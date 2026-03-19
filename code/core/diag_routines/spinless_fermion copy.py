@@ -5280,21 +5280,21 @@ def hybrid_svd_decompress(U: np.ndarray, S: np.ndarray, Vt: np.ndarray, out_shap
 
 
 def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensordot', norm=False, Hflow=False, store_flow=False):
+    """
+    混合精度递归 flow（模式 D - 连续内存版）。
+    前向一次积分得到 H2/Hint 终点；反向递归二分，base case 内用预分配连续 buffer（可选 FP16/动态缩放/剪枝/SVD）存轨迹并逆时更新 LIOM。
+    """
+    # ----- 1. 前置：强制步数 -----
     forced = _force_steps()
     if forced is not None:
         dl_list = dl_list[: min(len(dl_list), forced + 1)]
         print(f"        [FORCE_STEPS] Running exactly {len(dl_list)-1} steps (ignoring cutoff)")
-    """
-    [模式 D - 连续内存版] 混合精度递归 (Hybrid: Recursive + Quantized + Contiguous Buffer)
-    
-    关键改进:
-    - Pre-allocation: 放弃 list.append，改为预分配连续的 (BlockSize, N, N) Numpy 数组。
-    - Zero Fragmentation: 彻底消除小对象造成的内存碎片。
-    - Forced Sync: 数据搬运时强制同步，防止 JAX 指令队列堆积。
-    """
+    # 关键优化：预分配连续数组、减少碎片、数据搬运时 block_until_ready 强制同步
     # Uses module-level jnp/jit/np imports
     import gc
     
+    # ----- 2. 初始化与 ODE 配置 -----
+    # H2/Hint、dtype（随 JAX 配置）、JIT ODE 预热、BASE_CASE_STEPS、rtol/atol
     H2, Hint = hamiltonian.H2_spinless, hamiltonian.H4_spinless
     jit_update = jit(update) 
     
@@ -5317,6 +5317,8 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
     _rtol = float(os.environ.get('PYFLOW_ODE_RTOL', '1e-6'))
     _atol = float(os.environ.get('PYFLOW_ODE_ATOL', '1e-6'))
 
+    # ----- 3. 自适应网格（可选）-----
+    # 若开启：用 dtau_controller 根据 H2/H4 相对变化重算 dl_list，减少总步数 T
     # ─────────────────────────────────────────────────────────────────────────
     # Adaptive grid (same controller as recursive; reduces total steps T)
     # ─────────────────────────────────────────────────────────────────────────
@@ -5463,6 +5465,8 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
             print(f"        [Adaptive Grid] Steps: {len(dl_list_new)-1} (was {len(dl_list)-1}) retries={adp_stats['retries']}", flush=True)
             dl_list = dl_list_new
 
+    # ----- 4. 前向积分 Phase 1 -----
+    # 定义 integrate_h_forward：在 [t_start_idx, t_end_idx) 上 ODE 积分，可选 _approx 或 ode(int_ode)；达到 cutoff 可提前退出
     # --- 前向积分 ---
     def integrate_h_forward(h2, hint, t_start_idx, t_end_idx, log_progress=False):
         curr_h2, curr_hint = h2, hint
@@ -5506,6 +5510,8 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
     print("        [Hybrid Flow] Phase 1: Forward pass (float64)...")
     H2_final, Hint_final = integrate_h_forward(H2_init, Hint_init, 0, len(dl_list)-1, log_progress=True)
     
+    # ----- 5. l-bits 与 Phase 2 初值 -----
+    # H0_diag、Hint2、HFint 矩阵；lbits 占位；liom2/4 初值（中心为 1）；stats 统计
     # l-bits extraction
     H0_diag = H2_final
     Hint2 = Hint_final
@@ -5521,6 +5527,9 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
     
     stats = {'recomputes': 0, 'max_depth': 0, 'quantized_blocks': 0}
 
+    # ----- 6. 递归求解器 recursive_solve -----
+    # Base case：区间长度 <= BASE_CASE_STEPS 时，前向填 buffer（稠密/COO/SVD），反向从 buffer 读并 jit_update 更新 LIOM
+    # 递归 case：二分区间，先算后半段再算前半段，传递 LIOM 状态
     # --- 递归求解器 ---
     def recursive_solve(t_start_idx, t_end_idx, h2_start, hint_start, current_liom2, current_liom4, depth):
         stats['max_depth'] = max(stats['max_depth'], depth)
@@ -6085,6 +6094,8 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
             
             return l2_final, l4_final
 
+    # ----- 7. 启动递归与输出 -----
+    # 从 [0, len(dl_list)-1] 调用 recursive_solve，得到 liom2_final/liom4_final；组装 output 字典
     # 启动
     liom2_final, liom4_final = recursive_solve(0, len(dl_list)-1, H2_init, Hint_init, liom2, liom4, 0)
     

@@ -37,6 +37,11 @@ os.environ['MKL_NUM_THREADS']= str(int(cpu_count(logical=False))) # Set number o
 os.environ['KMP_DUPLICATE_LIB_OK']="TRUE"                         # Necessary on some versions of OS X
 os.environ['KMP_WARNINGS'] = 'off'                                # Silence non-critical warning
 
+# Torch GPU flow switch:
+# - 0 (default): keep existing routing logic
+# - 1/true/on: allow CUT to route LIOM='bck' standard branch to flow_static_int_torch_gpu
+os.environ.setdefault("USE_TORCH_GPU_FLOW", "1")
+
 # JAX options - must be set BEFORE importing the JAX library
 # os.environ['CUDA_VISIBLE_DEVIES'] = '2'                         # Set which device to use ('' is CPU)
 os.environ['JAX_ENABLE_X64'] = 'true'                           # Enable 64-bit floats in JAX
@@ -123,8 +128,10 @@ if (species == 'spinless fermion' and n > 12) or (species == 'spinful fermion' a
 # Only used if 'dyn = True'
 tlist = [0.01*i for i in range(31)]
 
+order = 4
+
 # Make directory to store data
-nvar = utility.namevar(dis_type,dsymm,no_state,dyn,norm,n,LIOM,species)
+nvar = utility.namevar(dis_type, dim, dsymm, no_state, dyn, norm, n, LIOM, species, order)
 
 if Hflow == False:
     print('*** Warning: Setting Hflow=False requires small flow time steps in order for backwards transform to be accurate. ***')
@@ -155,9 +162,38 @@ if __name__ == '__main__':
                 for delta in Ulist:
 
                     # Create dictionary of parameters to pass to functions; avoids having to have too many function args
-                    params = {"n":n,"delta":delta,"J":J,"cutoff":cutoff,"dis":dis,"dsymm":dsymm,"NO_state":no_state,"lmax":lmax,"qmax":qmax,
-                                "reps":reps,"norm":norm,"Hflow":Hflow,"method":method, "intr":intr,"dyn":dyn,"imbalance":imbalance,"species":species,
-                                    "LIOM":LIOM, "dyn_MF":dyn_MF,"logflow":logflow,"dis_type":dis_type,"x":x,"tlist":tlist,"store_flow":store_flow,"ITC":ITC,"ladder":ladder}
+                    # 根据后续的使用，添加了dim和dtype参数。例如，如果后面有用到维度相关或数据类型相关的功能，应确保这些参数被包含。
+                    params = {
+                        "n": n,
+                        "delta": delta,
+                        "J": J,
+                        "cutoff": cutoff,
+                        "dis": dis,
+                        "dsymm": dsymm,
+                        "NO_state": no_state,
+                        "lmax": lmax,
+                        "qmax": qmax,
+                        "reps": reps,
+                        "norm": norm,
+                        "Hflow": Hflow,
+                        "method": method,
+                        "intr": intr,
+                        "dyn": dyn,
+                        "imbalance": imbalance,
+                        "species": species,
+                        "LIOM": LIOM,
+                        "dyn_MF": dyn_MF,
+                        "logflow": logflow,
+                        "dis_type": dis_type,
+                        "x": x,
+                        "tlist": tlist,
+                        "store_flow": store_flow,
+                        "ITC": ITC,
+                        "ladder": ladder,
+                        "order": order,
+                        "dim": dim,          # 新增参数 dim
+                        "dtype": jnp.float64 # 新增参数 dtype，默认用 jax 的 float64
+                    }
 
                     #-----------------------------------------------------------------
                     # Initialise Hamiltonian
@@ -221,7 +257,6 @@ if __name__ == '__main__':
                             flevels = utility.flow_levels_spin(n,flow,intr)
                         flevels = flevels-np.median(flevels)
                         ed = ed[0] - np.median(ed[0])
-                    
                     else:
                         flevels=np.zeros(n)
                         ed=np.zeros(n)
@@ -250,8 +285,8 @@ if __name__ == '__main__':
                         plt.show()
                         plt.close()
 
-                    print(flow["LIOM2"])
-                    print(flow["LIOM2_FWD"])
+                    # print(flow["LIOM2"])
+                    # print(flow["LIOM2_FWD"])
 
                     #==============================================================
                     # Export data   

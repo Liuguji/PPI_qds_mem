@@ -27,6 +27,16 @@ and numerically integrate the flow equation to obtain a diagonal Hamiltonian.
 
 """
 
+try:
+    import torch
+except Exception:
+    torch = None
+
+try:
+    from torchdiffeq import odeint as torch_odeint
+except Exception:
+    torch_odeint = None
+
 import os,functools,time
 try:
     from psutil import cpu_count  # type: ignore
@@ -98,6 +108,46 @@ from ..contract import contract, contractNO, no_helper
 from ..utility import nstate, state_spinless, indices
 from  jax.experimental.ode import odeint as ode
 from scipy.integrate import ode as ode_np
+
+
+def _ode_scipy_benchmark(func, y0_list, t_points, rtol=1e-6, atol=1e-6):
+    """Scipy-based ODE wrapper used only when BENCHMARK_FLOW_TIMING=1.
+
+    jax.experimental.ode.odeint traces the RHS function as a JAX computation
+    graph, so Python-level time.perf_counter() calls inside the RHS are only
+    executed once during tracing and never again during actual integration.
+    scipy.integrate.solve_ivp is a Python-callback solver: it calls the RHS
+    as a normal Python function at every internal step, so time.perf_counter()
+    inside int_ode works correctly and sub-phase timings accumulate properly.
+
+    Returns the same structure as odeint: a list of jnp arrays each with a
+    leading time dimension matching t_points, so callers can use soln[i][-1]
+    exactly as before.
+    """
+    from scipy.integrate import solve_ivp as _scipy_solve_ivp
+
+    shapes = [np.array(a).shape for a in y0_list]
+    sizes  = [int(np.prod(s)) for s in shapes]
+    splits = np.cumsum([0] + sizes)
+
+    y0_flat = np.concatenate([np.array(a, dtype=np.float64).ravel() for a in y0_list])
+
+    def _flat_rhs(t, y_flat):
+        y = [jnp.array(y_flat[splits[i]:splits[i+1]].reshape(shapes[i]))
+             for i in range(len(shapes))]
+        result = func(y, t)
+        return np.concatenate([np.array(r, dtype=np.float64).ravel() for r in result])
+
+    t_arr = np.asarray(t_points, dtype=np.float64)
+    sol = _scipy_solve_ivp(_flat_rhs, [t_arr[0], t_arr[-1]], y0_flat,
+                           method='RK45', t_eval=t_arr,
+                           rtol=rtol, atol=atol, dense_output=False)
+
+    result = []
+    for i, shape in enumerate(shapes):
+        traj = sol.y[splits[i]:splits[i+1], :].T.reshape(len(t_arr), *shape)
+        result.append(jnp.array(traj))
+    return result
 #import matplotlib.pyplot as plt
 from jax.numpy.linalg import norm as frn
 from ..memlog import memlog
@@ -147,6 +197,9 @@ def _approx_skip_small_terms() -> bool:
     return os.environ.get("PYFLOW_SKIP_SMALL_TERMS", "0") in ("1", "true", "True")
 
 
+def _approx_enabled() -> bool:
+    return (_approx_h4_update_every() > 1) or _approx_skip_small_terms()
+
 def _approx_skip_eps(default: float = 0.0) -> float:
     try:
         return float(os.environ.get("PYFLOW_SKIP_EPS", str(default)))
@@ -154,8 +207,6 @@ def _approx_skip_eps(default: float = 0.0) -> float:
         return default
 
 
-def _approx_enabled() -> bool:
-    return (_approx_h4_update_every() > 1) or _approx_skip_small_terms()
 
 def _force_steps() -> int | None:
     """
@@ -617,111 +668,30 @@ def _get_jit_ode(n):
     
     return _jit_ode_cache[n]
 
+def int_ode_gpu(l, y, n, method='einsum'):
+    """
+    GPU version of int_ode: RHS of flow equation for Hamiltonian only (dH/dl, dHint/dl).
+    y and return value are torch tensors of shape (n**2 + n**4,) on module device.
+    """
+    H = y[:n**2].reshape(n, n)
+    Hint = y[n**2:].reshape(n, n, n, n)
 
-def int_ode(y,l,eta=[],method='einsum',norm=False,Hflow=True):
-        """ Generate the flow equation for the interacting systems.
+    H0 = torch.diag(torch.diag(H))
+    V0 = H - H0
 
-        e.g. compute the RHS of dH/dl = [\eta,H] which will be used later to integrate H(l) -> H(l + dl)
+    idx_i, idx_j = _get_hint0_indices(n, device)
+    Hint0 = torch.zeros_like(Hint)
+    Hint0[idx_i, idx_i, idx_j, idx_j] = Hint[idx_i, idx_i, idx_j, idx_j]
+    Hint0[idx_i, idx_j, idx_j, idx_i] = Hint[idx_i, idx_j, idx_j, idx_i]
+    Vint = Hint - Hint0
 
-        Note that with the parameter Hflow = True, the generator will be recomputed as required. Using Hflow=False,
-        the ijnput array eta will be used to specify the generator at this flow time step. The latter option will result 
-        in a huge speed increase, at the potential cost of accuracy. This is because the SciPy routine used to 
-        integrate the ODEs will sometimes add intermediate steps: recomputing eta on the fly will result in these 
-        steps being computed accurately, while fixing eta will avoid having to recompute the generator every time an 
-        interpolation step is added (leading to a speed increase), however it will mean that the generator evaluated at 
-        these intermediate steps has errors of order <dl (where dl is the flow time step). For sufficiently small dl, 
-        the benefits from the speed increase likely outweigh the decrease in accuracy.
+    eta0 = contract(H0, V0, method=method, eta=True)
+    eta_int = contract(Hint0, V0, method=method, eta=True) + contract(H0, Vint, method=method, eta=True)
 
-        Parameters
-        ----------
-        l : float
-            The (fictitious) flow time l which parameterises the unitary transform.
-        y : array
-            Array of size n**2 + n**4 containing all coefficients of the running Hamiltonian at flow time l.
-        n : integer
-            Linear system size.
-        eta : array, optional
-            Provide a pre-computed generator, if desired.
-        method : string, optional
-            Specify which method to use to generate the RHS of the flow equations.
-            Method choices are 'einsum', 'tensordot', 'jit' and 'vectorize'.
-            The first two are built-in NumPy methods, while the latter two are custom coded for speed.
-        norm : bool, optional
-            Specify whether to use non-perturbative normal-ordering corrections (True) or not (False).
-            This may take a lot longer to run, but typically improves accuracy. Care must be taken to 
-            ensure that use of normal-ordering is warranted and that the contractions are computed with 
-            respect to an appropriate state.
-        Hflow : bool, optional
-            Choose whether to use pre-computed generator or re-compute eta on the fly.
+    sol = contract(eta0, H0 + V0, method=method)
+    sol2 = contract(eta_int, H0 + V0, method=method) + contract(eta0, Hint, method=method)
 
-        Returns
-        -------
-        sol0 : RHS of the flow equation for interacting system.
-
-        """
-        # Use JIT-accelerated version if enabled and conditions match
-        if _USE_JIT_FLOW and norm == False and Hflow == True:
-            n = y[0].shape[0]
-            jit_ode = _get_jit_ode(n)
-            return jit_ode(y, l)
-        
-        # Original implementation
-        # print('y shape', y.shape)
-        # Extract various components of the Hamiltonian from the ijnput array 'y'
-        # id_print(y)
-        # id_print(l)
-        H2 = y[0]                           # Define quadratic part of Hamiltonian
-        n,_ = H2.shape
-        # H2_0 = jnp.diag(jnp.diag(H2))       # Define diagonal quadratic part H0
-        # V0 = H2 - H2_0                      # Define off-diagonal quadratic part
-
-        Hint = y[1]                         # Define quartic part of Hamiltonian
-        # Hint0 = jnp.zeros((n,n,n,n))        # Define diagonal quartic part 
-        # for i in range(n):                  # Load Hint0 with values
-        #     for j in range(n):
-        #             Hint0 = Hint0.at[i,i,j,j].set(Hint[i,i,j,j])
-        #             Hint0 = Hint0.at[i,j,j,i].set(Hint[i,j,j,i])
-        # Vint = Hint-Hint0
-        # id_print(H2)
-
-        H2_0,V0,Hint0,Vint = extract_diag(H2,Hint)
-
-        if norm == True:
-            state = state_spinless(H2)
-
-        if Hflow == True:
-            # Compute the generator eta
-            eta0 = contract(H2_0,V0,method=method,eta=True)
-            eta_int = contract(Hint0,V0,method=method,eta=True) + contract(H2_0,Vint,method=method,eta=True)
-
-            # Add normal-ordering corrections into generator eta, if norm == True
-            if norm == True:
-
-                eta_no2 = contractNO(Hint,V0,method=method,eta=True,state=state) + contractNO(H2_0,Vint,method=method,eta=True,state=state)
-                eta0 += eta_no2
-
-                eta_no4 = contractNO(Hint0,Vint,method=method,eta=True,state=state)
-                eta_int += eta_no4
-        else:
-            eta0 = (eta[:n**2]).reshape(n,n)
-            eta_int = (eta[n**2:]).reshape(n,n,n,n)
-
-        # id_print(eta0)
-   
-        # Compute the RHS of the flow equation dH/dl = [\eta,H]
-        sol = contract(eta0,H2,method=method)
-        sol2 = contract(eta_int,H2,method=method) + contract(eta0,Hint,method=method)
-
-        # Add normal-ordering corrections into flow equation, if norm == True
-        if norm == True:
-            sol_no = contractNO(eta_int,H2,method=method,eta=False,state=state) + contractNO(eta0,Hint,method=method,eta=False,state=state)
-            sol4_no = contractNO(eta_int,Hint,method=method,eta=False,state=state)
-            sol+=sol_no
-            sol2 += sol4_no
-
-        # id_print([sol,sol2])
-        return [sol,sol2]
-
+    return torch.cat([sol.reshape(-1), sol2.reshape(-1)])
 
 def int_ode_ITC(y,l,eta=[],method='einsum',norm=False,Hflow=True):
         """ Generate the flow equation for the interacting systems.
@@ -1296,23 +1266,6 @@ def int_ode2(y,l,eta=[],method='einsum',norm=False,Hflow=True):
         # id_print([sol,sol2])
         return [sol,sol2]
 
-# @jit
-def update(n2,n4,H2,Hint,steps,method='einsum'):
-
-    n,_ = H2.shape
-    H0,V0,Hint0,Vint = extract_diag(H2,Hint)
-
-    eta2 = contract(H0,V0,method=method,comp=False,eta=True)
-    eta4 = contract(Hint0,V0,method=method,comp=False,eta=True) + contract(H0,Vint,method=method,comp=False,eta=True)
-
-    dl = steps[-1]-steps[0]
-    # id_print(dl)
-    dn2 = contract(eta2,n2,method=method,comp=False)
-    dn4 = contract(eta4,n2,method=method,comp=False) + contract(eta2,n4,method=method,comp=False)
-    n2 += dl*dn2
-    n4 += dl*dn4
-
-    return n2,n4
 
 def liom_ode(y,l,n,array,method='tensordot',comp=False,Hflow=True,norm=False,bck=True):
     """ Generate the flow equation for density operators of the interacting systems.
@@ -1615,117 +1568,117 @@ def liom_ode_int_fwd(y,l,n,array,bck=False,method='einsum',comp=False,Hflow=True
 
 
 def int_ode_fwd(l,y0,n,eta=[],method='jit',norm=False,Hflow=False,comp=False):
-        """ Generate the flow equation for the interacting systems.
+    """ Generate the flow equation for the interacting systems.
 
-        e.g. compute the RHS of dH/dl = [\eta,H] which will be used later to integrate H(l) -> H(l + dl)
+    e.g. compute the RHS of dH/dl = [\eta,H] which will be used later to integrate H(l) -> H(l + dl)
 
-        Note that with the parameter Hflow = True, the generator will be recomputed as required. Using Hflow=False,
-        the ijnput array eta will be used to specify the generator at this flow time step. The latter option will result 
-        in a huge speed increase, at the potential cost of accuracy. This is because the SciPi routine used to 
-        integrate the ODEs will sometimes add intermediate steps: recomputing eta on the fly will result in these 
-        steps being computed accurately, while fixing eta will avoid having to recompute the generator every time an 
-        interpolation step is added (leading to a speed increase), however it will mean that the generator evaluated at 
-        these intermediate steps has errors of order <dl (where dl is the flow time step). For sufficiently small dl, 
-        the benefits from the speed increase likely outweigh the decrease in accuracy.
+    Note that with the parameter Hflow = True, the generator will be recomputed as required. Using Hflow=False,
+    the ijnput array eta will be used to specify the generator at this flow time step. The latter option will result 
+    in a huge speed increase, at the potential cost of accuracy. This is because the SciPi routine used to 
+    integrate the ODEs will sometimes add intermediate steps: recomputing eta on the fly will result in these 
+    steps being computed accurately, while fixing eta will avoid having to recompute the generator every time an 
+    interpolation step is added (leading to a speed increase), however it will mean that the generator evaluated at 
+    these intermediate steps has errors of order <dl (where dl is the flow time step). For sufficiently small dl, 
+    the benefits from the speed increase likely outweigh the decrease in accuracy.
 
-        Parameters
-        ----------
-        l : float
-            The (fictitious) flow time l which parameterises the unitary transform.
-        y : array
-            Array of size n**2 + n**4 containing all coefficients of the running Hamiltonian at flow time l.
-        n : integer
-            Linear system size.
-        eta : array, optional
-            Provide a pre-computed generator, if desired.
-        method : string, optional
-            Specify which method to use to generate the RHS of the flow equations.
-            Method choices are 'einsum', 'tensordot', 'jit' and 'vectorize'.
-            The first two are built-in NumPy methods, while the latter two are custom coded for speed.
-        norm : bool, optional
-            Specify whether to use non-perturbative normal-ordering corrections (True) or not (False).
-            This may take a lot longer to run, but typically improves accuracy. Care must be taken to 
-            ensure that use of normal-ordering is warranted and that the contractions are computed with 
-            respect to an appropriate state.
-        Hflow : bool, optional
-            Choose whether to use pre-computed generator or re-compute eta on the fly.
+    Parameters
+    ----------
+    l : float
+        The (fictitious) flow time l which parameterises the unitary transform.
+    y : array
+        Array of size n**2 + n**4 containing all coefficients of the running Hamiltonian at flow time l.
+    n : integer
+        Linear system size.
+    eta : array, optional
+        Provide a pre-computed generator, if desired.
+    method : string, optional
+        Specify which method to use to generate the RHS of the flow equations.
+        Method choices are 'einsum', 'tensordot', 'jit' and 'vectorize'.
+        The first two are built-in NumPy methods, while the latter two are custom coded for speed.
+    norm : bool, optional
+        Specify whether to use non-perturbative normal-ordering corrections (True) or not (False).
+        This may take a lot longer to run, but typically improves accuracy. Care must be taken to 
+        ensure that use of normal-ordering is warranted and that the contractions are computed with 
+        respect to an appropriate state.
+    Hflow : bool, optional
+        Choose whether to use pre-computed generator or re-compute eta on the fly.
 
-        Returns
-        -------
-        sol0 : RHS of the flow equation for interacting system.
+    Returns
+    -------
+    sol0 : RHS of the flow equation for interacting system.
 
-        """
-        y = y0[:n**2+n**4]
-        nlist = y0[n**2+n**4::]
+    """
+    y = y0[:n**2+n**4]
+    nlist = y0[n**2+n**4::]
 
-        # Extract various components of the Hamiltonian from the ijnput array 'y'
-        H = y[0:n**2]                   # Define quadratic part of Hamiltonian
-        H = H.reshape(n,n)              # Reshape into matrix
-        H0 = jnp.diag(jnp.diag(H))        # Define diagonal quadratic part H0
-        V0 = H - H0                     # Define off-diagonal quadratic part B
+    # Extract various components of the Hamiltonian from the ijnput array 'y'
+    H = y[0:n**2]                   # Define quadratic part of Hamiltonian
+    H = H.reshape(n,n)              # Reshape into matrix
+    H0 = jnp.diag(jnp.diag(H))        # Define diagonal quadratic part H0
+    V0 = H - H0                     # Define off-diagonal quadratic part B
 
-        Hint = y[n**2:]                 # Define quartic part of Hamiltonian
-        Hint = Hint.reshape(n,n,n,n)    # Reshape into rank-4 tensor
-        Hint0 = jnp.zeros((n,n,n,n))     # Define diagonal quartic part 
-        for i in range(n):              # Load Hint0 with values
-            for j in range(n):
-                # if i != j:
-                    # Load dHint_diag with diagonal values (n_i n_j or c^dag_i c_j c^dag_j c_i)
-                    Hint0[i,i,j,j] = Hint[i,i,j,j]
-                    Hint0[i,j,j,i] = Hint[i,j,j,i]
-        Vint = Hint-Hint0
+    Hint = y[n**2:]                 # Define quartic part of Hamiltonian
+    Hint = Hint.reshape(n,n,n,n)    # Reshape into rank-4 tensor
+    Hint0 = jnp.zeros((n,n,n,n))     # Define diagonal quartic part 
+    for i in range(n):              # Load Hint0 with values
+        for j in range(n):
+            # if i != j:
+                # Load dHint_diag with diagonal values (n_i n_j or c^dag_i c_j c^dag_j c_i)
+                Hint0[i,i,j,j] = Hint[i,i,j,j]
+                Hint0[i,j,j,i] = Hint[i,j,j,i]
+    Vint = Hint-Hint0
 
-        # Extract components of the density operator from ijnput array 'y'
-        n2 = nlist[0:n**2]                  # Define quadratic part of density operator
-        n2 = n2.reshape(n,n)            # Reshape into matrix
-        if len(nlist)>n**2:                 # If interacting system...
-            n4 = nlist[n**2::]              #...then define quartic part of density operator
-            n4 = n4.reshape(n,n,n,n)    # Reshape into tensor
-        
+    # Extract components of the density operator from ijnput array 'y'
+    n2 = nlist[0:n**2]                  # Define quadratic part of density operator
+    n2 = n2.reshape(n,n)            # Reshape into matrix
+    if len(nlist)>n**2:                 # If interacting system...
+        n4 = nlist[n**2::]              #...then define quartic part of density operator
+        n4 = n4.reshape(n,n,n,n)    # Reshape into tensor
+    
+    if norm == True:
+        state=state_spinless(H)
+
+    if Hflow == True:
+        # Compute the generator eta
+        eta0 = contract(H0,V0,method=method,eta=True)
+        eta_int = contract(Hint0,V0,method=method,eta=True) + contract(H0,Vint,method=method,eta=True)
+
+        # Add normal-ordering corrections into generator eta, if norm == True
         if norm == True:
-            state=state_spinless(H)
 
-        if Hflow == True:
-            # Compute the generator eta
-            eta0 = contract(H0,V0,method=method,eta=True)
-            eta_int = contract(Hint0,V0,method=method,eta=True) + contract(H0,Vint,method=method,eta=True)
+            eta_no2 = contractNO(Hint,V0,method=method,eta=True,state=state) + contractNO(H0,Vint,method=method,eta=True,state=state)
+            eta0 += eta_no2
 
-            # Add normal-ordering corrections into generator eta, if norm == True
-            if norm == True:
+            eta_no4 = contractNO(Hint0,Vint,method=method,eta=True,state=state)
+            eta_int += eta_no4
+    else:
+        eta0 = (eta[:n**2]).reshape(n,n)
+        eta_int = (eta[n**2:]).reshape(n,n,n,n)
 
-                eta_no2 = contractNO(Hint,V0,method=method,eta=True,state=state) + contractNO(H0,Vint,method=method,eta=True,state=state)
-                eta0 += eta_no2
+    # Compute the RHS of the flow equation dH/dl = [\eta,H]
+    sol = contract(eta0,H0+V0,method=method)
+    sol2 = contract(eta_int,H0+V0,method=method) + contract(eta0,Hint,method=method)
 
-                eta_no4 = contractNO(Hint0,Vint,method=method,eta=True,state=state)
-                eta_int += eta_no4
-        else:
-            eta0 = (eta[:n**2]).reshape(n,n)
-            eta_int = (eta[n**2:]).reshape(n,n,n,n)
-   
-        # Compute the RHS of the flow equation dH/dl = [\eta,H]
-        sol = contract(eta0,H0+V0,method=method)
-        sol2 = contract(eta_int,H0+V0,method=method) + contract(eta0,Hint,method=method)
-
-        nsol = contract(eta0,n2,method=method,comp=comp)
-        if len(y) > n**2:
-            nsol2 = contract(eta_int,n2,method=method,comp=comp) + contract(eta0,n4,method=method,comp=comp)
+    nsol = contract(eta0,n2,method=method,comp=comp)
+    if len(y) > n**2:
+        nsol2 = contract(eta_int,n2,method=method,comp=comp) + contract(eta0,n4,method=method,comp=comp)
 
 
-        # Add normal-ordering corrections into flow equation, if norm == True
-        if norm == True:
-            sol_no = contractNO(eta_int,H0+V0,method=method,eta=False,state=state) + contractNO(eta0,Hint,method=method,eta=False,state=state)
-            sol4_no = contractNO(eta_int,Hint,method=method,eta=False,state=state)
-            sol+= sol_no
-            sol2 += sol4_no
-        
-        # Define and load output list sol0
-        sol0 = jnp.zeros(2*(n**2+n**4))
-        sol0[:n**2] = sol.reshape(n**2)
-        sol0[n**2:n**2+n**4] = sol2.reshape(n**4)
-        sol0[n**2+n**4:2*n**2+n**4] = nsol.reshape(n**2)
-        sol0[2*n**2+n**4:] = nsol2.reshape(n**4)
+    # Add normal-ordering corrections into flow equation, if norm == True
+    if norm == True:
+        sol_no = contractNO(eta_int,H0+V0,method=method,eta=False,state=state) + contractNO(eta0,Hint,method=method,eta=False,state=state)
+        sol4_no = contractNO(eta_int,Hint,method=method,eta=False,state=state)
+        sol+= sol_no
+        sol2 += sol4_no
+    
+    # Define and load output list sol0
+    sol0 = jnp.zeros(2*(n**2+n**4))
+    sol0[:n**2] = sol.reshape(n**2)
+    sol0[n**2:n**2+n**4] = sol2.reshape(n**4)
+    sol0[n**2+n**4:2*n**2+n**4] = nsol.reshape(n**2)
+    sol0[2*n**2+n**4:] = nsol2.reshape(n**4)
 
-        return sol0
+    return sol0
 #------------------------------------------------------------------------------  
 
 def flow_static(n,hamiltonian,dl_list,qmax,cutoff,method='jit',store_flow=True):
@@ -1800,410 +1753,6 @@ def proc(mat,cutoff):
         if mat[i] < cutoff:
             mat[i] = 0.
     return mat
-
-def flow_static_int(n,hamiltonian,dl_list,qmax,cutoff,method='jit',norm=True,Hflow=False,store_flow=False):
-    """
-    Diagonalise an initial interacting Hamiltonian and compute the integrals of motion.
-
-    Parameters
-        ----------
-        n : integer
-            Linear system size.
-        H0 : array, float
-            Diagonal component of Hamiltonian
-        V0 : array, float
-            Off-diagonal component of Hamiltonian.
-        Hint : array, float
-            Diagonal component of Hamiltonian
-        Vint : array, float
-            Off-diagonal component of Hamiltonian.
-        dl_list : array, float
-            List of flow times to use for the numerical integration.
-        qmax : integer
-            Maximum number of flow time steps.
-        cutoff : float
-            Threshold value below which off-diagonal elements are set to zero.
-        method : string, optional
-            Specify which method to use to generate the RHS of the flow equations.
-            Method choices are 'einsum', 'tensordot', 'jit' and 'vec'.
-            The first two are built-in NumPy methods, while the latter two are custom coded for speed.
-        norm : bool, optional
-            Specify whether to use non-perturbative normal-ordering corrections (True) or not (False).
-            This may take a lot longer to run, but typically improves accuracy. Care must be taken to 
-            ensure that use of normal-ordering is warranted and that the contractions are computed with 
-            respect to an appropriate state.
-        Hflow : bool, optional
-            Choose whether to use pre-computed generator or re-compute eta on the fly.
-
-        Returns
-        -------
-        output : dict
-            Dictionary containing diagonal Hamiltonian ("H0_diag","Hint"), LIOM interaction coefficient ("LIOM Interactions"),
-            the LIOM on central site ("LIOM") and the value of the second invariant of the flow ("Invariant").
-    
-    """
-    H2,Hint = hamiltonian.H2_spinless,hamiltonian.H4_spinless
-
-    # Number of intermediate setps specified for the solver to use
-    # It will in any case insert others as needed
-    increment = 2
-
-    # Optional: force a fixed number of steps (ignore cutoff/accuracy).
-    forced = _force_steps()
-    if forced is not None:
-        # Need forced+1 time points to make forced steps.
-        dl_list = dl_list[: min(len(dl_list), forced + 1)]
-        print(f"        [FORCE_STEPS] Running exactly {len(dl_list)-1} steps (ignoring cutoff)")
-
-    print('dl_list',len(dl_list),dl_list[0],dl_list[-1])
-
-    # Define integrator
-    # sol = ode(int_ode,[H2,Hint],dl_list)
-    mem_tot = (len(dl_list)*(n**2+n**4)*4)/1e9
-    chunk = int(np.ceil(mem_tot/6))
-    #print('MANUALLY SET TO 20 CHUNKS FOR DEBUG PURPOSES')
-    # chunk =int(2)
-    if chunk > 1:
-        chunk_size = len(dl_list)//chunk
-        print('Memory',mem_tot,chunk,chunk_size)
-    # chunk =int(2)
-
-    if chunk <= 1:
-        # Integration with hard-coded event handling
-        k=1
-        sol2 = jnp.zeros((len(dl_list),n,n))
-        sol4 = jnp.zeros((len(dl_list),n,n,n,n))
-        sol2 = sol2.at[0].set(H2)
-        sol4 = sol4.at[0].set(Hint)
-        J0 = 1
-        # Ensure peak RSS is captured right after allocating the dominant buffers
-        memlog("flow:alloc", step=0, mode="original", kind="sol2/sol4", steps=len(dl_list), n=n)
-        last_h2 = sol2[0]
-        last_h4 = sol4[0]
-
-        # term = ODETerm(int_ode)
-        # solver = Dopri5()
-
-        sol2_test=jnp.zeros((len(dl_list),n,n,n,n))
-        sol2_test=sol2_test.at[::,::,::,0,0].set(sol2)
-
-        # print('jax list')
-        # print(make_jaxpr(int_ode)([jnp.zeros((n,n)),jnp.zeros((n,n,n,n))],0.1))
-        # print('*****************************************************')
-        # print('*****************************************************')
-        # print('*****************************************************')
-        # print('*****************************************************')
-        # print('jax array')
-        # print(make_jaxpr(int_ode2)(jnp.array([jnp.zeros((n,n,n,n)),jnp.zeros((n,n,n,n))]),0.1))
-
-        # ODE tolerances - configurable via environment for performance tuning
-        # Looser tolerances (1e-5) can be 2-5x faster with minimal accuracy loss
-        _rtol = float(os.environ.get('PYFLOW_ODE_RTOL', '1e-6'))
-        _atol = float(os.environ.get('PYFLOW_ODE_ATOL', '1e-6'))
-        print(f"        Flow integration: max_steps={len(dl_list)}, cutoff={cutoff:.2e}, rtol={_rtol:.0e}, atol={_atol:.0e}")
-        last_progress = 0
-        approx = _approx_enabled()
-        _approx_cache: dict = {}
-        while k <len(dl_list) and ((forced is not None) or (J0 > cutoff)):
-            if approx and (not norm):
-                h2_next, h4_next = _approx_step_h2_h4(
-                    sol2[k-1],
-                    sol4[k-1],
-                    float(dl_list[k-1]),
-                    float(dl_list[k]),
-                    step_idx=k,
-                    method=method,
-                    cache=_approx_cache,
-                    norm=norm,
-                    Hflow=True,
-                )
-                sol2 = sol2.at[k].set(h2_next)
-                sol4 = sol4.at[k].set(h4_next)
-                J0 = jnp.max(jnp.abs(h2_next - jnp.diag(jnp.diag(h2_next))))
-                last_h2 = h2_next
-                last_h4 = h4_next
-            else:
-                steps = np.linspace(dl_list[k-1],dl_list[k],num=increment,endpoint=True)
-                soln = ode(int_ode,[sol2[k-1],sol4[k-1]],steps,rtol=_rtol,atol=_atol)
-                sol2 = sol2.at[k].set(soln[0][-1])
-                sol4 = sol4.at[k].set(soln[1][-1])
-                J0 = jnp.max(jnp.abs(soln[0][-1] - jnp.diag(jnp.diag(soln[0][-1]))))
-                last_h2 = soln[0][-1]
-                last_h4 = soln[1][-1]
-
-            # Progress printing every 10% or every 50 steps
-            progress = (k * 100) // len(dl_list)
-            if progress >= last_progress + 10 or k % 50 == 0:
-                print(f"        Step {k}/{len(dl_list)} ({progress}%) | l={dl_list[k]:.4f} | off-diag={J0:.2e}", flush=True)
-                last_progress = progress
-            
-            # Add memlog record
-            if k % 10 == 0:
-                memlog("flow:step", step=k, mode="original")
-            k += 1
-        print(f"        Converged at step {k-1}, final off-diag={J0:.2e}")
-
-    else:
-
-        # Initialise arrays
-        # Note: the memory required for these arrays is *not* pre-allocated. The reason is twofold: partly, it
-        # is likely that the integration will finish before the max value of dl_list is encountered, therefore 
-        # it's a waste to allocate all the memory. Secondly, in a later step we create a shortened copy of the array
-        # of the form sol2[0:k], which returns a new array of length k that requires separate memory allocation, so if we 
-        # max out the memory allocation here, there's no space left for to allocate the shortened array later.
-        # (Modifying the array in-place would be better, but I don't know how to do that...)
-
-        k=1
-        sol2 = np.zeros((len(dl_list),n,n),dtype=np.float32)
-        # sol2.fill(0.)
-        sol4 = np.zeros((len(dl_list),n,n,n,n),dtype=np.float32)
-        # sol4.fill(0.)
-        sol2_gpu = jnp.zeros((chunk_size,n,n))
-        sol4_gpu = jnp.zeros((chunk_size,n,n,n,n))
-        sol2_gpu = sol2_gpu.at[0].set(H2)
-        sol4_gpu = sol4_gpu.at[0].set(Hint)
-        J0 = 1
-        memlog("flow:alloc", step=0, mode="original", kind="sol2/sol4_chunked", steps=len(dl_list), n=n, chunk_size=chunk_size)
-        last_h2 = sol2_gpu[0]
-        last_h4 = sol4_gpu[0]
-    
-        # Integration with hard-coded event handling
-        # ODE tolerances - configurable via environment for performance tuning
-        _rtol = float(os.environ.get('PYFLOW_ODE_RTOL', '1e-6'))
-        _atol = float(os.environ.get('PYFLOW_ODE_ATOL', '1e-6'))
-        print(f"        Flow integration (chunked): max_steps={len(dl_list)}, cutoff={cutoff:.2e}, chunk_size={chunk_size}, rtol={_rtol:.0e}")
-        last_progress = 0
-        approx = _approx_enabled()
-        _approx_cache: dict = {}
-        while k <len(dl_list) and ((forced is not None) or (J0 > cutoff)):
-            if approx and (not norm):
-                h2_prev = sol2_gpu[k%chunk_size-1]
-                h4_prev = sol4_gpu[k%chunk_size-1]
-                h2_next, h4_next = _approx_step_h2_h4(
-                    h2_prev,
-                    h4_prev,
-                    float(dl_list[k-1]),
-                    float(dl_list[k]),
-                    step_idx=k,
-                    method=method,
-                    cache=_approx_cache,
-                    norm=norm,
-                    Hflow=True,
-                )
-                sol2_gpu = sol2_gpu.at[k%chunk_size].set(h2_next)
-                sol4_gpu = sol4_gpu.at[k%chunk_size].set(h4_next)
-                J0 = jnp.max(jnp.abs(h2_next - jnp.diag(jnp.diag(h2_next))))
-                last_h2 = h2_next
-                last_h4 = h4_next
-            else:
-                steps = np.linspace(dl_list[k-1],dl_list[k],num=increment,endpoint=True)
-                soln = ode(int_ode,[sol2_gpu[k%chunk_size-1],sol4_gpu[k%chunk_size-1]],steps,rtol=_rtol,atol=_atol)
-                sol2_gpu = sol2_gpu.at[k%chunk_size].set(soln[0][-1])
-                sol4_gpu = sol4_gpu.at[k%chunk_size].set(soln[1][-1])
-                J0 = jnp.max(jnp.abs(soln[0][-1] - jnp.diag(jnp.diag(soln[0][-1]))))
-                last_h2 = soln[0][-1]
-                last_h4 = soln[1][-1]
-
-            # Progress printing every 10% or every 50 steps
-            progress = (k * 100) // len(dl_list)
-            if progress >= last_progress + 10 or k % 50 == 0:
-                print(f"        Step {k}/{len(dl_list)} ({progress}%) | l={dl_list[k]:.4f} | off-diag={J0:.2e}", flush=True)
-                last_progress = progress
-
-            if k%chunk_size==0:
-                count = int(k/chunk_size)
-                if (sol2[(count-1)*chunk_size:(count)*chunk_size]).shape==np.array(sol2_gpu).shape:
-                    sol2[(count-1)*chunk_size:(count)*chunk_size] = np.array(sol2_gpu)
-                    sol4[(count-1)*chunk_size:(count)*chunk_size] = np.array(sol4_gpu)
-            elif k == len(dl_list)-1 or J0 <= cutoff:
-                remainder = len(sol2_gpu[0:k%chunk_size])
-                sol2[(count)*chunk_size:k] = np.array(sol2_gpu[0:remainder])
-                sol4[(count)*chunk_size:k] = np.array(sol4_gpu[0:remainder])
-            k += 1
-        print(f"        Converged at step {k-1}, final off-diag={J0:.2e}")
-        
-
-    print('dl_list',len(dl_list),dl_list[0],dl_list[-1])
-    print(k,J0,dl_list[k-1])
-    if k != len(dl_list):
-        dl_list = dl_list[0:k]
-        sol2 = sol2[0:k]
-        sol4 = sol4[0:k]
-        
-
-    steps = np.zeros(len(dl_list)-1)
-    for i in range(len(dl_list)-1):
-        steps[i] = dl_list[i+1]-dl_list[i]
-    print(np.max(steps),np.min(steps))
-
-    # Resize chunks
-    if chunk > 1:
-        mem_tot = (len(dl_list)*(n**2+n**4)*4)/1e9
-        chunk = int(np.ceil(mem_tot/6))
-        # chunk = 2
-        chunk_size = len(dl_list)//chunk
-        print('NEW CHUNK SIZE',chunk_size)
-        if int(chunk_size*chunk) != int(len(dl_list)):
-            print('Chunk size error - LIOMs may not be reliable.')
-
-        del sol2_gpu
-        del sol4_gpu 
-
-        sol2_gpu = jnp.zeros((chunk_size,n,n))
-        sol4_gpu = jnp.zeros((chunk_size,n,n,n,n))
-
-    # Store initial interaction value and trace of initial H^2 for later error estimation
-    delta = jnp.max(Hint)
-    e1 = jnp.trace(jnp.dot(H2,H2))
-    
-    # Define final quadratic/quartic Hamiltonian from the last computed step.
-    # (When approximate stepping is enabled, `soln` is not defined.)
-    H0_diag = last_h2.reshape(n, n)
-    print(jnp.sort(jnp.diag(H0_diag)))
-    print('Max |V|: ',jnp.max(jnp.abs(H0_diag-jnp.diag(jnp.diag(H0_diag)))))
-    # Define final diagonal quartic Hamiltonian
-    Hint2 = last_h4.reshape(n, n, n, n)   
-    # Extract only the density-density terms of the final quartic Hamiltonian, as a matrix                     
-    HFint = jnp.zeros(n**2).reshape(n,n)
-    for i in range(n):
-        for j in range(n):
-            HFint = HFint.at[i,j].set(Hint2[i,i,j,j]-Hint2[i,j,j,i])
-
-    # Compute the difference in the second invariant of the flow at start and end
-    # This acts as a measure of the unitarity of the transform
-    Hflat = HFint.reshape(n**2)
-    inv = 0.
-    for i in range(n**2):
-        inv += 2*Hflat[i]**2
-    e2 = jnp.trace(jnp.dot(H0_diag,H0_diag))
-    inv2 = jnp.abs(e1 - e2 + ((2*delta)**2)*(n-1) - inv)/jnp.abs(e2+((2*delta)**2)*(n-1))
-
-    # Compute the l-bit interactions from the density-density terms in the final Hamiltonian
-    lbits = jnp.zeros(n-1)
-    for q in range(1,n):
-        lbits = lbits.at[q-1].set(jnp.median(jnp.log10(jnp.abs(jnp.diag(HFint,q)+jnp.diag(HFint,-q))/2.)))
-
-    # Initialise a density operator in the microscopic basis on the central site
-    init_liom2 = jnp.zeros((n,n))
-    init_liom4 = jnp.zeros((n,n,n,n))
-    init_liom2 = init_liom2.at[n//2,n//2].set(1.0)
-
-    # Do forwards integration
-    k0=0
-    jit_update = jit(update)
-    if chunk <= 1:
-        for k0 in range(len(dl_list)-1):
-            steps = np.linspace(dl_list[k0],dl_list[k0+1],num=increment,endpoint=True)
-            init_liom2,init_liom4  = jit_update(init_liom2,init_liom4,sol2[k0],sol4[k0],steps)
-
-    else:
-        for k0 in range(len(dl_list)-1):
-            # print(k0,int(k0/chunk_size),k0%chunk_size)
-            if k0%chunk_size==0:
-                # print('load mem')
-                count = int(k0/chunk_size)
-                if jnp.array(sol2[count*chunk_size:(count+1)*chunk_size]).shape == sol2_gpu.shape:
-                    # print('load1')
-                    sol2_gpu = sol2_gpu.at[:,:].set(jnp.array(sol2[count*chunk_size:(count+1)*chunk_size]))
-                    sol4_gpu = sol4_gpu.at[:,:].set(jnp.array(sol4[count*chunk_size:(count+1)*chunk_size]))
-                else:
-                    # print('load2')
-                    sol2_gpu = jnp.array(sol2[count*chunk_size:(count+1)*chunk_size])
-                    sol4_gpu = jnp.array(sol4[count*chunk_size:(count+1)*chunk_size])
-
-            # print('****')
-            # print(k0)
-            # print(sol2_gpu[k0%chunk_size])
-            # print(sol2[k0])
-            steps = np.linspace(dl_list[k0],dl_list[k0+1],num=increment,endpoint=True)
-
-            init_liom2,init_liom4  = jit_update(init_liom2,init_liom4,sol2_gpu[k0%chunk_size],sol4_gpu[k0%chunk_size],steps)
-
-    liom_fwd2 = np.array(init_liom2)
-    liom_fwd4 = np.array(init_liom4)
-    
-
-    if chunk > 1:
-        del sol2_gpu
-        del sol4_gpu
-        sol2_gpu = jnp.zeros((chunk_size,n,n))
-        sol4_gpu = jnp.zeros((chunk_size,n,n,n,n))
-
-    # Preserve the (forward, truncated) flow-time grid for output before reversing for backward integration.
-    dl_list_fwd = np.array(dl_list)
-
-    # Reverse list of flow times in order to conduct backwards integration
-    dl_list = dl_list[::-1]
-    # sol2=sol2[::-1]
-    # sol4 = sol4[::-1]
-
-    # Initialise a density operator in the diagonal basis on the central site
-    init_liom2 = jnp.zeros((n,n))
-    init_liom4 = jnp.zeros((n,n,n,n))
-    init_liom2 = init_liom2.at[n//2,n//2].set(1.0)
-
-    # Do backwards integration
-    k0=0
-    if chunk <= 1:
-        for k0 in range(len(dl_list)-1):
-            steps = np.linspace(dl_list[k0],dl_list[k0+1],num=increment,endpoint=True)
-            init_liom2,init_liom4  = jit_update(init_liom2,init_liom4,sol2[-k0+1],sol4[-k0+1],steps)
-    else:
-        for k0 in range(len(dl_list)-1):
-            if k0%chunk_size==0:
-                count = int(k0/chunk_size)
-
-                if count == 0 and ((sol2[-1*((count+1)*chunk_size)::]).shape == sol2_gpu.shape):
-                    sol2_gpu = sol2_gpu.at[:,:].set(jnp.array(sol2[-1*((count+1)*chunk_size)::]))
-                    sol4_gpu = sol4_gpu.at[:,:].set(jnp.array(sol4[-1*((count+1)*chunk_size)::]))
-                elif count > 0 and (sol2[-1*((count+1)*chunk_size):-((count)*chunk_size)]).shape == sol2_gpu.shape:
-                    sol2_gpu = sol2_gpu.at[:,:].set(jnp.array(sol2[-1*((count+1)*chunk_size):-((count)*chunk_size)]))
-                    sol4_gpu = sol4_gpu.at[:,:].set(jnp.array(sol4[-1*((count+1)*chunk_size):-((count)*chunk_size)]))
-                else:
-                    sol2_gpu = jnp.array(sol2[0:-1*((count)*chunk_size)])
-                    sol4_gpu = jnp.array(sol4[0:-1*((count)*chunk_size)])
-
-            steps = np.linspace(dl_list[k0],dl_list[k0+1],num=increment,endpoint=True)
-            # print('****')
-            # print(k0)
-            # print(sol2_gpu[-(k0)%chunk_size-1])
-            # print(sol2[-k0-1])
-            init_liom2,init_liom4  = jit_update(init_liom2,init_liom4,sol2_gpu[-(k0)%chunk_size-1],sol4_gpu[-(k0)%chunk_size-1],steps)
-    
-    # Reverse again to get these lists the right way around
-    # dl_list = -1*dl_list[::-1]
-    # sol2=sol2[::-1]
-    # sol4 = sol4[::-1]
-
-    # import matplotlib.pyplot as plt
-    # plt.plot(jnp.log10(jnp.abs(jnp.diag(init_liom2.reshape(n,n)))))
-    # plt.plot(jnp.log10(jnp.abs(jnp.diag(liom_fwd2.reshape(n,n)))),'--')
-
-    output = {
-        "H0_diag": np.array(H0_diag),
-        "Hint": np.array(Hint2),
-        "LIOM Interactions": lbits,
-        "LIOM2": init_liom2,
-        "LIOM4": init_liom4,
-        "LIOM2_FWD": liom_fwd2,
-        "LIOM4_FWD": liom_fwd4,
-        "Invariant": inv2,
-        # Keep output schema consistent with other flow routines so main scripts can always export.
-        "dl_list": dl_list_fwd,
-        "truncation_err": np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float64),
-    }
-    if store_flow == True:
-        output["flow2"] = np.array(sol2)
-        output["flow4"] = np.array(sol4)
-        # For store_flow we keep the (reversed) dl_list used in backward integration.
-        output["dl_list"] = dl_list
-
-    # Free up some memory
-    # del sol2,sol4
-    # gc.collect()
-
-    return output
-
 
 #------------------------------------------------------------------------------
 # Optimized flow integration using JAX lax.while_loop
@@ -3929,7 +3478,6 @@ def flow_static_int_ckpt(n,hamiltonian,dl_list,qmax,cutoff,method='tensordot',no
     
     return output
 
-
 def flow_static_int_recursive(n, hamiltonian, dl_list, qmax, cutoff, method='tensordot', norm=False, Hflow=False, store_flow=False):
     forced = _force_steps()
     if forced is not None:
@@ -4662,23 +4210,546 @@ def flow_static_int_recursive(n, hamiltonian, dl_list, qmax, cutoff, method='ten
     
     return output
 
+# Benchmark timing: when BENCHMARK_FLOW_TIMING=1, flow_static_int / flow_static_int_hybrid
+# record phase times here; int_ode can append 2.1-2.5 times (when not JIT).
+_BENCHMARK_FLOW_TIMING = os.environ.get("BENCHMARK_FLOW_TIMING", "").strip() == "1"
+_benchmark_timing_ints = {"2.1_获取状态": 0.0, "2.2_2.3_分离H2_Hint": 0.0, "2.4_构建生成元": 0.0, "2.5_矩阵变换": 0.0}
+
+# @jit
+def update(n2,n4,H2,Hint,steps,method='einsum'):
+
+    n,_ = H2.shape
+    H0,V0,Hint0,Vint = extract_diag(H2,Hint)
+
+    eta2 = contract(H0,V0,method=method,comp=False,eta=True)
+    eta4 = contract(Hint0,V0,method=method,comp=False,eta=True) + contract(H0,Vint,method=method,comp=False,eta=True)
+
+    dl = steps[-1]-steps[0]
+    # id_print(dl)
+    dn2 = contract(eta2,n2,method=method,comp=False)
+    dn4 = contract(eta4,n2,method=method,comp=False) + contract(eta2,n4,method=method,comp=False)
+    n2 += dl*dn2
+    n4 += dl*dn4
+
+    return n2,n4
+
+
+def int_ode(y,l,eta=[],method='einsum',norm=False,Hflow=True):
+    # Use JIT-accelerated version if enabled and conditions match
+    if _USE_JIT_FLOW and norm == False and Hflow == True:
+        n = y[0].shape[0]
+        jit_ode = _get_jit_ode(n)
+        return jit_ode(y, l)
+    
+    # Original implementation
+    # print('y shape', y.shape)
+    # Extract various components of the Hamiltonian from the ijnput array 'y'
+    # id_print(y)
+    # id_print(l)
+    t_2_1 = time.perf_counter() if _BENCHMARK_FLOW_TIMING else 0
+    H2 = y[0]                           # Define quadratic part of Hamiltonian
+    n,_ = H2.shape
+    # H2_0 = jnp.diag(jnp.diag(H2))       # Define diagonal quadratic part H0
+    # V0 = H2 - H2_0                      # Define off-diagonal quadratic part
+
+    Hint = y[1]                         # Define quartic part of Hamiltonian
+    if _BENCHMARK_FLOW_TIMING:
+        jax.block_until_ready(H2)
+        jax.block_until_ready(Hint)
+        _benchmark_timing_ints["2.1_获取状态"] += time.perf_counter() - t_2_1
+    # Hint0 = jnp.zeros((n,n,n,n))        # Define diagonal quartic part 
+    # for i in range(n):                  # Load Hint0 with values
+    #     for j in range(n):
+    #             Hint0 = Hint0.at[i,i,j,j].set(Hint[i,i,j,j])
+    #             Hint0 = Hint0.at[i,j,j,i].set(Hint[i,j,j,i])
+    # Vint = Hint-Hint0
+    # id_print(H2)
+
+    t_2_2_3_start = time.perf_counter() if _BENCHMARK_FLOW_TIMING else 0
+    H2_0,V0,Hint0,Vint = extract_diag(H2,Hint)
+    if _BENCHMARK_FLOW_TIMING:
+        jax.block_until_ready([H2_0, V0, Hint0, Vint])
+        _benchmark_timing_ints["2.2_2.3_分离H2_Hint"] += time.perf_counter() - t_2_2_3_start
+
+    if norm == True:
+        state = state_spinless(H2)
+
+    t_2_4_start = time.perf_counter() if _BENCHMARK_FLOW_TIMING else 0
+    if Hflow == True:
+        # Compute the generator eta
+        eta0 = contract(H2_0,V0,method=method,eta=True)
+        eta_int = contract(Hint0,V0,method=method,eta=True) + contract(H2_0,Vint,method=method,eta=True)
+
+        # Add normal-ordering corrections into generator eta, if norm == True
+        if norm == True:
+
+            eta_no2 = contractNO(Hint,V0,method=method,eta=True,state=state) + contractNO(H2_0,Vint,method=method,eta=True,state=state)
+            eta0 += eta_no2
+
+            eta_no4 = contractNO(Hint0,Vint,method=method,eta=True,state=state)
+            eta_int += eta_no4
+    else:
+        eta0 = (eta[:n**2]).reshape(n,n)
+        eta_int = (eta[n**2:]).reshape(n,n,n,n)
+
+    if _BENCHMARK_FLOW_TIMING:
+        jax.block_until_ready(eta0)
+        jax.block_until_ready(eta_int)
+        _benchmark_timing_ints["2.4_构建生成元"] += time.perf_counter() - t_2_4_start
+
+    # id_print(eta0)
+
+    t_2_5_start = time.perf_counter() if _BENCHMARK_FLOW_TIMING else 0
+    # Compute the RHS of the flow equation dH/dl = [\eta,H]
+    sol = contract(eta0,H2,method=method)
+    sol2 = contract(eta_int,H2,method=method) + contract(eta0,Hint,method=method)
+
+    # Add normal-ordering corrections into flow equation, if norm == True
+    if norm == True:
+        sol_no = contractNO(eta_int,H2,method=method,eta=False,state=state) + contractNO(eta0,Hint,method=method,eta=False,state=state)
+        sol4_no = contractNO(eta_int,Hint,method=method,eta=False,state=state)
+        sol+=sol_no
+        sol2 += sol4_no
+
+    if _BENCHMARK_FLOW_TIMING:
+        jax.block_until_ready(sol)
+        jax.block_until_ready(sol2)
+        _benchmark_timing_ints["2.5_矩阵变换"] += time.perf_counter() - t_2_5_start
+
+    # id_print([sol,sol2])
+    return [sol,sol2]
+
+
+def flow_static_int(n,hamiltonian,dl_list,qmax,cutoff,method='jit',norm=True,Hflow=False,store_flow=False):
+    profile = _BENCHMARK_FLOW_TIMING
+
+    if profile:
+        _t0 = time.perf_counter()
+        for _k in _benchmark_timing_ints:
+            _benchmark_timing_ints[_k] = 0.0
+    H2,Hint = hamiltonian.H2_spinless,hamiltonian.H4_spinless
+
+    # Number of intermediate setps specified for the solver to use
+    # It will in any case insert others as needed
+    increment = 2
+
+    # Optional: force a fixed number of steps (ignore cutoff/accuracy).
+    forced = _force_steps()
+    if forced is not None:
+        # Need forced+1 time points to make forced steps.
+        dl_list = dl_list[: min(len(dl_list), forced + 1)]
+        print(f"        [FORCE_STEPS] Running exactly {len(dl_list)-1} steps (ignoring cutoff)")
+
+    print('dl_list',len(dl_list),dl_list[0],dl_list[-1])
+
+    # Define integrator
+    # sol = ode(int_ode,[H2,Hint],dl_list)
+    mem_tot = (len(dl_list)*(n**2+n**4)*4)/1e9
+    chunk = int(np.ceil(mem_tot/6))
+    #print('MANUALLY SET TO 20 CHUNKS FOR DEBUG PURPOSES')
+    # chunk =int(2)
+    if chunk > 1:
+        chunk_size = len(dl_list)//chunk
+        print('Memory',mem_tot,chunk,chunk_size)
+    # chunk =int(2)
+
+    # flow equation对角化
+    # # -------------------- 
+    if chunk <= 1:
+        # Integration with hard-coded event handling
+        k=1
+        sol2 = jnp.zeros((len(dl_list),n,n))
+        sol4 = jnp.zeros((len(dl_list),n,n,n,n))
+        sol2 = sol2.at[0].set(H2)
+        sol4 = sol4.at[0].set(Hint)
+        J0 = 1
+        # Ensure peak RSS is captured right after allocating the dominant buffers
+        memlog("flow:alloc", step=0, mode="original", kind="sol2/sol4", steps=len(dl_list), n=n)
+        last_h2 = sol2[0]
+        last_h4 = sol4[0]
+
+        # term = ODETerm(int_ode)
+        # solver = Dopri5()
+
+        sol2_test=jnp.zeros((len(dl_list),n,n,n,n))
+        sol2_test=sol2_test.at[::,::,::,0,0].set(sol2)
+
+        _rtol = float(os.environ.get('PYFLOW_ODE_RTOL', '1e-6'))
+        _atol = float(os.environ.get('PYFLOW_ODE_ATOL', '1e-6'))
+        print(f"        Flow integration: max_steps={len(dl_list)}, cutoff={cutoff:.2e}, rtol={_rtol:.0e}, atol={_atol:.0e}")
+        last_progress = 0
+        approx = _approx_enabled()
+        _approx_cache: dict = {}
+        if profile:
+            jax.block_until_ready([last_h2, last_h4])  # sync JAX init allocs before timing iteration
+            _t1 = time.perf_counter()
+        while k <len(dl_list) and ((forced is not None) or (J0 > cutoff)):
+            if approx and (not norm):
+                # 在满足某些条件时动态计算新哈密顿量
+                h2_next, h4_next = _approx_step_h2_h4(
+                    sol2[k-1],
+                    sol4[k-1],
+                    float(dl_list[k-1]),
+                    float(dl_list[k]),
+                    step_idx=k,
+                    method=method,
+                    cache=_approx_cache,
+                    norm=norm,
+                    Hflow=True,
+                )
+                sol2 = sol2.at[k].set(h2_next)
+                sol4 = sol4.at[k].set(h4_next)
+                J0 = jnp.max(jnp.abs(h2_next - jnp.diag(jnp.diag(h2_next))))
+                last_h2 = h2_next
+                last_h4 = h4_next
+            else:
+                # 使用ode求解器
+                steps = np.linspace(dl_list[k-1],dl_list[k],num=increment,endpoint=True)
+                _ode_fn = _ode_scipy_benchmark if profile else ode
+                soln = _ode_fn(int_ode,[sol2[k-1],sol4[k-1]],steps,rtol=_rtol,atol=_atol)
+                sol2 = sol2.at[k].set(soln[0][-1])
+                sol4 = sol4.at[k].set(soln[1][-1])
+                J0 = jnp.max(jnp.abs(soln[0][-1] - jnp.diag(jnp.diag(soln[0][-1]))))
+                last_h2 = soln[0][-1]
+                last_h4 = soln[1][-1]
+
+            # Progress printing every 10% or every 50 steps
+            progress = (k * 100) // len(dl_list)
+            if progress >= last_progress + 10 or k % 50 == 0:
+                print(f"        Step {k}/{len(dl_list)} ({progress}%) | l={dl_list[k]:.4f} | off-diag={J0:.2e}", flush=True)
+                last_progress = progress
+            
+            # Add memlog record
+            if k % 10 == 0:
+                memlog("flow:step", step=k, mode="original")
+            k += 1
+        if profile:
+            jax.block_until_ready([last_h2, last_h4])  # sync last ODE step before timing loop end
+            _t2 = time.perf_counter()
+        print(f"        Converged at step {k-1}, final off-diag={J0:.2e}")
+
+    else:
+
+        # Initialise arrays
+        # Note: the memory required for these arrays is *not* pre-allocated. The reason is twofold: partly, it
+        # is likely that the integration will finish before the max value of dl_list is encountered, therefore 
+        # it's a waste to allocate all the memory. Secondly, in a later step we create a shortened copy of the array
+        # of the form sol2[0:k], which returns a new array of length k that requires separate memory allocation, so if we 
+        # max out the memory allocation here, there's no space left for to allocate the shortened array later.
+        # (Modifying the array in-place would be better, but I don't know how to do that...)
+
+        k=1
+        sol2 = np.zeros((len(dl_list),n,n),dtype=np.float32)
+        # sol2.fill(0.)
+        sol4 = np.zeros((len(dl_list),n,n,n,n),dtype=np.float32)
+        # sol4.fill(0.)
+        sol2_gpu = jnp.zeros((chunk_size,n,n))
+        sol4_gpu = jnp.zeros((chunk_size,n,n,n,n))
+        sol2_gpu = sol2_gpu.at[0].set(H2)
+        sol4_gpu = sol4_gpu.at[0].set(Hint)
+        J0 = 1
+        memlog("flow:alloc", step=0, mode="original", kind="sol2/sol4_chunked", steps=len(dl_list), n=n, chunk_size=chunk_size)
+        last_h2 = sol2_gpu[0]
+        last_h4 = sol4_gpu[0]
+    
+        # Integration with hard-coded event handling
+        # ODE tolerances - configurable via environment for performance tuning
+        _rtol = float(os.environ.get('PYFLOW_ODE_RTOL', '1e-6'))
+        _atol = float(os.environ.get('PYFLOW_ODE_ATOL', '1e-6'))
+        print(f"        Flow integration (chunked): max_steps={len(dl_list)}, cutoff={cutoff:.2e}, chunk_size={chunk_size}, rtol={_rtol:.0e}")
+        last_progress = 0
+        approx = _approx_enabled()
+        _approx_cache: dict = {}
+        if profile:
+            jax.block_until_ready([last_h2, last_h4])  # sync JAX chunked init allocs before timing iteration
+            _t1 = time.perf_counter()
+        while k <len(dl_list) and ((forced is not None) or (J0 > cutoff)):
+            if approx and (not norm):
+                h2_prev = sol2_gpu[k%chunk_size-1]
+                h4_prev = sol4_gpu[k%chunk_size-1]
+                h2_next, h4_next = _approx_step_h2_h4(
+                    h2_prev,
+                    h4_prev,
+                    float(dl_list[k-1]),
+                    float(dl_list[k]),
+                    step_idx=k,
+                    method=method,
+                    cache=_approx_cache,
+                    norm=norm,
+                    Hflow=True,
+                )
+                sol2_gpu = sol2_gpu.at[k%chunk_size].set(h2_next)
+                sol4_gpu = sol4_gpu.at[k%chunk_size].set(h4_next)
+                J0 = jnp.max(jnp.abs(h2_next - jnp.diag(jnp.diag(h2_next))))
+                last_h2 = h2_next
+                last_h4 = h4_next
+            else:
+                steps = np.linspace(dl_list[k-1],dl_list[k],num=increment,endpoint=True)
+                _ode_fn = _ode_scipy_benchmark if profile else ode
+                soln = _ode_fn(int_ode,[sol2_gpu[k%chunk_size-1],sol4_gpu[k%chunk_size-1]],steps,rtol=_rtol,atol=_atol)
+
+                sol2_gpu = sol2_gpu.at[k%chunk_size].set(soln[0][-1])
+                sol4_gpu = sol4_gpu.at[k%chunk_size].set(soln[1][-1])
+                J0 = jnp.max(jnp.abs(soln[0][-1] - jnp.diag(jnp.diag(soln[0][-1]))))
+                last_h2 = soln[0][-1]
+                last_h4 = soln[1][-1]
+
+            # Progress printing every 10% or every 50 steps
+            progress = (k * 100) // len(dl_list)
+            if progress >= last_progress + 10 or k % 50 == 0:
+                print(f"        Step {k}/{len(dl_list)} ({progress}%) | l={dl_list[k]:.4f} | off-diag={J0:.2e}", flush=True)
+                last_progress = progress
+
+            if k%chunk_size==0:
+                count = int(k/chunk_size)
+                if (sol2[(count-1)*chunk_size:(count)*chunk_size]).shape==np.array(sol2_gpu).shape:
+                    sol2[(count-1)*chunk_size:(count)*chunk_size] = np.array(sol2_gpu)
+                    sol4[(count-1)*chunk_size:(count)*chunk_size] = np.array(sol4_gpu)
+            elif k == len(dl_list)-1 or J0 <= cutoff:
+                remainder = len(sol2_gpu[0:k%chunk_size])
+                sol2[(count)*chunk_size:k] = np.array(sol2_gpu[0:remainder])
+                sol4[(count)*chunk_size:k] = np.array(sol4_gpu[0:remainder])
+            k += 1
+        if profile:
+            jax.block_until_ready([last_h2, last_h4])  # sync last ODE step before timing chunked loop end
+            _t2 = time.perf_counter()
+        print(f"        Converged at step {k-1}, final off-diag={J0:.2e}")
+    # ----------------------
+
+    print('dl_list',len(dl_list),dl_list[0],dl_list[-1])
+    print(k,J0,dl_list[k-1])
+    if k != len(dl_list):
+        dl_list = dl_list[0:k]
+        sol2 = sol2[0:k]
+        sol4 = sol4[0:k]
+        
+
+    steps = np.zeros(len(dl_list)-1)
+    for i in range(len(dl_list)-1):
+        steps[i] = dl_list[i+1]-dl_list[i]
+    print(np.max(steps),np.min(steps))
+
+    # Resize chunks
+    if chunk > 1:
+        mem_tot = (len(dl_list)*(n**2+n**4)*4)/1e9
+        chunk = int(np.ceil(mem_tot/6))
+        # chunk = 2
+        chunk_size = len(dl_list)//chunk
+        print('NEW CHUNK SIZE',chunk_size)
+        if int(chunk_size*chunk) != int(len(dl_list)):
+            print('Chunk size error - LIOMs may not be reliable.')
+
+        del sol2_gpu
+        del sol4_gpu 
+
+        sol2_gpu = jnp.zeros((chunk_size,n,n))
+        sol4_gpu = jnp.zeros((chunk_size,n,n,n,n))
+
+    # Store initial interaction value and trace of initial H^2 for later error estimation
+    delta = jnp.max(Hint)
+    e1 = jnp.trace(jnp.dot(H2,H2))
+    
+    # Define final quadratic/quartic Hamiltonian from the last computed step.
+    # (When approximate stepping is enabled, `soln` is not defined.)
+    H0_diag = last_h2.reshape(n, n)
+    print(jnp.sort(jnp.diag(H0_diag)))
+    print('Max |V|: ',jnp.max(jnp.abs(H0_diag-jnp.diag(jnp.diag(H0_diag)))))
+    # Define final diagonal quartic Hamiltonian
+    Hint2 = last_h4.reshape(n, n, n, n)   
+    # Extract only the density-density terms of the final quartic Hamiltonian, as a matrix                     
+    HFint = jnp.zeros(n**2).reshape(n,n)
+    for i in range(n):
+        for j in range(n):
+            HFint = HFint.at[i,j].set(Hint2[i,i,j,j]-Hint2[i,j,j,i])
+
+    # Compute the difference in the second invariant of the flow at start and end
+    # This acts as a measure of the unitarity of the transform
+    Hflat = HFint.reshape(n**2)
+    inv = 0.
+    for i in range(n**2):
+        inv += 2*Hflat[i]**2
+    e2 = jnp.trace(jnp.dot(H0_diag,H0_diag))
+    inv2 = jnp.abs(e1 - e2 + ((2*delta)**2)*(n-1) - inv)/jnp.abs(e2+((2*delta)**2)*(n-1))
+
+    # Compute the l-bit interactions from the density-density terms in the final Hamiltonian
+    lbits = jnp.zeros(n-1)
+    for q in range(1,n):
+        lbits = lbits.at[q-1].set(jnp.median(jnp.log10(jnp.abs(jnp.diag(HFint,q)+jnp.diag(HFint,-q))/2.)))
+
+    # Initialise a density operator in the microscopic basis on the central site
+    init_liom2 = jnp.zeros((n,n))
+    init_liom4 = jnp.zeros((n,n,n,n))
+    init_liom2 = init_liom2.at[n//2,n//2].set(1.0)
+
+    # Do forwards integration
+    k0=0
+    jit_update = jit(update)
+    if chunk <= 1:
+        for k0 in range(len(dl_list)-1):
+            steps = np.linspace(dl_list[k0],dl_list[k0+1],num=increment,endpoint=True)
+            init_liom2,init_liom4  = jit_update(init_liom2,init_liom4,sol2[k0],sol4[k0],steps)
+
+    else:
+        for k0 in range(len(dl_list)-1):
+            # print(k0,int(k0/chunk_size),k0%chunk_size)
+            if k0%chunk_size==0:
+                # print('load mem')
+                count = int(k0/chunk_size)
+                if jnp.array(sol2[count*chunk_size:(count+1)*chunk_size]).shape == sol2_gpu.shape:
+                    # print('load1')
+                    sol2_gpu = sol2_gpu.at[:,:].set(jnp.array(sol2[count*chunk_size:(count+1)*chunk_size]))
+                    sol4_gpu = sol4_gpu.at[:,:].set(jnp.array(sol4[count*chunk_size:(count+1)*chunk_size]))
+                else:
+                    # print('load2')
+                    sol2_gpu = jnp.array(sol2[count*chunk_size:(count+1)*chunk_size])
+                    sol4_gpu = jnp.array(sol4[count*chunk_size:(count+1)*chunk_size])
+
+            # print('****')
+            # print(k0)
+            # print(sol2_gpu[k0%chunk_size])
+            # print(sol2[k0])
+            steps = np.linspace(dl_list[k0],dl_list[k0+1],num=increment,endpoint=True)
+
+            init_liom2,init_liom4  = jit_update(init_liom2,init_liom4,sol2_gpu[k0%chunk_size],sol4_gpu[k0%chunk_size],steps)
+
+    liom_fwd2 = np.array(init_liom2)
+    liom_fwd4 = np.array(init_liom4)
+    
+
+    if chunk > 1:
+        del sol2_gpu
+        del sol4_gpu
+        sol2_gpu = jnp.zeros((chunk_size,n,n))
+        sol4_gpu = jnp.zeros((chunk_size,n,n,n,n))
+
+    # Preserve the (forward, truncated) flow-time grid for output before reversing for backward integration.
+    dl_list_fwd = np.array(dl_list)
+
+    # Reverse list of flow times in order to conduct backwards integration
+    dl_list = dl_list[::-1]
+    # sol2=sol2[::-1]
+    # sol4 = sol4[::-1]
+
+    # Initialise a density operator in the diagonal basis on the central site
+    init_liom2 = jnp.zeros((n,n))
+    init_liom4 = jnp.zeros((n,n,n,n))
+    init_liom2 = init_liom2.at[n//2,n//2].set(1.0)
+
+    if profile:
+        _t2b_start = time.perf_counter()
+    
+    # Do backwards integration
+
+    # k0=0
+    # if chunk <= 1:
+    #     for k0 in range(len(dl_list)-1):
+    #         steps = np.linspace(dl_list[k0],dl_list[k0+1],num=increment,endpoint=True)
+    #         init_liom2,init_liom4  = jit_update(init_liom2,init_liom4,sol2[-k0+1],sol4[-k0+1],steps)
+    # else:
+    #     for k0 in range(len(dl_list)-1):
+    #         if k0%chunk_size==0:
+    #             count = int(k0/chunk_size)
+
+    #             if count == 0 and ((sol2[-1*((count+1)*chunk_size)::]).shape == sol2_gpu.shape):
+    #                 sol2_gpu = sol2_gpu.at[:,:].set(jnp.array(sol2[-1*((count+1)*chunk_size)::]))
+    #                 sol4_gpu = sol4_gpu.at[:,:].set(jnp.array(sol4[-1*((count+1)*chunk_size)::]))
+    #             elif count > 0 and (sol2[-1*((count+1)*chunk_size):-((count)*chunk_size)]).shape == sol2_gpu.shape:
+    #                 sol2_gpu = sol2_gpu.at[:,:].set(jnp.array(sol2[-1*((count+1)*chunk_size):-((count)*chunk_size)]))
+    #                 sol4_gpu = sol4_gpu.at[:,:].set(jnp.array(sol4[-1*((count+1)*chunk_size):-((count)*chunk_size)]))
+    #             else:
+    #                 sol2_gpu = jnp.array(sol2[0:-1*((count)*chunk_size)])
+    #                 sol4_gpu = jnp.array(sol4[0:-1*((count)*chunk_size)])
+
+    #         steps = np.linspace(dl_list[k0],dl_list[k0+1],num=increment,endpoint=True)
+    #         # print('****')
+    #         # print(k0)
+    #         # print(sol2_gpu[-(k0)%chunk_size-1])
+    #         # print(sol2[-k0-1])
+    #         init_liom2,init_liom4  = jit_update(init_liom2,init_liom4,sol2_gpu[-(k0)%chunk_size-1],sol4_gpu[-(k0)%chunk_size-1],steps)
+
+    k0=0
+    for k0 in range(len(dl_list)-1):
+        steps = np.linspace(dl_list[k0],dl_list[k0+1],num=increment,endpoint=True)
+        init_liom2,init_liom4  = jit_update(init_liom2,init_liom4,sol2[-k0-1],sol4[-k0-1],steps)
+        if k0 % 50 == 0:
+            print(f"        Step {k0}/{len(dl_list)-1} ({k0*100/(len(dl_list)-1):.2f}%) | l={dl_list[k0]:.4f}", flush=True)
+
+    if profile:
+        jax.block_until_ready([init_liom2, init_liom4])  # sync last jit_update before timing LIOM end
+        _t2b_end = time.perf_counter()
+    # Reverse again to get these lists the right way around
+    # dl_list = -1*dl_list[::-1]
+    # sol2=sol2[::-1]
+    # sol4 = sol4[::-1]
+
+    # import matplotlib.pyplot as plt
+    # plt.plot(jnp.log10(jnp.abs(jnp.diag(init_liom2.reshape(n,n)))))
+    # plt.plot(jnp.log10(jnp.abs(jnp.diag(liom_fwd2.reshape(n,n)))),'--')
+
+    if profile:
+        _t3 = time.perf_counter()
+
+    output = {
+        "H0_diag": np.array(H0_diag),
+        "Hint": np.array(Hint2),
+        "LIOM Interactions": lbits,
+        "LIOM2": init_liom2,
+        "LIOM4": init_liom4,
+        "LIOM2_FWD": liom_fwd2,
+        "LIOM4_FWD": liom_fwd4,
+        "Invariant": inv2,
+        # Keep output schema consistent with other flow routines so main scripts can always export.
+        "dl_list": dl_list_fwd,
+        "truncation_err": np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float64),
+    }
+    if store_flow == True:
+        output["flow2"] = np.array(sol2)
+        output["flow4"] = np.array(sol4)
+        # For store_flow we keep the (reversed) dl_list used in backward integration.
+        output["dl_list"] = dl_list
+
+    if profile:
+        _t4 = time.perf_counter()
+        output["_timing"] = {
+            "1.初始化": _t1 - _t0,
+            "2.迭代循环": _t2 - _t1,
+            "2b.LIOM反向": _t2b_end - _t2b_start,
+            "3.输出结果": _t4 - _t3,
+            "总时间": _t4 - _t0,
+        }
+        output["_timing"].update(_benchmark_timing_ints)
+
+    # Free up some memory
+    # del sol2,sol4
+    # gc.collect()
+
+    return output
+
+
 def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensordot', norm=False, Hflow=False, store_flow=False):
     forced = _force_steps()
+
+    # 用来统计时间的参数，当BENCHMARK_FLOW_TIMING=1时，记录各个阶段的时间
+    profile = _BENCHMARK_FLOW_TIMING
+    
+    # 每次统计前清空计时器
+    if profile:
+        _t0 = time.perf_counter()
+        for _k in _benchmark_timing_ints:
+            _benchmark_timing_ints[_k] = 0.0
+    
+    # 强制截取dl到固定长度
     if forced is not None:
         dl_list = dl_list[: min(len(dl_list), forced + 1)]
         print(f"        [FORCE_STEPS] Running exactly {len(dl_list)-1} steps (ignoring cutoff)")
-    """
-    [模式 D - 连续内存版] 混合精度递归 (Hybrid: Recursive + Quantized + Contiguous Buffer)
-    
-    关键改进:
-    - Pre-allocation: 放弃 list.append，改为预分配连续的 (BlockSize, N, N) Numpy 数组。
-    - Zero Fragmentation: 彻底消除小对象造成的内存碎片。
-    - Forced Sync: 数据搬运时强制同步，防止 JAX 指令队列堆积。
-    """
+
     # Uses module-level jnp/jit/np imports
     import gc
     
+    # 构建哈密顿量
     H2, Hint = hamiltonian.H2_spinless, hamiltonian.H4_spinless
+
+    # 演化liom算符的函数
     jit_update = jit(update) 
     
     # Initial state dtype:
@@ -4693,7 +4764,7 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
     if _USE_JIT_FLOW:
         _get_jit_ode(int(n))
     
-    # Base Case Block Size (align with recursive for fair comparisons)
+    # 反向演化中停止二分的最小段长，默认20
     BASE_CASE_STEPS = int(os.environ.get("PYFLOW_BASE_CASE_STEPS", "20"))
 
     # Keep ODE tolerances consistent with standard flow_static_int
@@ -4870,7 +4941,8 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
                     Hflow=True,
                 )
             else:
-                soln = ode(int_ode, [curr_h2, curr_hint], steps, rtol=_rtol, atol=_atol)
+                _ode_fn = _ode_scipy_benchmark if profile else ode
+                soln = _ode_fn(int_ode, [curr_h2, curr_hint], steps, rtol=_rtol, atol=_atol)
                 curr_h2, curr_hint = soln[0][-1], soln[1][-1]
             k += 1
             if log_progress:
@@ -4887,7 +4959,20 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
 
     # Phase 1: Forward
     print("        [Hybrid Flow] Phase 1: Forward pass (float64)...")
+    
+    if profile:
+        jax.block_until_ready([H2_init, Hint_init])  # sync array conversions before timing Phase 1 start
+        _t1 = time.perf_counter()
+    
     H2_final, Hint_final = integrate_h_forward(H2_init, Hint_init, 0, len(dl_list)-1, log_progress=True)
+    
+    if profile:
+        jax.block_until_ready([H2_final, Hint_final])
+        _t2 = time.perf_counter()
+        # 快照 Phase 1 的 int_ode 子阶段时间，然后清零，让 Phase 2 单独累积
+        _timing_p1_intode = {k: v for k, v in _benchmark_timing_ints.items()}
+        for _k in _benchmark_timing_ints:
+            _benchmark_timing_ints[_k] = 0.0
     
     # l-bits extraction
     H0_diag = H2_final
@@ -4904,29 +4989,22 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
     
     stats = {'recomputes': 0, 'max_depth': 0, 'quantized_blocks': 0}
 
+    if profile:
+        _t2b_start = time.perf_counter()
+    
     # --- 递归求解器 ---
     def recursive_solve(t_start_idx, t_end_idx, h2_start, hint_start, current_liom2, current_liom4, depth):
         stats['max_depth'] = max(stats['max_depth'], depth)
         
         # === Base Case: 密集区间 ===
+        # 这一段“足够短”，可以一次性把这段上的 H 轨迹算出来、放进内存，再在这段上做 LIOM 反向积分
         if (t_end_idx - t_start_idx) <= BASE_CASE_STEPS:
             stats['quantized_blocks'] += 1
             if t_start_idx % 50 == 0: memlog("flow:step", step=t_start_idx, mode="hybrid_bwd")
 
             block_len = t_end_idx - t_start_idx
             
-            # 【关键优化】预分配连续内存块 (Contiguous Memory Allocation)
-            # 形状：(Steps, N, N) 和 (Steps, N, N, N, N)
-            #
-            # 原实现使用 float16 节省空间，但在部分参数下会发生溢出/饱和（float16 最大约 6.5e4），
-            # 导致 LIOM/ITC 等物理量严重失真（例如 C(t) 爆到 > 1）。
-            # 这里改为“自适应精度”：
-            # - 默认允许 FP16（省内存）
-            # - 若检测到当前区间数据幅值过大，则自动退化到 FP32（更稳）
-            # 也可用环境变量强制选择：
-            #   PYFLOW_HYBRID_BUFFER_DTYPE=float16|float32
-            #
-            # 这里的 +1 是为了存储起点
+            # 用于自适应精度选择
             dtype_env = os.environ.get("PYFLOW_HYBRID_BUFFER_DTYPE", "").strip().lower()
             if dtype_env in ("float16", "fp16"):
                 buffer_dtype = np.float16
@@ -4944,6 +5022,7 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
                 # Conservative threshold below fp16 max to avoid saturation when casting trajectories.
                 buffer_dtype = np.float32 if (not np.isfinite(max_abs) or max_abs > 1.0e4) else np.float16
 
+            # 预分配连续内存块，存放H2和Hint的轨迹
             buffer_h2 = np.zeros((block_len + 1, n, n), dtype=buffer_dtype)
             buffer_hint = np.zeros((block_len + 1, n, n, n, n), dtype=buffer_dtype)
 
@@ -4968,7 +5047,11 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
             else:
                 for k in range(t_start_idx, t_end_idx):
                     steps = np.linspace(dl_list[k], dl_list[k+1], num=2, endpoint=True)
-                    soln = ode(int_ode, [curr_h2, curr_hint], steps, rtol=_rtol, atol=_atol)
+                    '''
+                    ode 函数用于求解 ODE 方程 , 进行H的演化
+                    '''
+                    _ode_fn = _ode_scipy_benchmark if profile else ode
+                    soln = _ode_fn(int_ode, [curr_h2, curr_hint], steps, rtol=_rtol, atol=_atol)
                     curr_h2, curr_hint = soln[0][-1], soln[1][-1]
                     
                     # 存入 buffer
@@ -4977,7 +5060,7 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
                     buffer_h2[local_idx] = np.array(curr_h2, dtype=buffer_dtype)
                     buffer_hint[local_idx] = np.array(curr_hint, dtype=buffer_dtype)
             
-            # 2. Backward: 从 buffer 读取
+            # 2. Backward: 从 buffer 读取 H 用来演化 LIOM 算符
             l2, l4 = current_liom2, current_liom4
             
             for i in range(block_len - 1, -1, -1):
@@ -4989,6 +5072,9 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
                 hint_now = jnp.array(buffer_hint[local_idx], dtype=dtype)
                 
                 t_span_bck = np.linspace(dl_list[global_step+1], dl_list[global_step], num=2, endpoint=True)
+                '''
+                jit_update 函数用于演化 LIOM 算符 , 每次仅反向演化一步 , update函数用于演化LIOM算符
+                '''
                 l2, l4 = jit_update(l2, l4, h2_now, hint_now, t_span_bck)
             
             # 3. 显式释放大块内存
@@ -5015,8 +5101,13 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
 
     # 启动
     liom2_final, liom4_final = recursive_solve(0, len(dl_list)-1, H2_init, Hint_init, liom2, liom4, 0)
+    if profile:
+        jax.block_until_ready([liom2_final, liom4_final])  # sync last jit_update in recursive_solve
+        _t2b_end = time.perf_counter()
     
-    # 输出部分不变
+    if profile:
+        _t3 = time.perf_counter()
+
     output = {
         "H0_diag": np.array(H0_diag), "Hint": np.array(Hint2),
         "LIOM2": np.array(liom2_final), "LIOM4": np.array(liom4_final),
@@ -5024,5 +5115,462 @@ def flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method='tensor
         "dl_list": np.array(dl_list),
         "truncation_err": np.array([0.,0.,0.,0.])
     }
+    if profile:
+        _t4 = time.perf_counter()
+        output["_timing"] = {
+            "1.初始化": _t1 - _t0,
+            "2.迭代循环": _t2 - _t1,
+            "2b.LIOM反向": _t2b_end - _t2b_start,
+            "3.输出结果": _t4 - _t3,
+            "总时间": _t4 - _t0,
+        }
+        # Phase 1 的 int_ode 子阶段时间（对应"2.迭代循环"内部）
+        output["_timing"].update(_timing_p1_intode)
+        # Phase 2 的 int_ode 子阶段时间（对应"2b.LIOM反向"内部的重计算开销），用 2b. 前缀区分
+        for k, v in _benchmark_timing_ints.items():
+            output["_timing"]["2b." + k] = v
     return output
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# PyTorch/GPU helpers for flow_static_int_ckpt_torch
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _ex_helper_torch(n, device):
+    """Mask for Hint diagonal elements: positions [i,i,j,j] and [i,j,j,i] set to 1."""
+    mask = torch.zeros(n**4, dtype=torch.float32, device=device)
+    for i in range(n):
+        for j in range(n):
+            mask[i*n**3 + i*n**2 + j*n + j] = 1.0
+            mask[i*n**3 + j*n**2 + j*n + i] = 1.0
+    return mask
+
+
+def _no_helper_torch(n, device):
+    """Mask for con42 result: zeros where a==c or b==d (torch equivalent of JAX no_helper)."""
+    test = np.ones((n, n, n, n), dtype=np.float32)
+    for i in range(n):
+        test[i, :, i, :] = 0
+        test[:, i, :, i] = 0
+    return torch.tensor(test.reshape(n**4), dtype=torch.float32, device=device)
+
+
+def _extract_diag_torch(H2, Hint, ex_mask):
+    """Torch equivalent of extract_diag: split H2/Hint into diagonal and off-diagonal parts."""
+    H2_0 = torch.diag(torch.diag(H2))
+    V0 = H2 - H2_0
+    Hint0 = (ex_mask * Hint.reshape(-1)).reshape(Hint.shape)
+    Vint = Hint - Hint0
+    return H2_0, V0, Hint0, Vint
+
+
+def _con22_torch(A, B):
+    """Matrix commutator [A, B] = AB - BA."""
+    return A @ B - B @ A
+
+
+def _con42_torch(A, B, no_mask):
+    """Rank-4 tensor with rank-2 matrix contraction, antisymmetry-masked."""
+    n = B.shape[0]
+    con  = torch.einsum('abcd,df->abcf', A, B)
+    con -= torch.einsum('abcd,ec->abed', A, B)
+    con += torch.einsum('abcd,bf->afcd', A, B)
+    con -= torch.einsum('abcd,ea->ebcd', A, B)
+    con = (no_mask * con.reshape(n**4)).reshape(n, n, n, n)
+    return con
+
+
+def _con24_torch(A, B, no_mask):
+    """Rank-2 matrix with rank-4 tensor contraction."""
+    return -_con42_torch(B, A, no_mask)
+
+
+def _int_ode_torch_fn(l, y_flat, n, ex_mask, no_mask):
+    """
+    RHS of flow equation dH/dl = [eta, H], compatible with torchdiffeq (func(t, y)).
+    y_flat: 1-D tensor of shape (n**2 + n**4,)
+    """
+    H2   = y_flat[:n**2].reshape(n, n)
+    Hint = y_flat[n**2:].reshape(n, n, n, n)
+    H2_0, V0, Hint0, Vint = _extract_diag_torch(H2, Hint, ex_mask)
+    eta0    = _con22_torch(H2_0, V0)
+    eta_int = _con42_torch(Hint0, V0, no_mask) + _con24_torch(H2_0, Vint, no_mask)
+    sol  = _con22_torch(eta0, H2)
+    sol2 = _con42_torch(eta_int, H2, no_mask) + _con24_torch(eta0, Hint, no_mask)
+    return torch.cat([sol.reshape(-1), sol2.reshape(-1)])
+
+
+def _update_torch(n2, n4, H2, Hint, dl, ex_mask, no_mask):
+    """
+    LIOM single Euler step (torch equivalent of update()).
+    dl > 0 for forward, dl < 0 for backward (time-reversed) evolution.
+    """
+    H0, V0, Hint0, Vint = _extract_diag_torch(H2, Hint, ex_mask)
+    eta2 = _con22_torch(H0, V0)
+    eta4 = _con42_torch(Hint0, V0, no_mask) + _con24_torch(H0, Vint, no_mask)
+    dn2 = _con22_torch(eta2, n2)
+    dn4 = _con42_torch(eta4, n2, no_mask) + _con24_torch(eta2, n4, no_mask)
+    return n2 + dl * dn2, n4 + dl * dn4
+
+
+def flow_static_int_ckpt_torch(n, hamiltonian, dl_list, qmax, cutoff,
+                                method='tensordot', norm=False, Hflow=False, store_flow=False):
+    """
+    PyTorch/GPU version of flow_static_int_ckpt_liubo.
+    Uses checkpointing to control memory: only sparse checkpoints are kept during
+    forward integration; the backward LIOM evolution re-computes each segment on-the-fly.
+    Requires: torch and torchdiffeq (pip install torchdiffeq).
+    Automatically uses CUDA if available, else falls back to CPU.
+    """
+    if torch is None:
+        raise ImportError("PyTorch is not installed. Cannot use flow_static_int_ckpt_torch.")
+    if torch_odeint is None:
+        raise ImportError("torchdiffeq is not installed. Run: pip install torchdiffeq")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Part 1: Initialization
+    # ═══════════════════════════════════════════════════════════════════
+    print('Part 1: Initialization')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"        [torch] device={device}")
+
+    # Pre-compute masks once (avoid recreating inside loops)
+    ex_mask = _ex_helper_torch(n, device)
+    no_mask = _no_helper_torch(n, device)
+
+    curr_H2   = torch.tensor(np.array(hamiltonian.H2_spinless), dtype=torch.float32, device=device)
+    curr_Hint = torch.tensor(np.array(hamiltonian.H4_spinless), dtype=torch.float32, device=device)
+
+    init_liom2 = torch.zeros((n, n),       dtype=torch.float32, device=device)
+    init_liom2[n // 2, n // 2] = 1.0
+    init_liom4 = torch.zeros((n, n, n, n), dtype=torch.float32, device=device)
+
+    _rtol = float(os.environ.get('PYFLOW_ODE_RTOL', '1e-6'))
+    _atol = float(os.environ.get('PYFLOW_ODE_ATOL', '1e-6'))
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Part 2: Checkpoint interval
+    # ═══════════════════════════════════════════════════════════════════
+    print('Part 2: Checkpoint interval')
+
+    _ckpt_step_env = os.environ.get('PYFLOW_CKPT_STEP', '').strip()
+    if _ckpt_step_env:
+        ckpt_step = max(1, int(_ckpt_step_env))
+        print(f"        ckpt_step={ckpt_step} (manual)")
+    else:
+        ckpt_step = min(20, int(np.sqrt(qmax)))
+        print(f"        ckpt_step={ckpt_step} (auto, min(20, sqrt(qmax)))")
+
+    # Checkpoints: list of (step_idx, H2_numpy_f32, Hint_numpy_f32)
+    checkpoints = []
+    checkpoints.append((0,
+        curr_H2.cpu().numpy().astype(np.float32),
+        curr_Hint.cpu().numpy().astype(np.float32)))
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Part 3: Forward integration
+    # ═══════════════════════════════════════════════════════════════════
+    print('Part 3: Forward integration')
+
+    k = 1
+    J0 = 1.0
+
+    # Closure capturing loop-invariant n, ex_mask, no_mask for torchdiffeq
+    def _ode_fn(t, y):
+        return _int_ode_torch_fn(t, y, n, ex_mask, no_mask)
+
+    while k < len(dl_list) and J0 > cutoff:
+        t_span  = torch.tensor([dl_list[k - 1], dl_list[k]], dtype=torch.float32, device=device)
+        y0_flat = torch.cat([curr_H2.reshape(-1), curr_Hint.reshape(-1)])
+
+        soln    = torch_odeint(_ode_fn, y0_flat, t_span, rtol=_rtol, atol=_atol, method='dopri5')
+        curr_H2   = soln[-1][:n**2].reshape(n, n)
+        curr_Hint = soln[-1][n**2:].reshape(n, n, n, n)
+        del soln
+
+        if k % ckpt_step == 0:
+            checkpoints.append((k,
+                curr_H2.detach().cpu().numpy().astype(np.float32),
+                curr_Hint.detach().cpu().numpy().astype(np.float32)))
+
+        J0 = float(torch.max(torch.abs(curr_H2 - torch.diag(torch.diag(curr_H2)))))
+
+        if k % 100 == 0:
+            print(f"        Step {k}/{len(dl_list)} | l={dl_list[k]:.4f} | off-diag={J0:.2e} | ckpts={len(checkpoints)}", flush=True)
+
+        # if k % 10 == 0:
+        #     memlog("flow:step", step=k, mode="torch_ckpt")
+        k += 1
+
+    # Save final state if not already on a checkpoint boundary
+    if (k - 1) % ckpt_step != 0:
+        checkpoints.append((k - 1,
+            curr_H2.detach().cpu().numpy().astype(np.float32),
+            curr_Hint.detach().cpu().numpy().astype(np.float32)))
+
+    print(f"        Forward pass converged at step {k-1}, off-diag={J0:.2e}, total checkpoints: {len(checkpoints)}")
+
+    # Truncate flow-time grid to actual convergence point
+    dl_list_final = dl_list[:k]
+    del dl_list
+
+    # ─── lbits ───────────────────────────────────────────────────────
+    # Density-density interactions HFint[i,j] = Hint[i,i,j,j] - Hint[i,j,j,i]
+    idx   = torch.arange(n, device=device)
+    HFint = curr_Hint[idx[:, None], idx[:, None], idx[None, :], idx[None, :]] \
+          - curr_Hint[idx[:, None], idx[None, :], idx[None, :], idx[:, None]]
+    HFint_np = HFint.detach().cpu().numpy()
+    lbits = np.zeros(n - 1, dtype=np.float32)
+    for q in range(1, n):
+        vals = (np.diag(HFint_np, q) + np.diag(HFint_np, -q)) / 2.0
+        lbits[q - 1] = float(np.median(np.log10(np.abs(vals) + 1e-30)))
+    del HFint, HFint_np
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Part 4: Backward LIOM integration (segment-by-segment recompute)
+    # ═══════════════════════════════════════════════════════════════════
+    print('Part 4: Backward LIOM integration')
+
+    num_segments = len(checkpoints) - 1
+    print(f"        {num_segments} segments to process")
+
+    for i in range(num_segments, 0, -1):
+        start_step_idx = checkpoints[i - 1][0]
+        end_step_idx   = checkpoints[i][0]
+        segment_len    = end_step_idx - start_step_idx
+        
+        if i % 10 == 0 or i == 1:
+            print(f"        Segment {i}/{num_segments} (steps {start_step_idx}-{end_step_idx})", flush=True)
+
+        # Restore segment start from checkpoint
+        temp_H2   = torch.tensor(checkpoints[i - 1][1], dtype=torch.float32, device=device)
+        temp_Hint = torch.tensor(checkpoints[i - 1][2], dtype=torch.float32, device=device)
+
+        # Recompute forward trajectory for this segment → dense buffer
+        seg_sol2 = [None] * segment_len
+        seg_sol4 = [None] * segment_len
+
+        for curr_step in range(start_step_idx, end_step_idx):
+            local_idx = curr_step - start_step_idx
+            seg_sol2[local_idx] = temp_H2
+            seg_sol4[local_idx] = temp_Hint
+            t_span  = torch.tensor([dl_list_final[curr_step], dl_list_final[curr_step + 1]],
+                                   dtype=torch.float32, device=device)
+            y0_flat = torch.cat([temp_H2.reshape(-1), temp_Hint.reshape(-1)])
+            
+            soln    = torch_odeint(_ode_fn, y0_flat, t_span, rtol=_rtol, atol=_atol, method='dopri5')
+
+            temp_H2   = soln[-1][:n**2].reshape(n, n)
+            temp_Hint = soln[-1][n**2:].reshape(n, n, n, n)
+            
+            del soln
+
+        del temp_H2, temp_Hint
+
+        # Backward LIOM Euler steps: time flows from large l → small l (dl < 0)
+        for local_idx in range(segment_len - 1, -1, -1):
+            global_step = start_step_idx + local_idx
+            dl = float(dl_list_final[global_step] - dl_list_final[global_step + 1])  # negative
+            init_liom2, init_liom4 = _update_torch(
+                init_liom2, init_liom4,
+                seg_sol2[local_idx], seg_sol4[local_idx],
+                dl, ex_mask, no_mask)
+
+        del seg_sol2, seg_sol4
+        checkpoints[i] = None
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Output (same schema as flow_static_int_ckpt_liubo)
+    # ═══════════════════════════════════════════════════════════════════
+    output = {
+        "H0_diag":           curr_H2.detach().cpu().numpy(),
+        "Hint":              curr_Hint.detach().cpu().numpy(),
+        "LIOM Interactions": lbits,
+        "LIOM2":             init_liom2.detach().cpu().numpy(),
+        "LIOM4":             init_liom4.detach().cpu().numpy(),
+        "LIOM2_FWD":         init_liom2.detach().cpu().numpy(),
+        "LIOM4_FWD":         init_liom4.detach().cpu().numpy(),
+        "Invariant":         0,
+        "dl_list":           np.array(dl_list_final),
+        "truncation_err":    np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float64),
+    }
+
+    return output
+
+
+def flow_static_int_ckpt_liubo(n,hamiltonian,dl_list,qmax,cutoff,method='tensordot',norm=False,Hflow=False,store_flow=False):
+    """
+    针对大系统优化的流方程对角化函数，使用检查点（Checkpointing）策略控制内存。
+    正向积分时仅保存稀疏检查点，反向演化 LIOM 时逐段重算密集轨迹，以时间换空间。
+    """
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 第一部分：初始化
+    # 提取哈密顿量矩阵，初始化 LIOM 算符及 ODE 求解精度
+    # ═══════════════════════════════════════════════════════════════════
+    print('Part 1: Initialization')
+    # 从哈密顿量对象中提取二次项和四次相互作用项，转为 JAX 数组后立即释放原始引用
+    curr_H2 = jnp.array(hamiltonian.H2_spinless)
+    curr_Hint = jnp.array(hamiltonian.H4_spinless)
+    orig_dtype = curr_H2.dtype
+
+    # 初始化 LIOM 算符：在对角基底下以中心格点的占据数算符 n_{L/2} 为起点
+    init_liom2 = jnp.zeros((n, n))
+    init_liom2 = init_liom2.at[n//2, n//2].set(1.0)
+    init_liom4 = jnp.zeros((n, n, n, n))
+
+    # JIT 编译 LIOM 单步演化函数，避免重复编译开销
+    jit_update = jit(update)
+
+    # ODE 求解精度，通过环境变量统一配置
+    _rtol = float(os.environ.get('PYFLOW_ODE_RTOL', '1e-6'))
+    _atol = float(os.environ.get('PYFLOW_ODE_ATOL', '1e-6'))
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 第二部分：检查点步长配置
+    # 每隔 ckpt_step 步保存一次哈密顿量快照
+    # ═══════════════════════════════════════════════════════════════════
+    print('Part 2: Checkpoint Configuration')
+    
+    # 检查点间隔步数：默认取 qmax 的算术平方根（使重算开销与内存开销达到平衡），
+    # 也可通过环境变量 PYFLOW_CKPT_STEP 手动指定整数值覆盖默认值
+    _ckpt_step_env = os.environ.get('PYFLOW_CKPT_STEP', '').strip()
+    if _ckpt_step_env:
+        ckpt_step = max(1, int(_ckpt_step_env))
+    else:
+        # 若 final_k 是哈密顿量对角化到达收敛的实际步数，则ckpt_step取 final_k 的平方根时能保证内存峰值最小
+        # qmax是手动设置的，不能代表实际收敛步数，目前先这样设置
+        ckpt_step = min(20 ,int(np.sqrt(qmax)))
+
+    # 检查点列表，每个元素为 (步数索引, H2 快照, Hint 快照)
+    checkpoints = []
+    checkpoints.append((0, np.array(curr_H2, dtype=orig_dtype), np.array(curr_Hint, dtype=orig_dtype)))
+
+    if _ckpt_step_env:
+        print(f"        ckpt_step={ckpt_step} (manual)")
+    else:
+        print(f"        ckpt_step={ckpt_step} (auto, min(20, sqrt(qmax)))")
+    
+    # ═══════════════════════════════════════════════════════════════════
+    # 第三部分：流方程正向积分，实现哈密顿量对角化
+    # 逐步积分 dH/dl = [η, H]，收敛后得到近对角化的哈密顿量
+    # 内存中仅保留当前状态，每隔 ckpt_step 步将快照写入检查点列表
+    # ═══════════════════════════════════════════════════════════════════
+    print('Part 3: Forward Integration')
+
+    k = 1
+    J0 = 1.0
+
+    while k < len(dl_list) and (J0 > cutoff):
+        # 正向积分一步，更新哈密顿量
+        soln = ode(int_ode, [curr_H2, curr_Hint], np.linspace(dl_list[k-1], dl_list[k], num=2, endpoint=True), rtol=_rtol, atol=_atol)
+        curr_H2 = soln[0][-1]
+        curr_Hint = soln[1][-1]
+        del soln
+
+        # 每隔 ckpt_step 步保存一次检查点（JAX → NumPy，释放设备内存）
+        if k % ckpt_step == 0:
+            checkpoints.append((k, np.array(curr_H2, dtype=orig_dtype), np.array(curr_Hint, dtype=orig_dtype)))
+
+        # 用非对角元最大值衡量收敛程度
+        J0 = jnp.max(jnp.abs(curr_H2 - jnp.diag(jnp.diag(curr_H2))))
+
+        if k % 100 == 0:
+            print(f"        Step {k}/{len(dl_list)} | l={dl_list[k]:.4f} | off-diag={J0:.2e} | ckpts={len(checkpoints)}", flush=True)
+
+        # if k % 10 == 0:
+        #     memlog("flow:step", step=k, mode="checkpoint")
+        k += 1
+
+    # 若最后一步未恰好落在检查点上，补存末态
+    if (k - 1) % ckpt_step != 0:
+        checkpoints.append((k - 1, np.array(curr_H2, dtype=orig_dtype), np.array(curr_Hint, dtype=orig_dtype)))
+
+    print(f"        Forward pass converged at step {k-1}, off-diag={J0:.2e}, total checkpoints: {len(checkpoints)}")
+
+    # 截断流时间网格至实际收敛位置
+    dl_list_final = dl_list[:k]
+    del dl_list
+
+    # 提取密度-密度相互作用项 HFint[i,j] = Hint[i,i,j,j] - Hint[i,j,j,i]
+    HFint = jnp.zeros(n**2).reshape(n, n)
+    for i in range(n):
+        for j in range(n):
+            HFint = HFint.at[i, j].set(curr_Hint[i, i, j, j] - curr_Hint[i, j, j, i])
+
+    # 计算 l-bit 相互作用随距离的衰减（对数中值），HFint 用完后立即释放
+    lbits = jnp.zeros(n - 1)
+    for q in range(1, n):
+        lbits = lbits.at[q-1].set(jnp.median(jnp.log10(jnp.abs(jnp.diag(HFint, q) + jnp.diag(HFint, -q)) / 2.)))
+    del HFint
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 第四部分：LIOM 算符反向演化
+    # 从最终时刻向初始时刻逐段倒推：每段先重算正向轨迹存入临时缓冲，
+    # 再利用缓冲中的哈密顿量轨迹反向演化 LIOM 算符，处理完后立即释放内存
+    # ═══════════════════════════════════════════════════════════════════
+    print('Part 4: Backward LIOM integration')
+
+    num_segments = len(checkpoints) - 1
+    print(f"        {num_segments} segments to process")
+
+    for i in range(num_segments, 0, -1):
+        start_step_idx = checkpoints[i-1][0]
+        end_step_idx = checkpoints[i][0]
+        segment_len = end_step_idx - start_step_idx
+
+        if i % 10 == 0 or i == 1:
+            print(f"        Segment {i}/{num_segments} (steps {start_step_idx}-{end_step_idx})", flush=True)
+
+        # 从检查点恢复该段起点的哈密顿量状态
+        temp_H2 = jnp.array(checkpoints[i-1][1])
+        temp_Hint = jnp.array(checkpoints[i-1][2])
+
+        # 预分配该段的密集轨迹缓冲（约 ckpt_step 步，内存可接受）
+        seg_sol2 = [None] * segment_len
+        seg_sol4 = [None] * segment_len
+
+        # 重算该段正向轨迹，逐步填充缓冲
+        for curr_step in range(start_step_idx, end_step_idx):
+            local_idx = curr_step - start_step_idx
+            seg_sol2[local_idx] = temp_H2
+            seg_sol4[local_idx] = temp_Hint
+            
+            soln = ode(int_ode, [temp_H2, temp_Hint], 
+                       np.linspace(dl_list_final[curr_step], dl_list_final[curr_step + 1], num=2, endpoint=True), 
+                       rtol=_rtol, atol=_atol)
+            
+            temp_H2 = soln[0][-1]
+            temp_Hint = soln[1][-1]
+            
+            del soln
+
+        del temp_H2, temp_Hint
+
+        # 利用缓冲中的哈密顿量轨迹，从段尾到段头反向演化 LIOM 算符
+        for local_idx in range(segment_len - 1, -1, -1):
+            global_step = start_step_idx + local_idx
+            # 时间点取反向（大 → 小），驱动 LIOM 算符逆向演化
+            init_liom2, init_liom4 = jit_update(init_liom2, init_liom4, seg_sol2[local_idx], seg_sol4[local_idx],
+                                                 np.linspace(dl_list_final[global_step + 1], dl_list_final[global_step], num=2, endpoint=True))
+
+        # 该段处理完毕，立即释放密集轨迹缓冲和已用检查点
+        del seg_sol2, seg_sol4
+        checkpoints[i] = None
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Output (same schema as flow_static_int_ckpt_liubo)
+    # ═══════════════════════════════════════════════════════════════════
+    output = {
+        "H0_diag": np.array(curr_H2),
+        "Hint": np.array(curr_Hint),
+        "LIOM Interactions": lbits,
+        "LIOM2": np.array(init_liom2),
+        "LIOM4": np.array(init_liom4),
+        "LIOM2_FWD": np.array(init_liom2),
+        "LIOM4_FWD": np.array(init_liom4),
+        "Invariant": 0,
+        "dl_list": np.array(dl_list_final),
+        "truncation_err": np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float64),
+    }
+
+    return output

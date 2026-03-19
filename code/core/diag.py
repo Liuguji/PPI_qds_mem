@@ -124,6 +124,7 @@ def CUT(params,hamiltonian,num,num_int):
                     # Check for JIT acceleration (applies to all modes)
                     use_jit_flow = os.environ.get("USE_JIT_FLOW", "0") in ("1", "true", "True")
                     jit_status = "[JIT ON]" if use_jit_flow else "[JIT OFF]"
+                    use_torch_gpu_flow = os.environ.get("USE_TORCH_GPU_FLOW", "0").lower() in ("1", "true", "on", "yes")
 
                     if str(checkpoint_mode).lower() == "hybrid":
                         print(f"--- [MODE SWITCH] Hybrid Mode (Recursive + Quantized) {jit_status} ---")
@@ -140,18 +141,32 @@ def CUT(params,hamiltonian,num,num_int):
                         )
                     elif checkpoint_mode is True:
                         # Linear Checkpoint mode (Low memory)
-                        print(f"--- [MODE SWITCH] Linear Checkpoint Mode (Low Memory) {jit_status} ---")
-                        flow = flow_static_int_ckpt(
-                            n, hamiltonian, dl, qmax, cutoff,
-                            method=method, norm=norm, Hflow=Hflow, store_flow=store_flow
-                        )
+                        if use_torch_gpu_flow:
+                            print(f"--- [MODE SWITCH] Linear Checkpoint Torch GPU Mode {jit_status} ---")
+                            flow = flow_static_int_ckpt_torch_gpu(
+                                n, hamiltonian, dl, qmax, cutoff,
+                                method=method, norm=norm, Hflow=Hflow, store_flow=store_flow
+                            )
+                        else:
+                            print(f"--- [MODE SWITCH] Linear Checkpoint Mode (Low Memory) {jit_status} ---")
+                            flow = flow_static_int_ckpt(
+                                n, hamiltonian, dl, qmax, cutoff,
+                                method=method, norm=norm, Hflow=Hflow, store_flow=store_flow
+                            )
                     else:
-                        # Standard mode (High memory)
-                        print(f"--- [MODE SWITCH] Standard Mode (High Memory) {jit_status} ---")
-                        flow = flow_static_int(
-                            n, hamiltonian, dl, qmax, cutoff,
-                            method=method, norm=norm, Hflow=Hflow, store_flow=store_flow
-                        )
+                        # Standard mode (High memory) with optional Torch GPU routing.
+                        if use_torch_gpu_flow:
+                            print(f"--- [MODE SWITCH] Standard Torch GPU Mode {jit_status} ---")
+                            flow = flow_static_int_torch_gpu(
+                                n, hamiltonian, dl, qmax, cutoff,
+                                method="torch", norm=norm, Hflow=Hflow, store_flow=store_flow
+                            )
+                        else:
+                            print(f"--- [MODE SWITCH] Standard Mode (High Memory) {jit_status} ---")
+                            flow = flow_static_int(
+                                n, hamiltonian, dl, qmax, cutoff,
+                                method=method, norm=norm, Hflow=Hflow, store_flow=store_flow
+                            )
                 elif LIOM == 'fwd':
                     flow = flow_static_int_fwd(n,hamiltonian,dl,qmax,cutoff,method=method,norm=norm,Hflow=Hflow,store_flow=store_flow)
             elif intr == False:

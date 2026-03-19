@@ -72,7 +72,7 @@ def Hinit(n,d,J,dis_type,x=0,pwrhop=False,alpha=0,Fourier=False,dim=1):
     """ Generate the non-interacting part of the Hamiltonian with the specified on-site potential. """
 
     _maybe_seed_numpy_for_hinit()
-    print('Choice of potential = %s' %dis_type)
+    # print('Choice of potential = %s' %dis_type)
 
     #-----------------------------------------------------------------
     # Non-interacting matrices

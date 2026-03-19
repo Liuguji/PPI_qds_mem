@@ -59,3 +59,7 @@ code/core/dyn_cython.c
 code/core/dyn_cython.html
 
 # (Do not ignore .gitignore itself)
+
+
+# benchmark_results
+benchmark_results/

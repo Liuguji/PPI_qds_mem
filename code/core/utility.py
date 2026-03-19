@@ -31,7 +31,10 @@ import numpy as np
 from numba import jit
 from .contract import contract,contractNO 
 from time import sleep
-from .dyn_cython import cy_levels
+try:
+    from .dyn_cython import cy_levels
+except Exception:
+    cy_levels = None
 
 def namevar(dis_type,dim,dsymm,no_state,dyn,norm,n,LIOM,species,order):
     if norm == True:
@@ -325,6 +328,11 @@ def flow_levels_old(n,array,intr,order=4):
 
 def flow_levels(n,array,intr,order=4):
     """ Function to compute the many-body eigenvalues from the Hamiltonian returned by the TFE method. """
+    # Fallback path when optional Cython extension is unavailable.
+    if cy_levels is None:
+        print("Warning: core.dyn_cython not found, falling back to Python flow_levels_old (slower).")
+        return flow_levels_old(n,array,intr,order=order)
+
     H0 = np.asarray(array["H0_diag"], dtype=np.float64)
     if intr == True:
         Hint = np.asarray(array["Hint"], dtype=np.float64)

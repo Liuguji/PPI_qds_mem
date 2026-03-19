@@ -1,0 +1,347 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  测试目标: flow_static_int_ckpt_torch 与 flow_static_int_ckpt_liubo          ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  L列表              [2, 3, 4, 5, 6]                                          ║
+║  dim                2                                                        ║
+║  qmax               1000                                                     ║
+║  lmax               100.0                                                    ║
+║  cutoff             1.0e-03                                                  ║
+║  dis                5.0                                                      ║
+║  模式               torch(GPU)vsJAX(CPU) 对比                                ║
+║  CKPT_STEP          auto, min(20, sqrt(qmax))                                ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+══════════════════════════════════════════════════════════════════════════════════════════
+  L=2  n=4  dim=2  dis=5.0  U=0.1  J=1.0  qmax=1000  lmax=100.0  cutoff=1.0e-03
+══════════════════════════════════════════════════════════════════════════════════════════
+Part 1: Initialization
+        [torch] device=cuda
+Part 2: Checkpoint interval
+        ckpt_step=20 (auto, min(20, sqrt(qmax)))
+Part 3: Forward integration
+        Step 100/1000 | l=0.0032 | off-diag=9.99e-01 | ckpts=6
+        Step 200/1000 | l=0.0100 | off-diag=9.92e-01 | ckpts=11
+        Step 300/1000 | l=0.0317 | off-diag=9.71e-01 | ckpts=16
+        Step 400/1000 | l=0.1005 | off-diag=9.09e-01 | ckpts=21
+        Step 500/1000 | l=0.3181 | off-diag=5.89e-01 | ckpts=26
+        Step 600/1000 | l=1.0069 | off-diag=6.25e-01 | ckpts=31
+        Step 700/1000 | l=3.1879 | off-diag=4.16e-02 | ckpts=36
+        Forward pass converged at step 745, off-diag=9.40e-04, total checkpoints: 39
+Part 4: Backward LIOM integration
+        38 segments to process
+        Segment 30/38 (steps 580-600)
+        Segment 20/38 (steps 380-400)
+        Segment 10/38 (steps 180-200)
+        Segment 1/38 (steps 0-20)
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  torch 版结果                                                                │
+├──────────────────────────────────────────────────────────────────────────────┤
+│  耗时               32.59 s                                                  │
+│  积分步数           746                                                      │
+│  off-diag 最大值    9.401e-04  (cutoff=1.0e-03)                              │
+│  LIOM2 迹           1.000000  (期望 ≈ 1.0)                                   │
+│  lbits              [-1.49  -1.32  -1.71]                                    │
+└──────────────────────────────────────────────────────────────────────────────┘
+  判断                     ✓ PASS
+Part 1: Initialization
+Part 2: Checkpoint Configuration
+        ckpt_step=20 (auto, min(20, sqrt(qmax)))
+Part 3: Forward Integration
+        Step 100/1000 | l=0.0032 | off-diag=9.99e-01 | ckpts=6
+        Step 200/1000 | l=0.0100 | off-diag=9.92e-01 | ckpts=11
+        Step 300/1000 | l=0.0317 | off-diag=9.71e-01 | ckpts=16
+        Step 400/1000 | l=0.1005 | off-diag=9.09e-01 | ckpts=21
+        Step 500/1000 | l=0.3181 | off-diag=5.89e-01 | ckpts=26
+        Step 600/1000 | l=1.0069 | off-diag=6.25e-01 | ckpts=31
+        Step 700/1000 | l=3.1879 | off-diag=4.16e-02 | ckpts=36
+        Forward pass converged at step 745, off-diag=9.41e-04, total checkpoints: 39
+Part 4: Backward LIOM integration
+        38 segments to process
+        Segment 30/38 (steps 580-600)
+        Segment 20/38 (steps 380-400)
+        Segment 10/38 (steps 180-200)
+        Segment 1/38 (steps 0-20)
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  JAX (liubo) 版结果                                                          │
+├──────────────────────────────────────────────────────────────────────────────┤
+│  耗时               5.20 s                                                   │
+│  积分步数           746                                                      │
+│  off-diag 最大值    9.409e-04  (cutoff=1.0e-03)                              │
+│  LIOM2 迹           1.000000  (期望 ≈ 1.0)                                   │
+└──────────────────────────────────────────────────────────────────────────────┘
+  数值一致性               ✓ OK
+══════════════════════════════════════════════════════════════════════════════════════════
+  L=3  n=9  dim=2  dis=5.0  U=0.1  J=1.0  qmax=1000  lmax=100.0  cutoff=1.0e-03
+══════════════════════════════════════════════════════════════════════════════════════════
+Part 1: Initialization
+        [torch] device=cuda
+Part 2: Checkpoint interval
+        ckpt_step=20 (auto, min(20, sqrt(qmax)))
+Part 3: Forward integration
+        Step 100/1000 | l=0.0032 | off-diag=9.99e-01 | ckpts=6
+        Step 200/1000 | l=0.0100 | off-diag=9.94e-01 | ckpts=11
+        Step 300/1000 | l=0.0317 | off-diag=9.74e-01 | ckpts=16
+        Step 400/1000 | l=0.1005 | off-diag=8.91e-01 | ckpts=21
+        Step 500/1000 | l=0.3181 | off-diag=5.67e-01 | ckpts=26
+        Step 600/1000 | l=1.0069 | off-diag=2.41e-01 | ckpts=31
+        Step 700/1000 | l=3.1879 | off-diag=7.64e-02 | ckpts=36
+        Step 800/1000 | l=10.0926 | off-diag=1.04e-03 | ckpts=41
+        Forward pass converged at step 801, off-diag=9.69e-04, total checkpoints: 42
+Part 4: Backward LIOM integration
+        41 segments to process
+        Segment 40/41 (steps 780-800)
+        Segment 30/41 (steps 580-600)
+        Segment 20/41 (steps 380-400)
+        Segment 10/41 (steps 180-200)
+        Segment 1/41 (steps 0-20)
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  torch 版结果                                                                │
+├──────────────────────────────────────────────────────────────────────────────┤
+│  耗时               57.81 s                                                  │
+│  积分步数           802                                                      │
+│  off-diag 最大值    9.688e-04  (cutoff=1.0e-03)                              │
+│  LIOM2 迹           1.000000  (期望 ≈ 1.0)                                   │
+│  lbits              [-1.56  -1.98  -1.53  -1.91  -2.23  -2.03  -2.55  -2.45] │
+└──────────────────────────────────────────────────────────────────────────────┘
+  判断                     ✓ PASS
+Part 1: Initialization
+Part 2: Checkpoint Configuration
+        ckpt_step=20 (auto, min(20, sqrt(qmax)))
+Part 3: Forward Integration
+        Step 100/1000 | l=0.0032 | off-diag=9.99e-01 | ckpts=6
+        Step 200/1000 | l=0.0100 | off-diag=9.94e-01 | ckpts=11
+        Step 300/1000 | l=0.0317 | off-diag=9.74e-01 | ckpts=16
+        Step 400/1000 | l=0.1005 | off-diag=8.91e-01 | ckpts=21
+        Step 500/1000 | l=0.3181 | off-diag=5.67e-01 | ckpts=26
+        Step 600/1000 | l=1.0069 | off-diag=2.41e-01 | ckpts=31
+        Step 700/1000 | l=3.1879 | off-diag=7.64e-02 | ckpts=36
+        Step 800/1000 | l=10.0926 | off-diag=1.04e-03 | ckpts=41
+        Forward pass converged at step 801, off-diag=9.69e-04, total checkpoints: 42
+Part 4: Backward LIOM integration
+        41 segments to process
+        Segment 40/41 (steps 780-800)
+        Segment 30/41 (steps 580-600)
+        Segment 20/41 (steps 380-400)
+        Segment 10/41 (steps 180-200)
+        Segment 1/41 (steps 0-20)
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  JAX (liubo) 版结果                                                          │
+├──────────────────────────────────────────────────────────────────────────────┤
+│  耗时               28.12 s                                                  │
+│  积分步数           802                                                      │
+│  off-diag 最大值    9.691e-04  (cutoff=1.0e-03)                              │
+│  LIOM2 迹           1.000000  (期望 ≈ 1.0)                                   │
+└──────────────────────────────────────────────────────────────────────────────┘
+  数值一致性               ✓ OK
+══════════════════════════════════════════════════════════════════════════════════════════
+  L=4  n=16  dim=2  dis=5.0  U=0.1  J=1.0  qmax=1000  lmax=100.0  cutoff=1.0e-03
+══════════════════════════════════════════════════════════════════════════════════════════
+Part 1: Initialization
+        [torch] device=cuda
+Part 2: Checkpoint interval
+        ckpt_step=20 (auto, min(20, sqrt(qmax)))
+Part 3: Forward integration
+        Step 100/1000 | l=0.0032 | off-diag=1.00e+00 | ckpts=6
+        Step 200/1000 | l=0.0100 | off-diag=9.98e-01 | ckpts=11
+        Step 300/1000 | l=0.0317 | off-diag=9.90e-01 | ckpts=16
+        Step 400/1000 | l=0.1005 | off-diag=9.47e-01 | ckpts=21
+        Step 500/1000 | l=0.3181 | off-diag=7.77e-01 | ckpts=26
+        Step 600/1000 | l=1.0069 | off-diag=5.83e-01 | ckpts=31
+        Step 700/1000 | l=3.1879 | off-diag=1.47e-01 | ckpts=36
+        Step 800/1000 | l=10.0926 | off-diag=7.55e-02 | ckpts=41
+        Step 900/1000 | l=31.9525 | off-diag=6.64e-02 | ckpts=46
+        Forward pass converged at step 999, off-diag=1.95e-02, total checkpoints: 51
+Part 4: Backward LIOM integration
+        50 segments to process
+        Segment 50/50 (steps 980-999)
+        Segment 40/50 (steps 780-800)
+        Segment 30/50 (steps 580-600)
+        Segment 20/50 (steps 380-400)
+        Segment 10/50 (steps 180-200)
+        Segment 1/50 (steps 0-20)
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  torch 版结果                                                                │
+├──────────────────────────────────────────────────────────────────────────────┤
+│  耗时               297.62 s                                                 │
+│  积分步数           1000                                                     │
+│  off-diag 最大值    1.948e-02  (cutoff=1.0e-03)                              │
+│  LIOM2 迹           1.000000  (期望 ≈ 1.0)                                   │
+│  lbits              [-1.77  -2.10  -2.03  -1.67  -1.94  -2.29  -2.16  -1.91  -2.30  -2.49  -2.35  -2.39  -2.44  -2.63  -2.51]│
+└──────────────────────────────────────────────────────────────────────────────┘
+  判断                     ✗ WARN
+Part 1: Initialization
+Part 2: Checkpoint Configuration
+        ckpt_step=20 (auto, min(20, sqrt(qmax)))
+Part 3: Forward Integration
+        Step 100/1000 | l=0.0032 | off-diag=1.00e+00 | ckpts=6
+        Step 200/1000 | l=0.0100 | off-diag=9.98e-01 | ckpts=11
+        Step 300/1000 | l=0.0317 | off-diag=9.90e-01 | ckpts=16
+        Step 400/1000 | l=0.1005 | off-diag=9.47e-01 | ckpts=21
+        Step 500/1000 | l=0.3181 | off-diag=7.77e-01 | ckpts=26
+        Step 600/1000 | l=1.0069 | off-diag=5.84e-01 | ckpts=31
+        Step 700/1000 | l=3.1879 | off-diag=1.47e-01 | ckpts=36
+        Step 800/1000 | l=10.0926 | off-diag=7.55e-02 | ckpts=41
+        Step 900/1000 | l=31.9525 | off-diag=6.64e-02 | ckpts=46
+        Forward pass converged at step 999, off-diag=1.95e-02, total checkpoints: 51
+Part 4: Backward LIOM integration
+        50 segments to process
+        Segment 50/50 (steps 980-999)
+        Segment 40/50 (steps 780-800)
+        Segment 30/50 (steps 580-600)
+        Segment 20/50 (steps 380-400)
+        Segment 10/50 (steps 180-200)
+        Segment 1/50 (steps 0-20)
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  JAX (liubo) 版结果                                                          │
+├──────────────────────────────────────────────────────────────────────────────┤
+│  耗时               1403.36 s                                                │
+│  积分步数           1000                                                     │
+│  off-diag 最大值    1.951e-02  (cutoff=1.0e-03)                              │
+│  LIOM2 迹           1.000000  (期望 ≈ 1.0)                                   │
+└──────────────────────────────────────────────────────────────────────────────┘
+  数值一致性               ✓ OK
+══════════════════════════════════════════════════════════════════════════════════════════
+  L=5  n=25  dim=2  dis=5.0  U=0.1  J=1.0  qmax=1000  lmax=100.0  cutoff=1.0e-03
+══════════════════════════════════════════════════════════════════════════════════════════
+Part 1: Initialization
+        [torch] device=cuda
+Part 2: Checkpoint interval
+        ckpt_step=20 (auto, min(20, sqrt(qmax)))
+Part 3: Forward integration
+        Step 100/1000 | l=0.0032 | off-diag=1.00e+00 | ckpts=6
+        Step 200/1000 | l=0.0100 | off-diag=9.97e-01 | ckpts=11
+        Step 300/1000 | l=0.0317 | off-diag=9.80e-01 | ckpts=16
+        Step 400/1000 | l=0.1005 | off-diag=9.50e-01 | ckpts=21
+        Step 500/1000 | l=0.3181 | off-diag=8.90e-01 | ckpts=26
+        Step 600/1000 | l=1.0069 | off-diag=4.00e-01 | ckpts=31
+        Step 700/1000 | l=3.1879 | off-diag=2.58e-01 | ckpts=36
+        Step 800/1000 | l=10.0926 | off-diag=1.96e-01 | ckpts=41
+        Step 900/1000 | l=31.9525 | off-diag=5.00e-02 | ckpts=46
+        Forward pass converged at step 999, off-diag=3.97e-02, total checkpoints: 51
+Part 4: Backward LIOM integration
+        50 segments to process
+        Segment 50/50 (steps 980-999)
+        Segment 40/50 (steps 780-800)
+        Segment 30/50 (steps 580-600)
+        Segment 20/50 (steps 380-400)
+        Segment 10/50 (steps 180-200)
+        Segment 1/50 (steps 0-20)
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  torch 版结果                                                                │
+├──────────────────────────────────────────────────────────────────────────────┤
+│  耗时               340.73 s                                                 │
+│  积分步数           1000                                                     │
+│  off-diag 最大值    3.969e-02  (cutoff=1.0e-03)                              │
+│  LIOM2 迹           1.000000  (期望 ≈ 1.0)                                   │
+│  lbits              [-1.84  -2.20  -2.23  -2.07  -1.77  -2.08  -2.39  -2.59  -2.24  -2.35  -2.44  -3.06  -2.52  -2.40  -2.78  -2.52  -2.96  -2.48  -2.91  -2.62  -3.00  -2.77  -2.87  -3.77]│
+└──────────────────────────────────────────────────────────────────────────────┘
+  判断                     ✗ WARN
+Part 1: Initialization
+Part 2: Checkpoint Configuration
+        ckpt_step=20 (auto, min(20, sqrt(qmax)))
+Part 3: Forward Integration
+        Step 100/1000 | l=0.0032 | off-diag=1.00e+00 | ckpts=6
+        Step 200/1000 | l=0.0100 | off-diag=9.97e-01 | ckpts=11
+        Step 300/1000 | l=0.0317 | off-diag=9.80e-01 | ckpts=16
+        Step 400/1000 | l=0.1005 | off-diag=9.50e-01 | ckpts=21
+        Step 500/1000 | l=0.3181 | off-diag=8.90e-01 | ckpts=26
+        Step 600/1000 | l=1.0069 | off-diag=4.00e-01 | ckpts=31
+        Step 700/1000 | l=3.1879 | off-diag=2.58e-01 | ckpts=36
+        Step 800/1000 | l=10.0926 | off-diag=1.96e-01 | ckpts=41
+        Step 900/1000 | l=31.9525 | off-diag=5.00e-02 | ckpts=46
+        Forward pass converged at step 999, off-diag=3.97e-02, total checkpoints: 51
+Part 4: Backward LIOM integration
+        50 segments to process
+        Segment 50/50 (steps 980-999)
+        Segment 40/50 (steps 780-800)
+        Segment 30/50 (steps 580-600)
+        Segment 20/50 (steps 380-400)
+        Segment 10/50 (steps 180-200)
+        Segment 1/50 (steps 0-20)
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  JAX (liubo) 版结果                                                          │
+├──────────────────────────────────────────────────────────────────────────────┤
+│  耗时               9166.71 s                                                │
+│  积分步数           1000                                                     │
+│  off-diag 最大值    3.968e-02  (cutoff=1.0e-03)                              │
+│  LIOM2 迹           1.000000  (期望 ≈ 1.0)                                   │
+└──────────────────────────────────────────────────────────────────────────────┘
+  数值一致性               ✓ OK
+══════════════════════════════════════════════════════════════════════════════════════════
+  L=6  n=36  dim=2  dis=5.0  U=0.1  J=1.0  qmax=1000  lmax=100.0  cutoff=1.0e-03
+══════════════════════════════════════════════════════════════════════════════════════════
+Part 1: Initialization
+        [torch] device=cuda
+Part 2: Checkpoint interval
+        ckpt_step=20 (auto, min(20, sqrt(qmax)))
+Part 3: Forward integration
+        Step 100/1000 | l=0.0032 | off-diag=1.00e+00 | ckpts=6
+        Step 200/1000 | l=0.0100 | off-diag=9.98e-01 | ckpts=11
+        Step 300/1000 | l=0.0317 | off-diag=9.89e-01 | ckpts=16
+        Step 400/1000 | l=0.1005 | off-diag=9.76e-01 | ckpts=21
+        Step 500/1000 | l=0.3181 | off-diag=9.40e-01 | ckpts=26
+        Step 600/1000 | l=1.0069 | off-diag=6.40e-01 | ckpts=31
+        Step 700/1000 | l=3.1879 | off-diag=2.76e-01 | ckpts=36
+        Step 800/1000 | l=10.0926 | off-diag=1.90e-01 | ckpts=41
+        Step 900/1000 | l=31.9525 | off-diag=8.00e-02 | ckpts=46
+        Forward pass converged at step 999, off-diag=4.74e-02, total checkpoints: 51
+Part 4: Backward LIOM integration
+        50 segments to process
+        Segment 50/50 (steps 980-999)
+        Segment 40/50 (steps 780-800)
+        Segment 30/50 (steps 580-600)
+        Segment 20/50 (steps 380-400)
+        Segment 10/50 (steps 180-200)
+        Segment 1/50 (steps 0-20)
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  torch 版结果                                                                │
+├──────────────────────────────────────────────────────────────────────────────┤
+│  耗时               463.83 s                                                 │
+│  积分步数           1000                                                     │
+│  off-diag 最大值    4.742e-02  (cutoff=1.0e-03)                              │
+│  LIOM2 迹           1.000000  (期望 ≈ 1.0)                                   │
+│  lbits              [-1.78  -2.22  -2.74  -2.48  -2.23  -1.67  -2.14  -2.24  -2.41  -2.62  -2.52  -2.23  -2.53  -2.47  -3.05  -2.92  -2.81  -2.43  -2.47  -2.87  -2.39  -2.92  -3.29  -3.01  -3.53  -3.24  -2.71  -3.24  -3.14  -3.34  -2.85  -3.34  -3.00  -3.21  -4.11]│
+└──────────────────────────────────────────────────────────────────────────────┘
+  判断                     ✗ WARN
+Part 1: Initialization
+Part 2: Checkpoint Configuration
+        ckpt_step=20 (auto, min(20, sqrt(qmax)))
+Part 3: Forward Integration
+        Step 100/1000 | l=0.0032 | off-diag=1.00e+00 | ckpts=6
+        Step 200/1000 | l=0.0100 | off-diag=9.98e-01 | ckpts=11
+        Step 300/1000 | l=0.0317 | off-diag=9.89e-01 | ckpts=16
+        Step 400/1000 | l=0.1005 | off-diag=9.76e-01 | ckpts=21
+        Step 500/1000 | l=0.3181 | off-diag=9.40e-01 | ckpts=26
+        Step 600/1000 | l=1.0069 | off-diag=6.40e-01 | ckpts=31
+        Step 700/1000 | l=3.1879 | off-diag=2.76e-01 | ckpts=36
+        Step 800/1000 | l=10.0926 | off-diag=1.91e-01 | ckpts=41
+        Step 900/1000 | l=31.9525 | off-diag=8.00e-02 | ckpts=46
+        Forward pass converged at step 999, off-diag=4.74e-02, total checkpoints: 51
+Part 4: Backward LIOM integration
+        50 segments to process
+        Segment 50/50 (steps 980-999)
+        Segment 40/50 (steps 780-800)
+        Segment 30/50 (steps 580-600)
+        Segment 20/50 (steps 380-400)
+        Segment 10/50 (steps 180-200)
+        Segment 1/50 (steps 0-20)
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  JAX (liubo) 版结果                                                          │
+├──────────────────────────────────────────────────────────────────────────────┤
+│  耗时               37584.42 s                                               │
+│  积分步数           1000                                                     │
+│  off-diag 最大值    4.742e-02  (cutoff=1.0e-03)                              │
+│  LIOM2 迹           1.000000  (期望 ≈ 1.0)                                   │
+└──────────────────────────────────────────────────────────────────────────────┘
+  数值一致性               ✓ OK
+
+════════════════════════════════════════════════════════════════════════════════
+  汇总
+  ──────────────────────────────────────────────────────────────────────────────
+     L     n    eig_err   liom_err    t_torch      t_jax  状态
+  ──────────────────────────────────────────────────────────────
+     2     4   6.74e-05   2.32e-05     32.59s      5.20s  PASS
+     3     9   3.22e-05   1.82e-05     57.81s     28.12s  PASS
+     4    16   1.15e-04   2.66e-05    297.62s   1403.36s  WARN/DIFF
+     5    25   4.79e-04   2.00e-05    340.73s   9166.71s  WARN/DIFF
+     6    36   1.08e-03   3.44e-04    463.83s  37584.42s  WARN/DIFF
+════════════════════════════════════════════════════════════════════════════════
