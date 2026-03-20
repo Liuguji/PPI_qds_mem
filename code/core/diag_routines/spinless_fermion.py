@@ -5229,6 +5229,7 @@ def flow_static_int_ckpt_torch(n, hamiltonian, dl_list, qmax, cutoff,
     # ═══════════════════════════════════════════════════════════════════
     # Part 1: Initialization
     # ═══════════════════════════════════════════════════════════════════
+    t_part1_start = time.perf_counter()
     print('Part 1: Initialization')
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"        [torch] device={device}")
@@ -5246,10 +5247,12 @@ def flow_static_int_ckpt_torch(n, hamiltonian, dl_list, qmax, cutoff,
 
     _rtol = float(os.environ.get('PYFLOW_ODE_RTOL', '1e-6'))
     _atol = float(os.environ.get('PYFLOW_ODE_ATOL', '1e-6'))
+    t_part1_init_s = time.perf_counter() - t_part1_start
 
     # ═══════════════════════════════════════════════════════════════════
     # Part 2: Checkpoint interval
     # ═══════════════════════════════════════════════════════════════════
+    t_part2_start = time.perf_counter()
     print('Part 2: Checkpoint interval')
 
     _ckpt_step_env = os.environ.get('PYFLOW_CKPT_STEP', '').strip()
@@ -5265,11 +5268,13 @@ def flow_static_int_ckpt_torch(n, hamiltonian, dl_list, qmax, cutoff,
     checkpoints.append((0,
         curr_H2.cpu().numpy().astype(np.float32),
         curr_Hint.cpu().numpy().astype(np.float32)))
+    t_part2_ckpt_s = time.perf_counter() - t_part2_start
 
     # ═══════════════════════════════════════════════════════════════════
     # Part 3: Forward integration
     # ═══════════════════════════════════════════════════════════════════
     print('Part 3: Forward integration')
+    t_forward_start = time.perf_counter()
 
     k = 1
     J0 = 1.0
@@ -5308,6 +5313,7 @@ def flow_static_int_ckpt_torch(n, hamiltonian, dl_list, qmax, cutoff,
             curr_Hint.detach().cpu().numpy().astype(np.float32)))
 
     print(f"        Forward pass converged at step {k-1}, off-diag={J0:.2e}, total checkpoints: {len(checkpoints)}")
+    t_forward_diag_s = time.perf_counter() - t_forward_start
 
     # Truncate flow-time grid to actual convergence point
     dl_list_final = dl_list[:k]
@@ -5329,6 +5335,7 @@ def flow_static_int_ckpt_torch(n, hamiltonian, dl_list, qmax, cutoff,
     # Part 4: Backward LIOM integration (segment-by-segment recompute)
     # ═══════════════════════════════════════════════════════════════════
     print('Part 4: Backward LIOM integration')
+    t_backward_start = time.perf_counter()
 
     num_segments = len(checkpoints) - 1
     print(f"        {num_segments} segments to process")
@@ -5378,6 +5385,8 @@ def flow_static_int_ckpt_torch(n, hamiltonian, dl_list, qmax, cutoff,
         del seg_sol2, seg_sol4
         checkpoints[i] = None
 
+    t_backward_liom_s = time.perf_counter() - t_backward_start
+
     # ═══════════════════════════════════════════════════════════════════
     # Output (same schema as flow_static_int_ckpt_liubo)
     # ═══════════════════════════════════════════════════════════════════
@@ -5392,6 +5401,14 @@ def flow_static_int_ckpt_torch(n, hamiltonian, dl_list, qmax, cutoff,
         "Invariant":         0,
         "dl_list":           np.array(dl_list_final),
         "truncation_err":    np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float64),
+        "_timing": {
+            "part1_init_s": float(t_part1_init_s),
+            "part2_ckpt_s": float(t_part2_ckpt_s),
+            "part3_forward_diag_s": float(t_forward_diag_s),
+            "part4_backward_liom_s": float(t_backward_liom_s),
+            "forward_diag_s": float(t_forward_diag_s),
+            "backward_liom_s": float(t_backward_liom_s),
+        },
     }
 
     return output
@@ -5407,6 +5424,7 @@ def flow_static_int_ckpt_liubo(n,hamiltonian,dl_list,qmax,cutoff,method='tensord
     # 第一部分：初始化
     # 提取哈密顿量矩阵，初始化 LIOM 算符及 ODE 求解精度
     # ═══════════════════════════════════════════════════════════════════
+    t_part1_start = time.perf_counter()
     print('Part 1: Initialization')
     # 从哈密顿量对象中提取二次项和四次相互作用项，转为 JAX 数组后立即释放原始引用
     curr_H2 = jnp.array(hamiltonian.H2_spinless)
@@ -5424,11 +5442,13 @@ def flow_static_int_ckpt_liubo(n,hamiltonian,dl_list,qmax,cutoff,method='tensord
     # ODE 求解精度，通过环境变量统一配置
     _rtol = float(os.environ.get('PYFLOW_ODE_RTOL', '1e-6'))
     _atol = float(os.environ.get('PYFLOW_ODE_ATOL', '1e-6'))
+    t_part1_init_s = time.perf_counter() - t_part1_start
 
     # ═══════════════════════════════════════════════════════════════════
     # 第二部分：检查点步长配置
     # 每隔 ckpt_step 步保存一次哈密顿量快照
     # ═══════════════════════════════════════════════════════════════════
+    t_part2_start = time.perf_counter()
     print('Part 2: Checkpoint Configuration')
     
     # 检查点间隔步数：默认取 qmax 的算术平方根（使重算开销与内存开销达到平衡），
@@ -5449,6 +5469,7 @@ def flow_static_int_ckpt_liubo(n,hamiltonian,dl_list,qmax,cutoff,method='tensord
         print(f"        ckpt_step={ckpt_step} (manual)")
     else:
         print(f"        ckpt_step={ckpt_step} (auto, min(20, sqrt(qmax)))")
+    t_part2_ckpt_s = time.perf_counter() - t_part2_start
     
     # ═══════════════════════════════════════════════════════════════════
     # 第三部分：流方程正向积分，实现哈密顿量对角化
@@ -5456,6 +5477,7 @@ def flow_static_int_ckpt_liubo(n,hamiltonian,dl_list,qmax,cutoff,method='tensord
     # 内存中仅保留当前状态，每隔 ckpt_step 步将快照写入检查点列表
     # ═══════════════════════════════════════════════════════════════════
     print('Part 3: Forward Integration')
+    t_forward_start = time.perf_counter()
 
     k = 1
     J0 = 1.0
@@ -5486,6 +5508,7 @@ def flow_static_int_ckpt_liubo(n,hamiltonian,dl_list,qmax,cutoff,method='tensord
         checkpoints.append((k - 1, np.array(curr_H2, dtype=orig_dtype), np.array(curr_Hint, dtype=orig_dtype)))
 
     print(f"        Forward pass converged at step {k-1}, off-diag={J0:.2e}, total checkpoints: {len(checkpoints)}")
+    t_forward_diag_s = time.perf_counter() - t_forward_start
 
     # 截断流时间网格至实际收敛位置
     dl_list_final = dl_list[:k]
@@ -5509,6 +5532,7 @@ def flow_static_int_ckpt_liubo(n,hamiltonian,dl_list,qmax,cutoff,method='tensord
     # 再利用缓冲中的哈密顿量轨迹反向演化 LIOM 算符，处理完后立即释放内存
     # ═══════════════════════════════════════════════════════════════════
     print('Part 4: Backward LIOM integration')
+    t_backward_start = time.perf_counter()
 
     num_segments = len(checkpoints) - 1
     print(f"        {num_segments} segments to process")
@@ -5557,6 +5581,8 @@ def flow_static_int_ckpt_liubo(n,hamiltonian,dl_list,qmax,cutoff,method='tensord
         del seg_sol2, seg_sol4
         checkpoints[i] = None
 
+    t_backward_liom_s = time.perf_counter() - t_backward_start
+
     # ═══════════════════════════════════════════════════════════════════
     # Output (same schema as flow_static_int_ckpt_liubo)
     # ═══════════════════════════════════════════════════════════════════
@@ -5571,6 +5597,182 @@ def flow_static_int_ckpt_liubo(n,hamiltonian,dl_list,qmax,cutoff,method='tensord
         "Invariant": 0,
         "dl_list": np.array(dl_list_final),
         "truncation_err": np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float64),
+        "_timing": {
+            "part1_init_s": float(t_part1_init_s),
+            "part2_ckpt_s": float(t_part2_ckpt_s),
+            "part3_forward_diag_s": float(t_forward_diag_s),
+            "part4_backward_liom_s": float(t_backward_liom_s),
+            "forward_diag_s": float(t_forward_diag_s),
+            "backward_liom_s": float(t_backward_liom_s),
+        },
+    }
+
+    return output
+
+# -------------------第三方测试用-----------------------
+
+def flow_test_cpu(n,hamiltonian,dl_list,qmax,cutoff,method='tensordot',norm=False,Hflow=False,store_flow=False):
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 第一部分：初始化
+    # 提取哈密顿量矩阵，初始化 LIOM 算符及 ODE 求解精度
+    # ═══════════════════════════════════════════════════════════════════
+
+    curr_H2 = jnp.array(hamiltonian.H2_spinless)
+    curr_Hint = jnp.array(hamiltonian.H4_spinless)
+    orig_dtype = curr_H2.dtype
+
+
+    init_liom2 = jnp.zeros((n, n))
+    init_liom2 = init_liom2.at[n//2, n//2].set(1.0)
+    init_liom4 = jnp.zeros((n, n, n, n))
+
+    jit_update = jit(update)
+
+    _rtol = float(os.environ.get('PYFLOW_ODE_RTOL', '1e-6'))
+    _atol = float(os.environ.get('PYFLOW_ODE_ATOL', '1e-6'))
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 第二部分：检查点步长配置
+    # 每隔 ckpt_step 步保存一次哈密顿量快照
+    # ═══════════════════════════════════════════════════════════════════
+
+    _ckpt_step_env = os.environ.get('PYFLOW_CKPT_STEP', '').strip()
+    if _ckpt_step_env:
+        ckpt_step = max(1, int(_ckpt_step_env))
+    else:
+        ckpt_step = min(40 ,int(np.sqrt(qmax)))
+
+    checkpoints = []
+    checkpoints.append((0, np.array(curr_H2, dtype=orig_dtype), np.array(curr_Hint, dtype=orig_dtype)))
+
+    # if _ckpt_step_env:
+    #     print(f"        ckpt_step={ckpt_step} (manual)")
+    # else:
+    #     print(f"        ckpt_step={ckpt_step} (auto, min(40, sqrt(qmax)))")
+    
+    # ═══════════════════════════════════════════════════════════════════
+    # 第三部分：流方程正向积分，实现哈密顿量对角化
+    # 逐步积分 dH/dl = [η, H]，收敛后得到近对角化的哈密顿量
+    # 内存中仅保留当前状态，每隔 ckpt_step 步将快照写入检查点列表
+    # ═══════════════════════════════════════════════════════════════════
+
+    k = 1
+    J0 = 1.0
+
+    while k < len(dl_list) and (J0 > cutoff):
+        # 正向积分一步，更新哈密顿量
+        soln = ode(int_ode, [curr_H2, curr_Hint], np.linspace(dl_list[k-1], dl_list[k], num=2, endpoint=True), rtol=_rtol, atol=_atol)
+        curr_H2 = soln[0][-1]
+        curr_Hint = soln[1][-1]
+        del soln
+
+        # 每隔 ckpt_step 步保存一次检查点（JAX → NumPy，释放设备内存）
+        if k % ckpt_step == 0:
+            checkpoints.append((k, np.array(curr_H2, dtype=orig_dtype), np.array(curr_Hint, dtype=orig_dtype)))
+
+        # 用非对角元最大值衡量收敛程度
+        J0 = jnp.max(jnp.abs(curr_H2 - jnp.diag(jnp.diag(curr_H2))))
+
+        if k % 100 == 0:
+            print(f"        Step {k}/{len(dl_list)} | l={dl_list[k]:.4f} | off-diag={J0:.2e} | ckpts={len(checkpoints)}", flush=True)
+
+        k += 1
+
+    # 若最后一步未恰好落在检查点上，补存末态
+    if (k - 1) % ckpt_step != 0:
+        checkpoints.append((k - 1, np.array(curr_H2, dtype=orig_dtype), np.array(curr_Hint, dtype=orig_dtype)))
+
+    # 记录实际拦截步的 l 值
+    l_intercepted = float(dl_list[k - 1])  # 实际拦截步时的流参数值
+
+    print(f"        Forward pass converged at step {k-1}, off-diag={J0:.2e}, l_intercepted={l_intercepted:.4f}, total checkpoints: {len(checkpoints)}")
+
+    # 截断流时间网格至实际收敛位置
+    dl_list_final = dl_list[:k]
+    del dl_list
+
+    # 提取密度-密度相互作用项 HFint[i,j] = Hint[i,i,j,j] - Hint[i,j,j,i]
+    HFint = jnp.zeros(n**2).reshape(n, n)
+    for i in range(n):
+        for j in range(n):
+            HFint = HFint.at[i, j].set(curr_Hint[i, i, j, j] - curr_Hint[i, j, j, i])
+
+    # 计算 l-bit 相互作用随距离的衰减（对数中值），HFint 用完后立即释放
+    lbits = jnp.zeros(n - 1)
+    for q in range(1, n):
+        lbits = lbits.at[q-1].set(jnp.median(jnp.log10(jnp.abs(jnp.diag(HFint, q) + jnp.diag(HFint, -q)) / 2.)))
+    del HFint
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 第四部分：LIOM 算符反向演化
+    # 从最终时刻向初始时刻逐段倒推：每段先重算正向轨迹存入临时缓冲，
+    # 再利用缓冲中的哈密顿量轨迹反向演化 LIOM 算符，处理完后立即释放内存
+    # ═══════════════════════════════════════════════════════════════════
+
+    num_segments = len(checkpoints) - 1
+
+    for i in range(num_segments, 0, -1):
+        start_step_idx = checkpoints[i-1][0]
+        end_step_idx = checkpoints[i][0]
+        segment_len = end_step_idx - start_step_idx
+
+        if i % 10 == 0 or i == 1:
+            print(f"        Segment {i}/{num_segments} (steps {start_step_idx}-{end_step_idx})", flush=True)
+
+        # 从检查点恢复该段起点的哈密顿量状态
+        temp_H2 = jnp.array(checkpoints[i-1][1])
+        temp_Hint = jnp.array(checkpoints[i-1][2])
+
+        # 预分配该段的密集轨迹缓冲（约 ckpt_step 步，内存可接受）
+        seg_sol2 = [None] * segment_len
+        seg_sol4 = [None] * segment_len
+
+        # 重算该段正向轨迹，逐步填充缓冲
+        for curr_step in range(start_step_idx, end_step_idx):
+            local_idx = curr_step - start_step_idx
+            seg_sol2[local_idx] = temp_H2
+            seg_sol4[local_idx] = temp_Hint
+            
+            soln = ode(int_ode, [temp_H2, temp_Hint], 
+                       np.linspace(dl_list_final[curr_step], dl_list_final[curr_step + 1], num=2, endpoint=True), 
+                       rtol=_rtol, atol=_atol)
+            
+            temp_H2 = soln[0][-1]
+            temp_Hint = soln[1][-1]
+            
+            del soln
+
+        del temp_H2, temp_Hint
+
+        # 利用缓冲中的哈密顿量轨迹，从段尾到段头反向演化 LIOM 算符
+        for local_idx in range(segment_len - 1, -1, -1):
+            global_step = start_step_idx + local_idx
+            # 时间点取反向（大 → 小），驱动 LIOM 算符逆向演化
+            init_liom2, init_liom4 = jit_update(init_liom2, init_liom4, seg_sol2[local_idx], seg_sol4[local_idx],
+                                                 np.linspace(dl_list_final[global_step + 1], dl_list_final[global_step], num=2, endpoint=True))
+
+        # 该段处理完毕，立即释放密集轨迹缓冲和已用检查点
+        del seg_sol2, seg_sol4
+        checkpoints[i] = None
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Output 
+    # ═══════════════════════════════════════════════════════════════════
+    output = {
+        "ckpt_step": int(ckpt_step),  # 检查点步长的实际值
+        
+        "H2": np.array(curr_H2),  # 哈密顿量二次项的最后实际结果
+        "Hint": np.array(curr_Hint),  # 哈密顿量四次项的最后实际结果
+        "H2_offdiag_max": float(J0),  # H2矩阵的非对角元素的最大值
+        "lbits": np.array(lbits),  # lbits数组的实际计算结果
+        
+        "steps_evolved": int(k - 1),  # 哈密顿量的实际演化步数
+        "dl_list": np.array(dl_list_final),  # 分组的步长（从初始到收敛的实际步长网格）
+        "l_intercepted": float(l_intercepted),  # 实际拦截步时的流参数值
+        
+        "LIOM2": np.array(init_liom2),  # LIOM二次项反向演化的最终结果
+        "LIOM4": np.array(init_liom4),  # LIOM四次项反向演化的最终结果
     }
 
     return output

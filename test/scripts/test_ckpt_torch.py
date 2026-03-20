@@ -14,7 +14,9 @@ import os
 import sys
 import argparse
 import time
+import csv
 from pathlib import Path
+from datetime import datetime
 
 os.environ.setdefault("JAX_ENABLE_X64", "true")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -33,6 +35,65 @@ from core.diag_routines.spinless_fermion import (
 )
 
 W = 80  # 分隔线宽度（终端列数）
+
+
+def _safe_token(v) -> str:
+    """将参数值转换为适合文件名的 token。"""
+    s = str(v)
+    return ''.join(ch if ch.isalnum() or ch in ('-', '_') else '_' for ch in s)
+
+
+def _write_per_l_result_file(result: dict, args) -> Path:
+    """每个 L 生成一个结果文件：优先 xlsx，缺少 openpyxl 时回退 csv。"""
+    out_dir = REPO_ROOT / "time_data_CPU_GPU"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    l_token = _safe_token(result.get("L", "unknown"))
+    q_token = _safe_token(args.qmax)
+    lmax_token = _safe_token(args.lmax)
+    stem = f"ckpt_timing_L{l_token}_lmax{lmax_token}_qmax{q_token}_{ts}"
+
+    headers = ["阶段", "CPU版本(JAX) 时间(s)", "GPU版本(Torch) 时间(s)"]
+    stage_rows = [
+        ["Part1 初始化", result.get("jax_part1_init_s"), result.get("torch_part1_init_s")],
+        ["Part2 检查点配置", result.get("jax_part2_ckpt_s"), result.get("torch_part2_ckpt_s")],
+        ["Part3 哈密顿量对角化", result.get("jax_forward_diag_s"), result.get("torch_forward_diag_s")],
+        ["Part4 LIOM反向演化", result.get("jax_backward_liom_s"), result.get("torch_backward_liom_s")],
+        ["总耗时", result.get("t_jax"), result.get("t_torch")],
+    ]
+
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, Alignment
+        from openpyxl.utils import get_column_letter
+
+        out_path = out_dir / f"{stem}.xlsx"
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "ckpt_timing"
+
+        ws.append(headers)
+        for r in stage_rows:
+            ws.append(r)
+
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(horizontal="center")
+
+        for col_idx, h in enumerate(headers, start=1):
+            values = [str(h)] + [str(r[col_idx - 1]) for r in stage_rows]
+            ws.column_dimensions[get_column_letter(col_idx)].width = min(max(len(v) for v in values) + 2, 40)
+
+        wb.save(out_path)
+        return out_path
+    except Exception:
+        out_path = out_dir / f"{stem}.csv"
+        with open(out_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+            writer.writerows(stage_rows)
+        return out_path
 
 
 def _dw(s: str) -> int:
@@ -109,13 +170,27 @@ def run_one(L: int, dim: int, qmax: int, lmax: float, cutoff: float,
     _print_result_block("torch 版结果", t_torch, len(res_torch["dl_list"]),
                         offdiag_t, cutoff, trace_t, lbits=lbits_t)
 
+    timing_torch = res_torch.get("_timing", {})
+    torch_part1_init_s = float(timing_torch.get("part1_init_s", np.nan))
+    torch_part2_ckpt_s = float(timing_torch.get("part2_ckpt_s", np.nan))
+    torch_forward_diag_s = float(timing_torch.get("forward_diag_s", np.nan))
+    torch_backward_liom_s = float(timing_torch.get("backward_liom_s", np.nan))
+    row("torch Part1 初始化", f"{torch_part1_init_s:.3f} s")
+    row("torch Part2 检查点", f"{torch_part2_ckpt_s:.3f} s")
+    row("torch 对角化耗时", f"{torch_forward_diag_s:.3f} s")
+    row("torch LIOM反向耗时", f"{torch_backward_liom_s:.3f} s")
+
     passed_torch = offdiag_t < cutoff * 10 and abs(trace_t - 1.0) < 0.5
     row("判断", f"{'✓ PASS' if passed_torch else '✗ WARN'}")
 
     if torch_only:
         return {"L": L, "n": n, "pass": passed_torch,
                 "offdiag_torch": offdiag_t, "trace_torch": trace_t,
-                "t_torch": t_torch}
+                "t_torch": t_torch,
+            "torch_part1_init_s": torch_part1_init_s,
+            "torch_part2_ckpt_s": torch_part2_ckpt_s,
+                "torch_forward_diag_s": torch_forward_diag_s,
+                "torch_backward_liom_s": torch_backward_liom_s}
 
     
     # ── JAX/liubo 版（对比基准）────────────────────────────────────────────────
@@ -133,6 +208,16 @@ def run_one(L: int, dim: int, qmax: int, lmax: float, cutoff: float,
     _print_result_block("JAX (liubo) 版结果", t_jax, len(res_jax["dl_list"]),
                         offdiag_j, cutoff, trace_j)
 
+    timing_jax = res_jax.get("_timing", {})
+    jax_part1_init_s = float(timing_jax.get("part1_init_s", np.nan))
+    jax_part2_ckpt_s = float(timing_jax.get("part2_ckpt_s", np.nan))
+    jax_forward_diag_s = float(timing_jax.get("forward_diag_s", np.nan))
+    jax_backward_liom_s = float(timing_jax.get("backward_liom_s", np.nan))
+    row("JAX Part1 初始化", f"{jax_part1_init_s:.3f} s")
+    row("JAX Part2 检查点", f"{jax_part2_ckpt_s:.3f} s")
+    row("JAX 对角化耗时", f"{jax_forward_diag_s:.3f} s")
+    row("JAX LIOM反向耗时", f"{jax_backward_liom_s:.3f} s")
+
     
     
     # ── 数值对比 ──────────────────────────────────────────────────────────────
@@ -148,6 +233,14 @@ def run_one(L: int, dim: int, qmax: int, lmax: float, cutoff: float,
         "offdiag_jax":   offdiag_j, "trace_jax":   trace_j,
         "eig_err": eig_err, "liom_err": liom_err,
         "t_torch": t_torch, "t_jax": t_jax,
+        "torch_part1_init_s": torch_part1_init_s,
+        "torch_part2_ckpt_s": torch_part2_ckpt_s,
+        "torch_forward_diag_s": torch_forward_diag_s,
+        "torch_backward_liom_s": torch_backward_liom_s,
+        "jax_part1_init_s": jax_part1_init_s,
+        "jax_part2_ckpt_s": jax_part2_ckpt_s,
+        "jax_forward_diag_s": jax_forward_diag_s,
+        "jax_backward_liom_s": jax_backward_liom_s,
         "pass": passed_torch and numerically_close,
     }
 
@@ -193,11 +286,31 @@ def main():
                         cutoff=args.cutoff, dis=args.dis, dis_type=args.dis_type,
                         torch_only=args.torch_only)
             all_results.append(r)
+            out_path = _write_per_l_result_file(r, args)
+            row("导出文件", str(out_path))
         except Exception as e:
             import traceback
             print(f"\n  [ERROR] L={L} 运行失败: {e}")
             traceback.print_exc()
-            all_results.append({"L": L, "pass": False, "error": str(e)})
+            err_result = {
+                "L": L,
+                "n": L ** args.dim,
+                "pass": False,
+                "error": str(e),
+                "t_torch": np.nan,
+                "t_jax": np.nan,
+                "torch_part1_init_s": np.nan,
+                "torch_part2_ckpt_s": np.nan,
+                "torch_forward_diag_s": np.nan,
+                "torch_backward_liom_s": np.nan,
+                "jax_part1_init_s": np.nan,
+                "jax_part2_ckpt_s": np.nan,
+                "jax_forward_diag_s": np.nan,
+                "jax_backward_liom_s": np.nan,
+            }
+            all_results.append(err_result)
+            out_path = _write_per_l_result_file(err_result, args)
+            row("导出文件", str(out_path))
 
     # ── 汇总表 ────────────────────────────────────────────────────────────────
     print(f"\n{'═' * W}")
