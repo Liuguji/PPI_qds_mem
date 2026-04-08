@@ -9,7 +9,7 @@ Default behavior:
 Generated charts:
 1) avg_cpu_full_flow_mem_by_n               (line plot)
 2) avg_cpu_gpu_elapsed_by_n_clustered_bar   (clustered bar)
-3) avg_cpu_full_flow_mem_by_n_with_ref_y1   (line plot + y=1 reference)
+3) avg_speedup_gpu_vs_cpu_by_n_with_ref_y1  (line plot + y=1 reference)
 
 Each chart is saved in its own subdirectory under liubo_diag.
 Filename format: <file_stem>_<timestamp>.png
@@ -131,14 +131,14 @@ def _save_cluster_elapsed(df_agg: pd.DataFrame, out_dir: Path, ts: str) -> Path:
 
 def _save_line_mem_with_ref(df_agg: pd.DataFrame, out_dir: Path, ts: str) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"avg_cpu_full_flow_mem_by_n_with_ref_y1_{ts}.png"
+    out_path = out_dir / f"avg_speedup_gpu_vs_cpu_by_n_with_ref_y1_{ts}.png"
 
     plt.figure(figsize=(9, 5))
-    sns.lineplot(data=df_agg, x="n", y="cpu_full_flow_mem_gb", marker="o", linewidth=2)
+    sns.lineplot(data=df_agg, x="n", y="speedup_gpu_vs_cpu", marker="o", linewidth=2)
     plt.axhline(y=1.0, color="red", linestyle="--", linewidth=1.5, label="y = 1")
-    plt.title("Average CPU Full-Flow Memory by n (y=1 reference)")
+    plt.title("Average Speedup (GPU vs CPU) by n (y=1 reference)")
     plt.xlabel("n")
-    plt.ylabel("avg cpu_full_flow_mem_gb")
+    plt.ylabel("avg speedup_gpu_vs_cpu")
     # Do not force uniform y-ticks; let matplotlib choose based on data.
     plt.legend()
     plt.grid(True, alpha=0.3)
@@ -175,7 +175,7 @@ def main() -> None:
 
     dir1 = diag_root / "avg_cpu_full_flow_mem_by_n"
     dir2 = diag_root / "avg_cpu_gpu_elapsed_by_n_clustered_bar"
-    dir3 = diag_root / "avg_cpu_full_flow_mem_by_n_with_ref_y1"
+    dir3 = diag_root / "avg_speedup_gpu_vs_cpu_by_n_with_ref_y1"
 
     p1 = _save_line_mem(df_agg, dir1, ts)
     p2 = _save_cluster_elapsed(df_agg, dir2, ts)
