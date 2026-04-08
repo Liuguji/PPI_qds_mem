@@ -65,3 +65,6 @@ code/core/dyn_cython.html
 benchmark_results/
 time_data_CPU_GPU/
 test_results/
+aaa_real_k/
+liubo_diag/
+liubo_test_CPU_GPU_results/

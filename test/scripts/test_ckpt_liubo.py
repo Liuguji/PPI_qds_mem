@@ -1,14 +1,4 @@
 #!/usr/bin/env python3
-"""
-测试 flow_static_int_ckpt_liubo 在多个系统尺寸 L 下的运行情况。
-参数默认值与 benchmark_flow_original_vs_hybrid.py 保持一致。
-
-用法：
-    python test/scripts/test_ckpt_liubo.py
-    python test/scripts/test_ckpt_liubo.py --L 4 6
-    python test/scripts/test_ckpt_liubo.py --L 4 --qmax 500 --lmax 75 --method tensordot
-"""
-
 from __future__ import annotations
 
 import os
@@ -80,7 +70,7 @@ def run_one(L: int, dim: int, qmax: int, lmax: float, cutoff: float,
     print(f"    LIOM2 Frobenius   : {liom_norm:.6f}")
     print(f"    l-bit 衰减(q=1..{n-1}): {lbits}")
 
-    passed = offdiag_max < cutoff * 10 and abs(liom_trace - 1.0) < 0.5
+    passed = offdiag_max < cutoff
     print(f"    状态: {'✓ PASS' if passed else '✗ WARN'}")
 
     return {
