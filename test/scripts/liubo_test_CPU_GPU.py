@@ -24,6 +24,8 @@ os.environ.setdefault("JAX_ENABLE_X64", "true")
 os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
 # Skip current parameter instance if GPU flow hits max steps without convergence.
 os.environ.setdefault("PYFLOW_GPU_SKIP_UNCONVERGED", "1")
+# GPU selection for torch flow (default: 0). Set PYFLOW_GPU_ID to choose a different GPU.
+os.environ.setdefault("PYFLOW_GPU_ID", "0")
 
 
 def _resolve_cpu_threads() -> int:
@@ -99,6 +101,13 @@ def estimate_full_flow_mem_gb(n: int, num_points: int, bytes_per_elem: int) -> f
     return float(total_bytes / 1e9)
 
 
+def estimate_ckpt_flow_mem_gb(n: int, checkpoints_count: int, ckpt_step: int, bytes_per_elem: int) -> float:
+    """Estimate checkpointing memory as (checkpoints_count + ckpt_step - 1) snapshots of H2+Hint."""
+    effective_points = max(0, checkpoints_count + ckpt_step - 1)
+    total_bytes = effective_points * (n**2 + n**4) * bytes_per_elem
+    return float(total_bytes / 1e9)
+
+
 def run_one(L: int, dim: int, qmax: int, lmax: float, cutoff: float,
             method: str, dis: float, dis_type: str) -> dict | None:
     n = L ** dim
@@ -138,10 +147,22 @@ def run_one(L: int, dim: int, qmax: int, lmax: float, cutoff: float,
     gpu_points = int(len(result_gpu["dl_list"]))
     cpu_steps = max(cpu_points - 1, 0)
     gpu_steps = max(gpu_points - 1, 0)
+    cpu_actual_flow_time = float(result_cpu["dl_list"][-1]) if cpu_points > 0 else np.nan
+    gpu_actual_flow_time = float(result_gpu["dl_list"][-1]) if gpu_points > 0 else np.nan
 
-    # H2 and Hint in CPU flow share the same dtype in this implementation.
+    cpu_ckpt_step = int(result_cpu.get("ckpt_step", 0))
+    gpu_ckpt_step = int(result_gpu.get("ckpt_step", 0))
+    cpu_checkpoints_count = int(result_cpu.get("checkpoints_count", 0))
+    gpu_checkpoints_count = int(result_gpu.get("checkpoints_count", 0))
+
+    # H2 and Hint in each flow share the same dtype in this implementation.
     cpu_bytes_per_elem = int(np.asarray(result_cpu["H0_diag"]).dtype.itemsize)
+    gpu_bytes_per_elem = int(np.asarray(result_gpu["H0_diag"]).dtype.itemsize)
+
     cpu_full_flow_mem_gb = estimate_full_flow_mem_gb(n, cpu_points, cpu_bytes_per_elem)
+    gpu_full_flow_mem_gb = estimate_full_flow_mem_gb(n, gpu_points, gpu_bytes_per_elem)
+    cpu_ckpt_flow_mem_gb = estimate_ckpt_flow_mem_gb(n, cpu_checkpoints_count, cpu_ckpt_step, cpu_bytes_per_elem)
+    gpu_ckpt_flow_mem_gb = estimate_ckpt_flow_mem_gb(n, gpu_checkpoints_count, gpu_ckpt_step, gpu_bytes_per_elem)
 
     summary = {
         "L": L,
@@ -158,15 +179,27 @@ def run_one(L: int, dim: int, qmax: int, lmax: float, cutoff: float,
         "speedup_gpu_vs_cpu": (elapsed_cpu / elapsed_gpu) if elapsed_gpu > 0 else np.nan,
         "cpu_steps_evolved": cpu_steps,
         "gpu_steps_evolved": gpu_steps,
+        "cpu_actual_flow_time": cpu_actual_flow_time,
+        "gpu_actual_flow_time": gpu_actual_flow_time,
+        "cpu_ckpt_step": cpu_ckpt_step,
+        "gpu_ckpt_step": gpu_ckpt_step,
+        "cpu_checkpoints_count": cpu_checkpoints_count,
+        "gpu_checkpoints_count": gpu_checkpoints_count,
         "cpu_full_flow_mem_gb": cpu_full_flow_mem_gb,
+        "gpu_full_flow_mem_gb": gpu_full_flow_mem_gb,
+        "cpu_ckpt_flow_mem_gb": cpu_ckpt_flow_mem_gb,
+        "gpu_ckpt_flow_mem_gb": gpu_ckpt_flow_mem_gb,
     }
 
     print(
-        "      CPU: {:.3f}s | GPU: {:.3f}s | speedup: {:.2f}x | CPU full-flow mem~{:.3f} GB".format(
+        "      CPU: {:.3f}s | GPU: {:.3f}s | speedup: {:.2f}x | CPU full~{:.3f} GB, ckpt~{:.3f} GB | GPU full~{:.3f} GB, ckpt~{:.3f} GB".format(
             summary["cpu_elapsed_s"],
             summary["gpu_elapsed_s"],
             summary["speedup_gpu_vs_cpu"],
             summary["cpu_full_flow_mem_gb"],
+            summary["cpu_ckpt_flow_mem_gb"],
+            summary["gpu_full_flow_mem_gb"],
+            summary["gpu_ckpt_flow_mem_gb"],
         ),
         flush=True,
     )
@@ -198,10 +231,11 @@ def main() -> None:
     print(f"dis         : {args.dis}")
     print(f"dis_type    : {args.dis_type}")
     print(f"cpu_threads : {CPU_THREADS}")
+    print(f"gpu_id      : {os.environ.get('PYFLOW_GPU_ID', '0')}")
     print(f"gpu_skip_unconverged : {os.environ.get('PYFLOW_GPU_SKIP_UNCONVERGED', '0')} (1=skip, 0=keep)")
     print("=" * 100)
 
-    out_dir = args.out_dir if args.out_dir is not None else (REPO_ROOT / "liubo_test_CPU_GPU_results")
+    out_dir = args.out_dir if args.out_dir is not None else (REPO_ROOT / "liubo_test_CPU_GPU_data")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     all_results: list[dict] = []
@@ -263,21 +297,24 @@ def main() -> None:
     print("SUMMARY")
     print("=" * 120)
     print(
-        f"{'L':>4} {'n':>6} {'qmax':>6} {'lmax':>8} {'type':>10} {'cutoff':>10} {'CPU(s)':>10} {'GPU(s)':>10} {'spd(x)':>8} {'cpu_steps':>10} {'gpu_steps':>10} {'cpu_mem(GB)':>12}"
+        f"{'L':>4} {'n':>6} {'qmax':>6} {'lmax':>8} {'type':>10} {'cutoff':>10} {'CPU(s)':>10} {'GPU(s)':>10} {'spd(x)':>8} {'cpu_steps':>10} {'gpu_steps':>10} {'cpu_full':>10} {'cpu_ckpt':>10} {'gpu_full':>10} {'gpu_ckpt':>10} {'cpu_ckpts':>10} {'gpu_ckpts':>10}"
     )
     print("-" * 120)
 
     for r in all_results:
         if "error" in r:
             print(
-                f"{r.get('L', ''):>4} {'':>6} {r.get('qmax', ''):>6} {str(r.get('lmax', '')):>8} {str(r.get('dis_type', '')):>10} {str(r.get('cutoff', '')):>10} {'ERROR':>10} {'':>10} {'':>8} {'':>10} {'':>10} {'':>12}"
+                f"{r.get('L', ''):>4} {'':>6} {r.get('qmax', ''):>6} {str(r.get('lmax', '')):>8} {str(r.get('dis_type', '')):>10} {str(r.get('cutoff', '')):>10} {'ERROR':>10} {'':>10} {'':>8} {'':>10} {'':>10} {'':>10} {'':>10} {'':>10} {'':>10} {'':>10} {'':>10}"
             )
             continue
 
         print(
             f"{r['L']:>4} {r['n']:>6} {r['qmax']:>6} {r['lmax']:>8.2f} {r['dis_type']:>10} {r['cutoff']:>10.1e} "
             f"{r['cpu_elapsed_s']:>10.3f} {r['gpu_elapsed_s']:>10.3f} {r['speedup_gpu_vs_cpu']:>8.2f} "
-            f"{r['cpu_steps_evolved']:>10} {r['gpu_steps_evolved']:>10} {r['cpu_full_flow_mem_gb']:>12.3f}"
+            f"{r['cpu_steps_evolved']:>10} {r['gpu_steps_evolved']:>10} "
+            f"{r['cpu_full_flow_mem_gb']:>10.3f} {r['cpu_ckpt_flow_mem_gb']:>10.3f} "
+            f"{r['gpu_full_flow_mem_gb']:>10.3f} {r['gpu_ckpt_flow_mem_gb']:>10.3f} "
+            f"{r['cpu_checkpoints_count']:>10} {r['gpu_checkpoints_count']:>10}"
         )
 
     print("=" * 120)

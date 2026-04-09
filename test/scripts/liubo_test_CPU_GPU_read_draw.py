@@ -3,11 +3,11 @@
 Aggregate CPU/GPU flow JSON summaries by n and generate seaborn charts.
 
 Default behavior:
-- Input dir: <repo_root>/liubo_test_CPU_GPU_results
+- Input dir: <repo_root>/liubo_test_CPU_GPU_data
 - Output dir root: <repo_root>/liubo_diag
 
 Generated charts:
-1) avg_cpu_full_flow_mem_by_n               (line plot)
+1) avg_flow_memory_by_n_three_lines         (line plot, 3 series)
 2) avg_cpu_gpu_elapsed_by_n_clustered_bar   (clustered bar)
 3) avg_speedup_gpu_vs_cpu_by_n_with_ref_y1  (line plot + y=1 reference)
 
@@ -23,9 +23,15 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import seaborn as sns
 from matplotlib import pyplot as plt
+
+try:
+    from scipy.interpolate import make_interp_spline
+except Exception:
+    make_interp_spline = None
 
 
 REQUIRED_KEYS = [
@@ -34,6 +40,8 @@ REQUIRED_KEYS = [
     "gpu_elapsed_s",
     "speedup_gpu_vs_cpu",
     "cpu_full_flow_mem_gb",
+    "cpu_ckpt_flow_mem_gb",
+    "gpu_ckpt_flow_mem_gb",
 ]
 
 
@@ -75,7 +83,14 @@ def _build_aggregated_df(rows: list[dict[str, Any]]) -> pd.DataFrame:
 
     agg = (
         df.groupby("n", as_index=False)[
-            ["cpu_elapsed_s", "gpu_elapsed_s", "speedup_gpu_vs_cpu", "cpu_full_flow_mem_gb"]
+            [
+                "cpu_elapsed_s",
+                "gpu_elapsed_s",
+                "speedup_gpu_vs_cpu",
+                "cpu_full_flow_mem_gb",
+                "cpu_ckpt_flow_mem_gb",
+                "gpu_ckpt_flow_mem_gb",
+            ]
         ]
         .mean()
         .sort_values("n")
@@ -84,15 +99,66 @@ def _build_aggregated_df(rows: list[dict[str, Any]]) -> pd.DataFrame:
     return agg
 
 
-def _save_line_mem(df_agg: pd.DataFrame, out_dir: Path, ts: str) -> Path:
+def _plot_smooth_series(ax, x, y, *, label: str, marker: str = "o", linewidth: float = 2.0) -> None:
+    """Plot a smooth curve through points when possible; otherwise fall back to polyline."""
+    x_arr = pd.to_numeric(pd.Series(x), errors="coerce").to_numpy(dtype=float)
+    y_arr = pd.to_numeric(pd.Series(y), errors="coerce").to_numpy(dtype=float)
+
+    valid = ~(pd.isna(x_arr) | pd.isna(y_arr))
+    x_arr = x_arr[valid]
+    y_arr = y_arr[valid]
+    if len(x_arr) == 0:
+        return
+
+    order = x_arr.argsort()
+    x_arr = x_arr[order]
+    y_arr = y_arr[order]
+
+    # Cubic spline needs scipy and at least 4 points with distinct x.
+    can_smooth = (
+        make_interp_spline is not None
+        and len(x_arr) >= 4
+        and len(set(x_arr.tolist())) == len(x_arr)
+    )
+    if can_smooth:
+        x_dense = np.linspace(float(x_arr.min()), float(x_arr.max()), 300)
+        spline = make_interp_spline(x_arr, y_arr, k=3)
+        y_dense = spline(x_dense)
+        ax.plot(x_dense, y_dense, label=label, linewidth=linewidth)
+        ax.plot(x_arr, y_arr, linestyle="", marker=marker, markersize=5)
+    else:
+        ax.plot(x_arr, y_arr, label=label, marker=marker, linewidth=linewidth)
+
+
+def _save_line_avg_mem_by_n(df_agg: pd.DataFrame, out_dir: Path, ts: str) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"avg_cpu_full_flow_mem_by_n_{ts}.png"
+    out_path = out_dir / f"avg_flow_memory_by_n_three_lines_{ts}.png"
+
+    df_mem = df_agg.melt(
+        id_vars=["n"],
+        value_vars=["cpu_full_flow_mem_gb", "cpu_ckpt_flow_mem_gb", "gpu_ckpt_flow_mem_gb"],
+        var_name="series",
+        value_name="mem_gb",
+    )
 
     plt.figure(figsize=(9, 5))
-    sns.lineplot(data=df_agg, x="n", y="cpu_full_flow_mem_gb", marker="o", linewidth=2)
-    plt.title("Average CPU Full-Flow Memory by n")
+    ax = plt.gca()
+    for series_name in ["cpu_full_flow_mem_gb", "cpu_ckpt_flow_mem_gb", "gpu_ckpt_flow_mem_gb"]:
+        part = df_mem[df_mem["series"] == series_name]
+        _plot_smooth_series(
+            ax,
+            part["n"],
+            part["mem_gb"],
+            label=series_name,
+            marker="o",
+            linewidth=2,
+        )
+    plt.title("Average Flow Memory by n (CPU full / CPU ckpt / GPU ckpt)")
     plt.xlabel("n")
-    plt.ylabel("avg cpu_full_flow_mem_gb")
+    plt.ylabel("avg memory (GB)")
+    # Use logarithmic y-axis so large scale differences are readable.
+    plt.yscale("log")
+    plt.legend(title="metric")
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(out_path, dpi=180)
@@ -100,7 +166,7 @@ def _save_line_mem(df_agg: pd.DataFrame, out_dir: Path, ts: str) -> Path:
     return out_path
 
 
-def _save_cluster_elapsed(df_agg: pd.DataFrame, out_dir: Path, ts: str) -> Path:
+def _save_cluster_avg_elapsed_by_n(df_agg: pd.DataFrame, out_dir: Path, ts: str) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"avg_cpu_gpu_elapsed_by_n_clustered_bar_{ts}.png"
 
@@ -129,12 +195,20 @@ def _save_cluster_elapsed(df_agg: pd.DataFrame, out_dir: Path, ts: str) -> Path:
     return out_path
 
 
-def _save_line_mem_with_ref(df_agg: pd.DataFrame, out_dir: Path, ts: str) -> Path:
+def _save_line_avg_speedup_by_n_with_ref(df_agg: pd.DataFrame, out_dir: Path, ts: str) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"avg_speedup_gpu_vs_cpu_by_n_with_ref_y1_{ts}.png"
 
     plt.figure(figsize=(9, 5))
-    sns.lineplot(data=df_agg, x="n", y="speedup_gpu_vs_cpu", marker="o", linewidth=2)
+    ax = plt.gca()
+    _plot_smooth_series(
+        ax,
+        df_agg["n"],
+        df_agg["speedup_gpu_vs_cpu"],
+        label="speedup_gpu_vs_cpu",
+        marker="o",
+        linewidth=2,
+    )
     plt.axhline(y=1.0, color="red", linestyle="--", linewidth=1.5, label="y = 1")
     plt.title("Average Speedup (GPU vs CPU) by n (y=1 reference)")
     plt.xlabel("n")
@@ -154,7 +228,7 @@ def main() -> None:
     script_path = Path(__file__).resolve()
     repo_root = script_path.parents[2]
 
-    default_input_dir = repo_root / "liubo_test_CPU_GPU_results"
+    default_input_dir = repo_root / "liubo_test_CPU_GPU_data"
     default_diag_root = repo_root / "liubo_diag"
 
     parser = argparse.ArgumentParser(description="Aggregate JSON summaries by n and plot seaborn charts")
@@ -173,13 +247,13 @@ def main() -> None:
     df_agg = _build_aggregated_df(rows)
     ts = time.strftime("%Y%m%d_%H%M%S")
 
-    dir1 = diag_root / "avg_cpu_full_flow_mem_by_n"
+    dir1 = diag_root / "avg_flow_memory_by_n_three_lines"
     dir2 = diag_root / "avg_cpu_gpu_elapsed_by_n_clustered_bar"
     dir3 = diag_root / "avg_speedup_gpu_vs_cpu_by_n_with_ref_y1"
 
-    p1 = _save_line_mem(df_agg, dir1, ts)
-    p2 = _save_cluster_elapsed(df_agg, dir2, ts)
-    p3 = _save_line_mem_with_ref(df_agg, dir3, ts)
+    chart_mem_path = _save_line_avg_mem_by_n(df_agg, dir1, ts)
+    chart_elapsed_path = _save_cluster_avg_elapsed_by_n(df_agg, dir2, ts)
+    chart_speedup_path = _save_line_avg_speedup_by_n_with_ref(df_agg, dir3, ts)
 
     if args.save_agg_csv:
         agg_csv = diag_root / f"n_level_avg_metrics_{ts}.csv"
@@ -190,9 +264,9 @@ def main() -> None:
     print(f"Loaded JSON files: {len(rows)}")
     print("Averaged metrics by n:")
     print(df_agg.to_string(index=False))
-    print(f"Chart 1: {p1}")
-    print(f"Chart 2: {p2}")
-    print(f"Chart 3: {p3}")
+    print(f"Chart 1: {chart_mem_path}")
+    print(f"Chart 2: {chart_elapsed_path}")
+    print(f"Chart 3: {chart_speedup_path}")
 
 
 if __name__ == "__main__":

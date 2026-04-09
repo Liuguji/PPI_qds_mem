@@ -5223,6 +5223,33 @@ def _pack_state_torch(y_flat, H2, Hint, n2):
     y_flat[n2:].copy_(Hint.reshape(-1))
 
 
+def _resolve_torch_flow_device():
+    """Resolve torch flow device from PYFLOW_GPU_ID (default 0), with safe fallback."""
+    if (torch is None) or (not torch.cuda.is_available()):
+        return torch.device('cpu')
+
+    gpu_env = os.environ.get("PYFLOW_GPU_ID", "0").strip()
+    try:
+        gpu_id = int(gpu_env) if gpu_env != "" else 0
+    except ValueError:
+        print(f"        [torch] invalid PYFLOW_GPU_ID={gpu_env!r}, fallback to 0")
+        gpu_id = 0
+
+    gpu_count = int(torch.cuda.device_count())
+    if gpu_id < 0 or gpu_id >= gpu_count:
+        print(f"        [torch] PYFLOW_GPU_ID={gpu_id} out of range [0, {gpu_count - 1}], fallback to 0")
+        gpu_id = 0
+
+    device = torch.device(f'cuda:{gpu_id}')
+    try:
+        torch.cuda.set_device(device)
+    except Exception as exc:
+        print(f"        [torch] failed to set cuda device {gpu_id}: {exc}; fallback to cuda:0")
+        device = torch.device('cuda:0')
+        torch.cuda.set_device(device)
+    return device
+
+
 def flow_static_int_ckpt_torch(n, hamiltonian, dl_list, qmax, cutoff,
                                 method='tensordot', norm=False, Hflow=False, store_flow=False):
     """
@@ -5230,7 +5257,8 @@ def flow_static_int_ckpt_torch(n, hamiltonian, dl_list, qmax, cutoff,
     Uses checkpointing to control memory: only sparse checkpoints are kept during
     forward integration; the backward LIOM evolution re-computes each segment on-the-fly.
     Requires: torch and torchdiffeq (pip install torchdiffeq).
-    Automatically uses CUDA if available, else falls back to CPU.
+    GPU selection is controlled by PYFLOW_GPU_ID (default: 0).
+    Automatically falls back to CPU when CUDA is unavailable.
     """
     if torch is None:
         raise ImportError("PyTorch is not installed. Cannot use flow_static_int_ckpt_torch.")
@@ -5251,8 +5279,8 @@ def flow_static_int_ckpt_torch(n, hamiltonian, dl_list, qmax, cutoff,
     # ═══════════════════════════════════════════════════════════════════
     t_part1_start = time.perf_counter() if timing_enabled else None
     print('Part 1: Initialization')
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"        [torch] device={device}")
+    device = _resolve_torch_flow_device()
+    print(f"        [torch] device={device} (PYFLOW_GPU_ID={os.environ.get('PYFLOW_GPU_ID', '0')})")
 
     # Pre-compute masks once (avoid recreating inside loops)
     ex_mask = _ex_helper_torch(n, device)
@@ -5340,8 +5368,9 @@ def flow_static_int_ckpt_torch(n, hamiltonian, dl_list, qmax, cutoff,
         checkpoints.append((k - 1,
             curr_H2.detach().clone(),
             curr_Hint.detach().clone()))
+    checkpoints_count = len(checkpoints)
 
-    print(f"        Forward pass converged at step {k-1}, off-diag={J0:.2e}, total checkpoints: {len(checkpoints)}")
+    print(f"        Forward pass converged at step {k-1}, off-diag={J0:.2e}, total checkpoints: {checkpoints_count}")
     t_forward_diag_s = (time.perf_counter() - t_forward_start) if timing_enabled else np.nan
 
     # Optional fast-exit: reached max allowed steps and still not converged.
@@ -5354,6 +5383,8 @@ def flow_static_int_ckpt_torch(n, hamiltonian, dl_list, qmax, cutoff,
             "H2_offdiag_max": float(J0),
             "cutoff": float(cutoff),
             "dl_list": np.array(dl_list[:k]),
+            "ckpt_step": int(ckpt_step),
+            "checkpoints_count": int(checkpoints_count),
         }
         if timing_enabled:
             output["_timing"] = {
@@ -5456,6 +5487,8 @@ def flow_static_int_ckpt_torch(n, hamiltonian, dl_list, qmax, cutoff,
         "LIOM4_FWD":         liom4_np,
         "Invariant":         0,
         "dl_list":           np.array(dl_list_final),
+        "ckpt_step":         int(ckpt_step),
+        "checkpoints_count": int(checkpoints_count),
         "truncation_err":    np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float64),
     }
 
@@ -5570,8 +5603,9 @@ def flow_static_int_ckpt_liubo(n,hamiltonian,dl_list,qmax,cutoff,method='tensord
     # 若最后一步未恰好落在检查点上，补存末态
     if (k - 1) % ckpt_step != 0:
         checkpoints.append((k - 1, np.array(curr_H2, dtype=orig_dtype), np.array(curr_Hint, dtype=orig_dtype)))
+    checkpoints_count = len(checkpoints)
 
-    print(f"        Forward pass converged at step {k-1}, off-diag={J0:.2e}, total checkpoints: {len(checkpoints)}")
+    print(f"        Forward pass converged at step {k-1}, off-diag={J0:.2e}, total checkpoints: {checkpoints_count}")
     t_forward_diag_s = (time.perf_counter() - t_forward_start) if timing_enabled else np.nan
 
     # 截断流时间网格至实际收敛位置
@@ -5660,6 +5694,8 @@ def flow_static_int_ckpt_liubo(n,hamiltonian,dl_list,qmax,cutoff,method='tensord
         "LIOM4_FWD": np.array(init_liom4),
         "Invariant": 0,
         "dl_list": np.array(dl_list_final),
+        "ckpt_step": int(ckpt_step),
+        "checkpoints_count": int(checkpoints_count),
         "truncation_err": np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float64),
     }
 
