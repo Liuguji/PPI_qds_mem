@@ -142,17 +142,7 @@ def _save_line_avg_mem_by_n(df_agg: pd.DataFrame, out_dir: Path, ts: str) -> Pat
     )
 
     plt.figure(figsize=(9, 5))
-    ax = plt.gca()
-    for series_name in ["cpu_full_flow_mem_gb", "cpu_ckpt_flow_mem_gb", "gpu_ckpt_flow_mem_gb"]:
-        part = df_mem[df_mem["series"] == series_name]
-        _plot_smooth_series(
-            ax,
-            part["n"],
-            part["mem_gb"],
-            label=series_name,
-            marker="o",
-            linewidth=2,
-        )
+    sns.lineplot(data=df_mem, x="n", y="mem_gb", hue="series", marker="o", linewidth=2)
     plt.title("Average Flow Memory by n (CPU full / CPU ckpt / GPU ckpt)")
     plt.xlabel("n")
     plt.ylabel("avg memory (GB)")

@@ -69,3 +69,4 @@ aaa_real_k/
 liubo_diag/
 liubo_test_CPU_GPU_results/
 liubo_test_CPU_GPU_data/
+*.png
