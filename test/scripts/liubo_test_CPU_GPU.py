@@ -215,7 +215,7 @@ def main() -> None:
     parser.add_argument("--cutoff", type=float, nargs="+", default=[1e-3], help="off-diagonal cutoff")
     parser.add_argument("--method", type=str, default="einsum", help="contraction method")
     parser.add_argument("--dis", type=float, default=5.0, help="disorder strength")
-    parser.add_argument("--dis-type", type=str, nargs="+", default=["random"], dest="dis_type", help="disorder type")
+    parser.add_argument("--dis-type", type=str, nargs="+", default=["linear"], dest="dis_type", help="disorder type")
     parser.add_argument("--out-dir", type=Path, default=None, help="output directory for json files")
     args = parser.parse_args()
 

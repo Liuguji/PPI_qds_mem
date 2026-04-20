@@ -1,0 +1,254 @@
+====================================================================================================
+CPU(JAX) vs GPU(Torch) FLOW TEST
+====================================================================================================
+L           : [8]
+dim         : 2
+qmax        : [60000]
+lmax        : [4000.0]
+cutoff      : [0.001]
+method      : einsum
+dis         : 5.0
+dis_type    : ['linear']
+cpu_threads : 64
+gpu_id      : 0
+gpu_skip_unconverged : 1 (1=skip, 0=keep)
+====================================================================================================
+Part 1: Initialization
+        [torch] device=cuda:0 (PYFLOW_GPU_ID=0)
+Part 2: Checkpoint interval
+        ckpt_step=40 (auto, min(40, sqrt(qmax)))
+Part 3: Forward integration
+        Step 100/60000 | l=0.0010 | off-diag=9.99e-01 | ckpts=3
+        Step 200/60000 | l=0.0011 | off-diag=9.99e-01 | ckpts=6
+        Step 300/60000 | l=0.0011 | off-diag=9.98e-01 | ckpts=8
+        Step 400/60000 | l=0.0011 | off-diag=9.97e-01 | ckpts=11
+        Step 500/60000 | l=0.0011 | off-diag=9.97e-01 | ckpts=13
+        Step 600/60000 | l=0.0012 | off-diag=9.96e-01 | ckpts=16
+        Step 700/60000 | l=0.0012 | off-diag=9.95e-01 | ckpts=18
+        Step 800/60000 | l=0.0012 | off-diag=9.94e-01 | ckpts=21
+        Step 900/60000 | l=0.0013 | off-diag=9.94e-01 | ckpts=23
+        Step 1000/60000 | l=0.0013 | off-diag=9.93e-01 | ckpts=26
+        Step 1100/60000 | l=0.0013 | off-diag=9.92e-01 | ckpts=28
+        Step 1200/60000 | l=0.0014 | off-diag=9.91e-01 | ckpts=31
+        Step 1300/60000 | l=0.0014 | off-diag=9.90e-01 | ckpts=33
+        Step 1400/60000 | l=0.0014 | off-diag=9.89e-01 | ckpts=36
+        Step 1500/60000 | l=0.0015 | off-diag=9.89e-01 | ckpts=38
+        Step 1600/60000 | l=0.0015 | off-diag=9.88e-01 | ckpts=41
+        Step 1700/60000 | l=0.0015 | off-diag=9.87e-01 | ckpts=43
+        Step 1800/60000 | l=0.0016 | off-diag=9.86e-01 | ckpts=46
+        Step 1900/60000 | l=0.0016 | off-diag=9.85e-01 | ckpts=48
+        Step 2000/60000 | l=0.0017 | off-diag=9.84e-01 | ckpts=51
+        Step 2100/60000 | l=0.0017 | off-diag=9.83e-01 | ckpts=53
+        Step 2200/60000 | l=0.0017 | off-diag=9.82e-01 | ckpts=56
+        Step 2300/60000 | l=0.0018 | off-diag=9.80e-01 | ckpts=58
+        Step 2400/60000 | l=0.0018 | off-diag=9.79e-01 | ckpts=61
+        Step 2500/60000 | l=0.0019 | off-diag=9.78e-01 | ckpts=63
+        Step 2600/60000 | l=0.0019 | off-diag=9.77e-01 | ckpts=66
+        Step 2700/60000 | l=0.0020 | off-diag=9.76e-01 | ckpts=68
+        Step 2800/60000 | l=0.0020 | off-diag=9.75e-01 | ckpts=71
+        Step 2900/60000 | l=0.0021 | off-diag=9.73e-01 | ckpts=73
+        Step 3000/60000 | l=0.0021 | off-diag=9.72e-01 | ckpts=76
+        Step 3100/60000 | l=0.0022 | off-diag=9.71e-01 | ckpts=78
+        Step 3200/60000 | l=0.0022 | off-diag=9.69e-01 | ckpts=81
+        Step 3300/60000 | l=0.0023 | off-diag=9.68e-01 | ckpts=83
+        Step 3400/60000 | l=0.0024 | off-diag=9.66e-01 | ckpts=86
+        Step 3500/60000 | l=0.0024 | off-diag=9.65e-01 | ckpts=88
+        Step 3600/60000 | l=0.0025 | off-diag=9.63e-01 | ckpts=91
+        Step 3700/60000 | l=0.0026 | off-diag=9.62e-01 | ckpts=93
+        Step 3800/60000 | l=0.0026 | off-diag=9.60e-01 | ckpts=96
+        Step 3900/60000 | l=0.0027 | off-diag=9.59e-01 | ckpts=98
+        Step 4000/60000 | l=0.0028 | off-diag=9.57e-01 | ckpts=101
+        Step 4100/60000 | l=0.0028 | off-diag=9.55e-01 | ckpts=103
+        Step 4200/60000 | l=0.0029 | off-diag=9.54e-01 | ckpts=106
+        Step 4300/60000 | l=0.0030 | off-diag=9.52e-01 | ckpts=108
+        Step 4400/60000 | l=0.0030 | off-diag=9.50e-01 | ckpts=111
+        Step 4500/60000 | l=0.0031 | off-diag=9.48e-01 | ckpts=113
+        Step 4600/60000 | l=0.0032 | off-diag=9.46e-01 | ckpts=116
+        Step 4700/60000 | l=0.0033 | off-diag=9.44e-01 | ckpts=118
+        Step 4800/60000 | l=0.0034 | off-diag=9.42e-01 | ckpts=121
+        Step 4900/60000 | l=0.0035 | off-diag=9.40e-01 | ckpts=123
+        Step 5000/60000 | l=0.0035 | off-diag=9.38e-01 | ckpts=126
+        Step 5100/60000 | l=0.0036 | off-diag=9.36e-01 | ckpts=128
+        Step 5200/60000 | l=0.0037 | off-diag=9.34e-01 | ckpts=131
+        Step 5300/60000 | l=0.0038 | off-diag=9.32e-01 | ckpts=133
+        Step 5400/60000 | l=0.0039 | off-diag=9.29e-01 | ckpts=136
+        Step 5500/60000 | l=0.0040 | off-diag=9.27e-01 | ckpts=138
+        Step 5600/60000 | l=0.0041 | off-diag=9.25e-01 | ckpts=141
+        Step 5700/60000 | l=0.0042 | off-diag=9.22e-01 | ckpts=143
+        Step 5800/60000 | l=0.0043 | off-diag=9.20e-01 | ckpts=146
+        Step 5900/60000 | l=0.0045 | off-diag=9.17e-01 | ckpts=148
+        Step 6000/60000 | l=0.0046 | off-diag=9.15e-01 | ckpts=151
+        Step 6100/60000 | l=0.0047 | off-diag=9.12e-01 | ckpts=153
+        Step 6200/60000 | l=0.0048 | off-diag=9.09e-01 | ckpts=156
+        Step 6300/60000 | l=0.0049 | off-diag=9.06e-01 | ckpts=158
+        Step 6400/60000 | l=0.0051 | off-diag=9.03e-01 | ckpts=161
+        Step 6500/60000 | l=0.0052 | off-diag=9.01e-01 | ckpts=163
+        Step 6600/60000 | l=0.0053 | off-diag=8.98e-01 | ckpts=166
+        Step 6700/60000 | l=0.0055 | off-diag=8.94e-01 | ckpts=168
+        Step 6800/60000 | l=0.0056 | off-diag=8.91e-01 | ckpts=171
+        Step 6900/60000 | l=0.0057 | off-diag=8.88e-01 | ckpts=173
+        Step 7000/60000 | l=0.0059 | off-diag=8.85e-01 | ckpts=176
+        Step 7100/60000 | l=0.0060 | off-diag=8.82e-01 | ckpts=178
+        Step 7200/60000 | l=0.0062 | off-diag=8.78e-01 | ckpts=181
+        Step 7300/60000 | l=0.0064 | off-diag=8.75e-01 | ckpts=183
+        Step 7400/60000 | l=0.0065 | off-diag=8.71e-01 | ckpts=186
+        Step 7500/60000 | l=0.0067 | off-diag=8.67e-01 | ckpts=188
+        Step 7600/60000 | l=0.0069 | off-diag=8.64e-01 | ckpts=191
+        Step 7700/60000 | l=0.0070 | off-diag=8.60e-01 | ckpts=193
+        Step 7800/60000 | l=0.0072 | off-diag=8.56e-01 | ckpts=196
+        Step 7900/60000 | l=0.0074 | off-diag=8.52e-01 | ckpts=198
+        Step 8000/60000 | l=0.0076 | off-diag=8.48e-01 | ckpts=201
+        Step 8100/60000 | l=0.0078 | off-diag=8.44e-01 | ckpts=203
+        Step 8200/60000 | l=0.0080 | off-diag=8.40e-01 | ckpts=206
+        Step 8300/60000 | l=0.0082 | off-diag=8.35e-01 | ckpts=208
+        Step 8400/60000 | l=0.0084 | off-diag=8.31e-01 | ckpts=211
+        Step 8500/60000 | l=0.0086 | off-diag=8.27e-01 | ckpts=213
+        Step 8600/60000 | l=0.0088 | off-diag=8.22e-01 | ckpts=216
+        Step 8700/60000 | l=0.0091 | off-diag=8.17e-01 | ckpts=218
+        Step 8800/60000 | l=0.0093 | off-diag=8.13e-01 | ckpts=221
+        Step 8900/60000 | l=0.0095 | off-diag=8.08e-01 | ckpts=223
+        Step 9000/60000 | l=0.0098 | off-diag=8.03e-01 | ckpts=226
+        Step 9100/60000 | l=0.0100 | off-diag=7.98e-01 | ckpts=228
+        Step 9200/60000 | l=0.0103 | off-diag=7.93e-01 | ckpts=231
+        Step 9300/60000 | l=0.0106 | off-diag=7.88e-01 | ckpts=233
+        Step 9400/60000 | l=0.0108 | off-diag=7.82e-01 | ckpts=236
+        Step 9500/60000 | l=0.0111 | off-diag=7.77e-01 | ckpts=238
+        Step 9600/60000 | l=0.0114 | off-diag=7.71e-01 | ckpts=241
+        Step 9700/60000 | l=0.0117 | off-diag=7.66e-01 | ckpts=243
+        Step 9800/60000 | l=0.0120 | off-diag=7.60e-01 | ckpts=246
+        Step 9900/60000 | l=0.0123 | off-diag=7.54e-01 | ckpts=248
+        Step 10000/60000 | l=0.0126 | off-diag=7.48e-01 | ckpts=251
+        Step 10100/60000 | l=0.0129 | off-diag=7.42e-01 | ckpts=253
+        Step 10200/60000 | l=0.0133 | off-diag=7.36e-01 | ckpts=256
+        Step 10300/60000 | l=0.0136 | off-diag=7.30e-01 | ckpts=258
+        Step 10400/60000 | l=0.0139 | off-diag=7.24e-01 | ckpts=261
+        Step 10500/60000 | l=0.0143 | off-diag=7.17e-01 | ckpts=263
+        Step 10600/60000 | l=0.0147 | off-diag=7.11e-01 | ckpts=266
+        Step 10700/60000 | l=0.0150 | off-diag=7.04e-01 | ckpts=268
+        Step 10800/60000 | l=0.0154 | off-diag=6.97e-01 | ckpts=271
+        Step 10900/60000 | l=0.0158 | off-diag=6.90e-01 | ckpts=273
+        Step 11000/60000 | l=0.0162 | off-diag=6.83e-01 | ckpts=276
+        Step 11100/60000 | l=0.0166 | off-diag=6.76e-01 | ckpts=278
+        Step 11200/60000 | l=0.0171 | off-diag=6.69e-01 | ckpts=281
+        Step 11300/60000 | l=0.0175 | off-diag=6.62e-01 | ckpts=283
+        Step 11400/60000 | l=0.0180 | off-diag=6.54e-01 | ckpts=286
+        Step 11500/60000 | l=0.0184 | off-diag=6.47e-01 | ckpts=288
+        Step 11600/60000 | l=0.0189 | off-diag=6.39e-01 | ckpts=291
+        Step 11700/60000 | l=0.0194 | off-diag=6.32e-01 | ckpts=293
+        Step 11800/60000 | l=0.0199 | off-diag=6.24e-01 | ckpts=296
+        Step 11900/60000 | l=0.0204 | off-diag=6.16e-01 | ckpts=298
+        Step 12000/60000 | l=0.0209 | off-diag=6.08e-01 | ckpts=301
+        Step 12100/60000 | l=0.0215 | off-diag=6.00e-01 | ckpts=303
+        Step 12200/60000 | l=0.0220 | off-diag=5.92e-01 | ckpts=306
+        Step 12300/60000 | l=0.0226 | off-diag=5.83e-01 | ckpts=308
+        Step 12400/60000 | l=0.0231 | off-diag=5.75e-01 | ckpts=311
+        Step 12500/60000 | l=0.0237 | off-diag=5.66e-01 | ckpts=313
+        Step 12600/60000 | l=0.0243 | off-diag=5.58e-01 | ckpts=316
+        Step 12700/60000 | l=0.0250 | off-diag=5.49e-01 | ckpts=318
+        Step 12800/60000 | l=0.0256 | off-diag=5.40e-01 | ckpts=321
+        Step 12900/60000 | l=0.0263 | off-diag=5.32e-01 | ckpts=323
+        Step 13000/60000 | l=0.0269 | off-diag=5.23e-01 | ckpts=326
+        Step 13100/60000 | l=0.0276 | off-diag=5.14e-01 | ckpts=328
+        Step 13200/60000 | l=0.0283 | off-diag=5.05e-01 | ckpts=331
+        Step 13300/60000 | l=0.0291 | off-diag=4.96e-01 | ckpts=333
+        Step 13400/60000 | l=0.0298 | off-diag=4.87e-01 | ckpts=336
+        Step 13500/60000 | l=0.0306 | off-diag=4.77e-01 | ckpts=338
+        Step 13600/60000 | l=0.0314 | off-diag=4.68e-01 | ckpts=341
+        Step 13700/60000 | l=0.0322 | off-diag=4.59e-01 | ckpts=343
+        Step 13800/60000 | l=0.0330 | off-diag=4.49e-01 | ckpts=346
+        Step 13900/60000 | l=0.0338 | off-diag=4.40e-01 | ckpts=348
+        Step 14000/60000 | l=0.0347 | off-diag=4.30e-01 | ckpts=351
+        Step 14100/60000 | l=0.0356 | off-diag=4.21e-01 | ckpts=353
+        Step 14200/60000 | l=0.0365 | off-diag=4.11e-01 | ckpts=356
+        Step 14300/60000 | l=0.0375 | off-diag=4.02e-01 | ckpts=358
+        Step 14400/60000 | l=0.0384 | off-diag=3.92e-01 | ckpts=361
+        Step 14500/60000 | l=0.0394 | off-diag=3.83e-01 | ckpts=363
+        Step 14600/60000 | l=0.0404 | off-diag=3.73e-01 | ckpts=366
+        Step 14700/60000 | l=0.0415 | off-diag=3.64e-01 | ckpts=368
+        Step 14800/60000 | l=0.0425 | off-diag=3.54e-01 | ckpts=371
+        Step 14900/60000 | l=0.0436 | off-diag=3.45e-01 | ckpts=373
+        Step 15000/60000 | l=0.0447 | off-diag=3.35e-01 | ckpts=376
+        Step 15100/60000 | l=0.0459 | off-diag=3.26e-01 | ckpts=378
+        Step 15200/60000 | l=0.0470 | off-diag=3.16e-01 | ckpts=381
+        Step 15300/60000 | l=0.0483 | off-diag=3.07e-01 | ckpts=383
+        Step 15400/60000 | l=0.0495 | off-diag=2.97e-01 | ckpts=386
+        Step 15500/60000 | l=0.0508 | off-diag=2.88e-01 | ckpts=388
+        Step 15600/60000 | l=0.0521 | off-diag=2.79e-01 | ckpts=391
+        Step 15700/60000 | l=0.0534 | off-diag=2.70e-01 | ckpts=393
+        Step 15800/60000 | l=0.0548 | off-diag=2.61e-01 | ckpts=396
+        Step 15900/60000 | l=0.0562 | off-diag=2.52e-01 | ckpts=398
+        Step 16000/60000 | l=0.0576 | off-diag=2.43e-01 | ckpts=401
+        Step 16100/60000 | l=0.0591 | off-diag=2.34e-01 | ckpts=403
+        Step 16200/60000 | l=0.0606 | off-diag=2.25e-01 | ckpts=406
+        Step 16300/60000 | l=0.0622 | off-diag=2.17e-01 | ckpts=408
+        Step 16400/60000 | l=0.0638 | off-diag=2.08e-01 | ckpts=411
+        Step 16500/60000 | l=0.0654 | off-diag=2.00e-01 | ckpts=413
+        Step 16600/60000 | l=0.0671 | off-diag=1.92e-01 | ckpts=416
+        Step 16700/60000 | l=0.0688 | off-diag=1.84e-01 | ckpts=418
+        Step 16800/60000 | l=0.0706 | off-diag=1.76e-01 | ckpts=421
+        Step 16900/60000 | l=0.0724 | off-diag=1.68e-01 | ckpts=423
+        Step 17000/60000 | l=0.0742 | off-diag=1.60e-01 | ckpts=426
+        Step 17100/60000 | l=0.0761 | off-diag=1.53e-01 | ckpts=428
+        Step 17200/60000 | l=0.0781 | off-diag=1.46e-01 | ckpts=431
+        Step 17300/60000 | l=0.0801 | off-diag=1.38e-01 | ckpts=433
+        Step 17400/60000 | l=0.0822 | off-diag=1.31e-01 | ckpts=436
+        Step 17500/60000 | l=0.0843 | off-diag=1.25e-01 | ckpts=438
+        Step 17600/60000 | l=0.0864 | off-diag=1.18e-01 | ckpts=441
+        Step 17700/60000 | l=0.0886 | off-diag=1.12e-01 | ckpts=443
+        Step 17800/60000 | l=0.0909 | off-diag=1.06e-01 | ckpts=446
+        Step 17900/60000 | l=0.0932 | off-diag=9.96e-02 | ckpts=448
+        Step 18000/60000 | l=0.0956 | off-diag=9.38e-02 | ckpts=451
+        Step 18100/60000 | l=0.0981 | off-diag=8.83e-02 | ckpts=453
+        Step 18200/60000 | l=0.1006 | off-diag=8.29e-02 | ckpts=456
+        Step 18300/60000 | l=0.1032 | off-diag=7.77e-02 | ckpts=458
+        Step 18400/60000 | l=0.1058 | off-diag=7.27e-02 | ckpts=461
+        Step 18500/60000 | l=0.1086 | off-diag=6.79e-02 | ckpts=463
+        Step 18600/60000 | l=0.1113 | off-diag=6.34e-02 | ckpts=466
+        Step 18700/60000 | l=0.1142 | off-diag=5.90e-02 | ckpts=468
+        Step 18800/60000 | l=0.1171 | off-diag=5.48e-02 | ckpts=471
+        Step 18900/60000 | l=0.1201 | off-diag=5.09e-02 | ckpts=473
+        Step 19000/60000 | l=0.1232 | off-diag=4.71e-02 | ckpts=476
+        Step 19100/60000 | l=0.1264 | off-diag=4.35e-02 | ckpts=478
+        Step 19200/60000 | l=0.1296 | off-diag=4.01e-02 | ckpts=481
+        Step 19300/60000 | l=0.1330 | off-diag=3.69e-02 | ckpts=483
+        Step 19400/60000 | l=0.1364 | off-diag=3.39e-02 | ckpts=486
+        Step 19500/60000 | l=0.1399 | off-diag=3.11e-02 | ckpts=488
+        Step 19600/60000 | l=0.1435 | off-diag=2.84e-02 | ckpts=491
+        Step 19700/60000 | l=0.1471 | off-diag=2.59e-02 | ckpts=493
+        Step 19800/60000 | l=0.1509 | off-diag=2.36e-02 | ckpts=496
+        Step 19900/60000 | l=0.1548 | off-diag=2.14e-02 | ckpts=498
+        Step 20000/60000 | l=0.1588 | off-diag=1.94e-02 | ckpts=501
+        Step 20100/60000 | l=0.1628 | off-diag=1.75e-02 | ckpts=503
+        Step 20200/60000 | l=0.1670 | off-diag=1.58e-02 | ckpts=506
+        Step 20300/60000 | l=0.1713 | off-diag=1.42e-02 | ckpts=508
+        Step 20400/60000 | l=0.1757 | off-diag=1.27e-02 | ckpts=511
+        Step 20500/60000 | l=0.1802 | off-diag=1.13e-02 | ckpts=513
+        Step 20600/60000 | l=0.1848 | off-diag=1.01e-02 | ckpts=516
+        Step 20700/60000 | l=0.1896 | off-diag=8.97e-03 | ckpts=518
+        Step 20800/60000 | l=0.1944 | off-diag=7.94e-03 | ckpts=521
+        Step 20900/60000 | l=0.1994 | off-diag=7.01e-03 | ckpts=523
+        Step 21000/60000 | l=0.2045 | off-diag=6.17e-03 | ckpts=526
+        Step 21100/60000 | l=0.2098 | off-diag=5.41e-03 | ckpts=528
+        Step 21200/60000 | l=0.2152 | off-diag=4.73e-03 | ckpts=531
+        Step 21300/60000 | l=0.2207 | off-diag=4.12e-03 | ckpts=533
+        Step 21400/60000 | l=0.2263 | off-diag=3.57e-03 | ckpts=536
+        Step 21500/60000 | l=0.2322 | off-diag=3.09e-03 | ckpts=538
+        Step 21600/60000 | l=0.2381 | off-diag=2.66e-03 | ckpts=541
+        Step 21700/60000 | l=0.2442 | off-diag=2.29e-03 | ckpts=543
+        Step 21800/60000 | l=0.2505 | off-diag=1.95e-03 | ckpts=546
+        Step 21900/60000 | l=0.2569 | off-diag=1.66e-03 | ckpts=548
+        Step 22000/60000 | l=0.2635 | off-diag=1.41e-03 | ckpts=551
+        Step 22100/60000 | l=0.2703 | off-diag=1.19e-03 | ckpts=553
+        Step 22200/60000 | l=0.2772 | off-diag=1.00e-03 | ckpts=556
+        Forward pass converged at step 22202, off-diag=9.99e-04, total checkpoints: 557
+Part 4: Backward LIOM integration
+        556 segments to process
+[ERROR] L=8, lmax=4000.0, qmax=60000, dis_type=linear, cutoff=0.001 failed: CUDA out of memory. Tried to allocate 64.00 MiB. GPU 0 has a total capacity of 39.38 GiB of which 62.12 MiB is free. Including non-PyTorch memory, this process has 39.31 GiB memory in use. Of the allocated memory 38.77 GiB is allocated by PyTorch, and 56.24 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+
+========================================================================================================================
+SUMMARY
+========================================================================================================================
+   L      n   qmax     lmax       type     cutoff     CPU(s)     GPU(s)   spd(x)  cpu_steps  gpu_steps   cpu_full   cpu_ckpt   gpu_full   gpu_ckpt  cpu_ckpts  gpu_ckpts
+------------------------------------------------------------------------------------------------------------------------
+   8         60000   4000.0     linear      0.001      ERROR                                                                                                            
+========================================================================================================================

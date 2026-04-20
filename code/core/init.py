@@ -234,29 +234,6 @@ def Hinit(n,d,J,dis_type,x=0,pwrhop=False,alpha=0,Fourier=False,dim=1):
 
     return H0+V0
 
-def H2_spin_init(n,d,J,dis_type,x=0,pwrhop=False,alpha=0,Fourier=False,dsymm='charge'):
-
-    print('str',isinstance(dsymm,str))
-    if isinstance(dsymm,str) == False:
-        hlist_up = dsymm[0]
-        hlist_down = dsymm[1]
-        print('hup',hlist_up)
-        print('hdn',hlist_down)
-        H2_spin_up = Hinit(n,hlist_up,-1*J,dis_type,x=0,pwrhop=False,alpha=0,Fourier=False)
-        H2_spin_down = Hinit(n,hlist_down,-1*J,dis_type,x=0,pwrhop=False,alpha=0,Fourier=False)
-    else:
-        H2_spin_up = Hinit(n,d,-1*J,dis_type,x=0,pwrhop=False,alpha=0,Fourier=False)
-        if dsymm == 'charge':
-            H2_spin_down = H2_spin_up
-        elif dsymm == 'spin':
-            H2_spin_down = copy.deepcopy(H2_spin_up)
-            for i in range(len(H2_spin_down)):
-                H2_spin_down[i,i] = -H2_spin_up[i,i]
-        elif dsymm == 'random':
-            H2_spin_down = Hinit(n,d,-1*J,dis_type,x=0,pwrhop=False,alpha=0,Fourier=False)
-
-    return H2_spin_up,H2_spin_down
-    
 def Hint_init(n,delta,pwrint=False,beta=0,dim=1,U=0):
     # Interaction tensors
     Hint = np.zeros((n,n,n,n),dtype=np.float32)
@@ -295,6 +272,29 @@ def Hint_init(n,delta,pwrint=False,beta=0,dim=1,U=0):
 
     return Hint+Vint
 
+def H2_spin_init(n,d,J,dis_type,x=0,pwrhop=False,alpha=0,Fourier=False,dsymm='charge'):
+
+    print('str',isinstance(dsymm,str))
+    if isinstance(dsymm,str) == False:
+        hlist_up = dsymm[0]
+        hlist_down = dsymm[1]
+        print('hup',hlist_up)
+        print('hdn',hlist_down)
+        H2_spin_up = Hinit(n,hlist_up,-1*J,dis_type,x=0,pwrhop=False,alpha=0,Fourier=False)
+        H2_spin_down = Hinit(n,hlist_down,-1*J,dis_type,x=0,pwrhop=False,alpha=0,Fourier=False)
+    else:
+        H2_spin_up = Hinit(n,d,-1*J,dis_type,x=0,pwrhop=False,alpha=0,Fourier=False)
+        if dsymm == 'charge':
+            H2_spin_down = H2_spin_up
+        elif dsymm == 'spin':
+            H2_spin_down = copy.deepcopy(H2_spin_up)
+            for i in range(len(H2_spin_down)):
+                H2_spin_down[i,i] = -H2_spin_up[i,i]
+        elif dsymm == 'random':
+            H2_spin_down = Hinit(n,d,-1*J,dis_type,x=0,pwrhop=False,alpha=0,Fourier=False)
+
+    return H2_spin_up,H2_spin_down
+  
 def H4_spin_init(n,delta_up=0,delta_down=0,delta_updown=0,delta_onsite=0,delta_mixed=0):
 
     # Interaction tensors

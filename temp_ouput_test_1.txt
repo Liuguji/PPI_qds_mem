@@ -1,0 +1,20 @@
+====================================================================================================
+CPU(JAX) vs GPU(Torch) FLOW TEST
+====================================================================================================
+L           : [8]
+dim         : 2
+qmax        : [60000, 80000]
+lmax        : [4000.0]
+cutoff      : [0.001]
+method      : einsum
+dis         : 5.0
+dis_type    : ['random']
+cpu_threads : 64
+gpu_id      : 0
+gpu_skip_unconverged : 1 (1=skip, 0=keep)
+====================================================================================================
+Part 1: Initialization
+        [torch] device=cuda:0 (PYFLOW_GPU_ID=0)
+Part 2: Checkpoint interval
+        ckpt_step=40 (auto, min(40, sqrt(qmax)))
+Part 3: Forward integration
