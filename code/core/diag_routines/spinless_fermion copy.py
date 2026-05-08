@@ -3866,201 +3866,6 @@ def flow_dyn_int_singlesite(n,hamiltonian,num,num_int,dl_list,qmax,cutoff,tlist,
     return output
  
     
-def flow_dyn_int_imb(n,hamiltonian,num,num_int,dl_list,qmax,cutoff,tlist,method='jit',store_flow=False):
-    """
-    Diagonalise an initial interacting Hamiltonian and compute the quench dynamics.
-
-    This function will return the imbalance following a quench, which involves computing the 
-    non-equilibrium dynamics of the densiy operator on every single lattice site.
-
-        Parameters
-        ----------
-        n : integer
-            Linear system size.
-        H0 : array, float
-            Diagonal component of Hamiltonian
-        V0 : array, float
-            Off-diagonal component of Hamiltonian.
-        Hint : array, float
-            Diagonal component of Hamiltonian
-        Vint : array, float
-            Off-diagonal component of Hamiltonian.
-        num : array, float
-            Density operator n_i(t=0) to be time-evolved.
-        dl_list : array, float
-            List of flow times to use for the numerical integration.
-        qmax : integer
-            Maximum number of flow time steps.
-        cutoff : float
-            Threshold value below which off-diagonal elements are set to zero.
-        tlist : array
-            List of timesteps to return time-evolved operator n_i(t).
-        method : string, optional
-            Specify which method to use to generate the RHS of the flow equations.
-            Method choices are 'einsum', 'tensordot', 'jit' and 'vec'.
-            The first two are built-in NumPy methods, while the latter two are custom coded for speed.
-
-        Returns
-        -------
-        sol : array, float
-            Final (diagonal) Hamiltonian
-        central : array, float
-            Local integral of motion (LIOM) computed on the central lattice site of the chain
-    
-    """
-
-    H2 = hamiltonian.H2_spinless
-    H4 = hamiltonian.H4_spinless
-
-    # Initialise array to hold solution at all flow times
-    sol_int = jnp.zeros((qmax,n**2+n**4),dtype=jnp.float32)
-    # print('Memory64 required: MB', sol_int.nbytes/10**6)
-    
-    # Initialise the first flow timestep
-    init = jnp.zeros(n**2+n**4,dtype=jnp.float32)
-    init[:n**2] = (H2).reshape(n**2)
-    init[n**2:] = (H4).reshape(n**4)
-    sol_int[0] = init
-
-    # Define integrator
-    r_int = ode(int_ode).set_integrator('dopri5', nsteps=50,atol=10**(-6),rtol=10**(-3))
-    r_int.set_initial_value(init,dl_list[0])
-    r_int.set_f_params(n,[],method)
-    
-    
-    # Numerically integrate the flow equations
-    k = 1                       # Flow timestep index
-    J0 = 10.                    # Seed value for largest off-diagonal term
-    # Integration continues until qmax is reached or all off-diagonal elements decay below cutoff
-    while r_int.successful() and k < qmax-1 and J0 > cutoff:
-        r_int.integrate(dl_list[k])
-        sol_int[k] = r_int.y
-        mat = sol_int[k,0:n**2].reshape(n,n)
-        off_diag = mat-jnp.diag(jnp.diag(mat))
-        J0 = max(off_diag.reshape(n**2))
-        k += 1
-
-    # Truncate solution list and flow time list to max timestep reached
-    sol_int=sol_int[:k-1]
-    dl_list=dl_list[:k-1]
-
-    # Define final Hamiltonian, for function return
-    H0final,Hintfinal = sol_int[-1,:n**2].reshape(n,n),sol_int[-1,n**2::].reshape(n,n,n,n)
-    
-    # Define final diagonal quadratic Hamiltonian
-    H0_diag = sol_int[-1,:n**2].reshape(n,n)
-    # Define final diagonal quartic Hamiltonian
-    Hint = sol_int[-1,n**2::].reshape(n,n,n,n)   
-    # Extract only the density-density terms of the final quartic Hamiltonian, as a matrix                     
-    HFint = jnp.zeros(n**2).reshape(n,n)
-    for i in range(n):
-        for j in range(n):
-            HFint[i,j] = Hint[i,i,j,j]
-            HFint[i,j] += -Hint[i,j,j,i]
-
-    # Compute the l-bit interactions from the density-density terms in the final Hamiltonian
-    lbits = jnp.zeros(n-1)
-    for q in range(1,n):
-        lbits[q-1] = jnp.median(jnp.log10(jnp.abs(jnp.diag(HFint,q)+jnp.diag(HFint,-q))/2.))
-
-    # Initialise a density operator in the diagonal basis on the central site
-    liom = jnp.zeros((k,n**2+n**4),dtype=jnp.float32)
-    init_liom = jnp.zeros((n,n))
-    init_liom[n//2,n//2] = 1.0
-    liom[0,:n**2] = init_liom.reshape(n**2)
-    
-    # Reverse list of flow times in order to conduct backwards integration
-    dl_list = dl_list[::-1]
-    
-    # Set up initial state as a CDW
-    list1 = jnp.array([1. for i in range(n//2)])
-    list2 = jnp.array([0. for i in range(n//2)])
-    state = jnp.array([val for pair in zip(list1,list2) for val in pair])
-    
-    # Define lists to store the time-evolved density operators on each lattice site
-    # 'imblist' will include interaction effects
-    # 'imblist2' includes only single-particle effects
-    # Both are kept to check for diverging interaction terms
-    imblist = jnp.zeros((n,len(tlist)))
-    imblist2 = jnp.zeros((n,len(tlist)))
-
-    # Compute the time-evolution of the number operator on every site
-    for site in range(n):
-        # Initialise operator to be time-evolved
-        num = jnp.zeros((k,n**2+n**4))
-        num_init = jnp.zeros((n,n),dtype=jnp.float32)
-        num_init[site,site] = 1.0
-
-        num[0,0:n**2] = num_init.reshape(n**2)
-        
-            # Invert dl again back to original
-        dl_list = dl_list[::-1]
-
-        # Define integrator for density operator again
-        # This time we integrate from l=0 to l -> infinity
-        num_int = ode(liom_ode).set_integrator('dopri5', nsteps=50,atol=10**(-6),rtol=10**(-3))
-        num_int.set_initial_value(num[0],dl_list[0])
-        k0=1
-        while num_int.successful() and k0 < k-1:
-            num_int.set_f_params(n,sol_int[k0],method)
-            num_int.integrate(dl_list[k0])
-            # liom[k0] = num_int.y
-            k0 += 1
-        num = num_int.y
-        
-        # Run non-equilibrium dynamics following a quench from CDW state
-        # Returns answer *** in LIOM basis ***
-        evolist2 = dyn_exact(n,num,sol_int[-1],tlist)
-        dl_list = dl_list[::-1] # Reverse the flow
-        
-        num_t_list2 = jnp.zeros((len(tlist),n**2+n**4))
-        # For each timestep, integrate back from l -> infinity to l=0
-        # i.e. from LIOM basis back to original microscopic basis
-        for t0 in range(len(tlist)):
-            
-            num_int = ode(liom_ode).set_integrator('dopri5',nsteps=50,atol=10**(-8),rtol=10**(-8))
-            num_int.set_initial_value(evolist2[t0],dl_list[0])
-            k0=1
-            while num_int.successful() and k0 < k-1:
-                num_int.set_f_params(n,sol_int[-k0],method,True)
-                num_int.integrate(dl_list[k0])
-                k0 += 1
-            num_t_list2[t0] = num_int.y
-        
-        # Initialise lists to store the expectation value of time-evolved density operator at each timestep
-        nlist = jnp.zeros(len(tlist))
-        nlist2 = jnp.zeros(len(tlist))
-        
-        # Compute the expectation value <n_i(t)> for each timestep t
-        n2list = num_t_list2[::,:n**2]
-        n4list = num_t_list2[::,n**2:]
-        for t0 in range(len(tlist)):
-            mat = n2list[t0].reshape(n,n)
-            mat4 = n4list[t0].reshape(n,n,n,n)
-            # phaseMF = 0.
-            for i in range(n):
-                # nlist[t0] += (mat[i,i]*state[i]**2).real
-                nlist[t0] += (mat[i,i]*state[i]).real
-                nlist2[t0] += (mat[i,i]*state[i]).real
-                for j in range(n):
-                    if i != j:
-                        nlist[t0] += (mat4[i,i,j,j]*state[i]*state[j]).real
-                        nlist[t0] += -(mat4[i,j,j,i]*state[i]*state[j]).real
-                        
-        imblist[site] = ((-1)**site)*nlist/n
-        imblist2[site] = ((-1)**site)*nlist2/n
-
-    # Compute the imbalance over the entire system
-    # Note that the (-1)^i factors are included in imblist already
-    imblist = 2*jnp.sum(imblist,axis=0)
-    imblist2 = 2*jnp.sum(imblist2,axis=0)
-
-    output = {"H0_diag":H0_diag,"Hint":Hintfinal,"LIOM Interactions":lbits,"LIOM":liom,"Invariant":0,"Imbalance":imblist}
-    if store_flow == True:
-        output["flow"] = sol_int
-        output["dl_list"] = dl_list[::-1]
-
-    return output
 
 #------------------------------------------------------------------------------
 # Function for benchmarking the non-interacting system using 'einsum'
@@ -6134,3 +5939,2562 @@ def flow_static_int_hybrid_pruned(
     os.environ["PYFLOW_HYBRID_PRUNE"] = "1"
     return flow_static_int_hybrid(n, hamiltonian, dl_list, qmax, cutoff, method=method, norm=norm, Hflow=Hflow, store_flow=store_flow)
 
+#---------------------------------------------
+
+# CPU默认版本
+def flow_dyn_int_imb(n,hamiltonian,num,num_int,dl_list,qmax,cutoff,tlist,method='jit',store_flow=False):
+    """
+    Diagonalise an initial interacting Hamiltonian and compute the quench dynamics.
+
+    This function will return the imbalance following a quench, which involves computing the 
+    non-equilibrium dynamics of the densiy operator on every single lattice site.
+
+        Parameters
+        ----------
+        n : integer
+            Linear system size.
+        H0 : array, float
+            Diagonal component of Hamiltonian
+        V0 : array, float
+            Off-diagonal component of Hamiltonian.
+        Hint : array, float
+            Diagonal component of Hamiltonian
+        Vint : array, float
+            Off-diagonal component of Hamiltonian.
+        num : array, float
+            Density operator n_i(t=0) to be time-evolved.
+        dl_list : array, float
+            List of flow times to use for the numerical integration.
+        qmax : integer
+            Maximum number of flow time steps.
+        cutoff : float
+            Threshold value below which off-diagonal elements are set to zero.
+        tlist : array
+            List of timesteps to return time-evolved operator n_i(t).
+        method : string, optional
+            Specify which method to use to generate the RHS of the flow equations.
+            Method choices are 'einsum', 'tensordot', 'jit' and 'vec'.
+            The first two are built-in NumPy methods, while the latter two are custom coded for speed.
+
+        Returns
+        -------
+        sol : array, float
+            Final (diagonal) Hamiltonian
+        central : array, float
+            Local integral of motion (LIOM) computed on the central lattice site of the chain
+    
+    """
+
+    H2 = hamiltonian.H2_spinless
+    H4 = hamiltonian.H4_spinless
+
+    # Initialise array to hold solution at all flow times
+    sol_int = jnp.zeros((qmax,n**2+n**4),dtype=jnp.float32)
+    # print('Memory64 required: MB', sol_int.nbytes/10**6)
+    
+    # Initialise the first flow timestep
+    init = jnp.zeros(n**2+n**4,dtype=jnp.float32)
+    init[:n**2] = (H2).reshape(n**2)
+    init[n**2:] = (H4).reshape(n**4)
+    sol_int[0] = init
+
+    # Define integrator
+    r_int = ode(int_ode).set_integrator('dopri5', nsteps=50,atol=10**(-6),rtol=10**(-3))
+    r_int.set_initial_value(init,dl_list[0])
+    r_int.set_f_params(n,[],method)
+    
+    
+    # Numerically integrate the flow equations
+    k = 1                       # Flow timestep index
+    J0 = 10.                    # Seed value for largest off-diagonal term
+    # Integration continues until qmax is reached or all off-diagonal elements decay below cutoff
+    while r_int.successful() and k < qmax-1 and J0 > cutoff:
+        r_int.integrate(dl_list[k])
+        sol_int[k] = r_int.y
+        mat = sol_int[k,0:n**2].reshape(n,n)
+        off_diag = mat-jnp.diag(jnp.diag(mat))
+        J0 = max(off_diag.reshape(n**2))
+        k += 1
+
+    # Truncate solution list and flow time list to max timestep reached
+    sol_int=sol_int[:k-1]
+    dl_list=dl_list[:k-1]
+
+    # Define final Hamiltonian, for function return
+    H0final,Hintfinal = sol_int[-1,:n**2].reshape(n,n),sol_int[-1,n**2::].reshape(n,n,n,n)
+    
+    # Define final diagonal quadratic Hamiltonian
+    H0_diag = sol_int[-1,:n**2].reshape(n,n)
+    # Define final diagonal quartic Hamiltonian
+    Hint = sol_int[-1,n**2::].reshape(n,n,n,n)   
+    # Extract only the density-density terms of the final quartic Hamiltonian, as a matrix                     
+    HFint = jnp.zeros(n**2).reshape(n,n)
+    for i in range(n):
+        for j in range(n):
+            HFint[i,j] = Hint[i,i,j,j]
+            HFint[i,j] += -Hint[i,j,j,i]
+
+    # Compute the l-bit interactions from the density-density terms in the final Hamiltonian
+    lbits = jnp.zeros(n-1)
+    for q in range(1,n):
+        lbits[q-1] = jnp.median(jnp.log10(jnp.abs(jnp.diag(HFint,q)+jnp.diag(HFint,-q))/2.))
+
+    # Initialise a density operator in the diagonal basis on the central site
+    liom = jnp.zeros((k,n**2+n**4),dtype=jnp.float32)
+    init_liom = jnp.zeros((n,n))
+    init_liom[n//2,n//2] = 1.0
+    liom[0,:n**2] = init_liom.reshape(n**2)
+    
+    # Reverse list of flow times in order to conduct backwards integration
+    dl_list = dl_list[::-1]
+    
+    # Set up initial state as a CDW
+    list1 = jnp.array([1. for i in range(n//2)])
+    list2 = jnp.array([0. for i in range(n//2)])
+    state = jnp.array([val for pair in zip(list1,list2) for val in pair])
+    
+    # Define lists to store the time-evolved density operators on each lattice site
+    # 'imblist' will include interaction effects
+    # 'imblist2' includes only single-particle effects
+    # Both are kept to check for diverging interaction terms
+    imblist = jnp.zeros((n,len(tlist)))
+    imblist2 = jnp.zeros((n,len(tlist)))
+
+    # Compute the time-evolution of the number operator on every site
+    for site in range(n):
+        # Initialise operator to be time-evolved
+        num = jnp.zeros((k,n**2+n**4))
+        num_init = jnp.zeros((n,n),dtype=jnp.float32)
+        num_init[site,site] = 1.0
+
+        num[0,0:n**2] = num_init.reshape(n**2)
+        
+            # Invert dl again back to original
+        dl_list = dl_list[::-1]
+
+        # Define integrator for density operator again
+        # This time we integrate from l=0 to l -> infinity
+        num_int = ode(liom_ode).set_integrator('dopri5', nsteps=50,atol=10**(-6),rtol=10**(-3))
+        num_int.set_initial_value(num[0],dl_list[0])
+        k0=1
+        while num_int.successful() and k0 < k-1:
+            num_int.set_f_params(n,sol_int[k0],method)
+            num_int.integrate(dl_list[k0])
+            # liom[k0] = num_int.y
+            k0 += 1
+        num = num_int.y
+        
+        # Run non-equilibrium dynamics following a quench from CDW state
+        # Returns answer *** in LIOM basis ***
+        evolist2 = dyn_exact(n,num,sol_int[-1],tlist)
+        dl_list = dl_list[::-1] # Reverse the flow
+        
+        num_t_list2 = jnp.zeros((len(tlist),n**2+n**4))
+        # For each timestep, integrate back from l -> infinity to l=0
+        # i.e. from LIOM basis back to original microscopic basis
+        for t0 in range(len(tlist)):
+            
+            num_int = ode(liom_ode).set_integrator('dopri5',nsteps=50,atol=10**(-8),rtol=10**(-8))
+            num_int.set_initial_value(evolist2[t0],dl_list[0])
+            k0=1
+            while num_int.successful() and k0 < k-1:
+                num_int.set_f_params(n,sol_int[-k0],method,True)
+                num_int.integrate(dl_list[k0])
+                k0 += 1
+            num_t_list2[t0] = num_int.y
+        
+        # Initialise lists to store the expectation value of time-evolved density operator at each timestep
+        nlist = jnp.zeros(len(tlist))
+        nlist2 = jnp.zeros(len(tlist))
+        
+        # Compute the expectation value <n_i(t)> for each timestep t
+        n2list = num_t_list2[::,:n**2]
+        n4list = num_t_list2[::,n**2:]
+        for t0 in range(len(tlist)):
+            mat = n2list[t0].reshape(n,n)
+            mat4 = n4list[t0].reshape(n,n,n,n)
+            # phaseMF = 0.
+            for i in range(n):
+                # nlist[t0] += (mat[i,i]*state[i]**2).real
+                nlist[t0] += (mat[i,i]*state[i]).real
+                nlist2[t0] += (mat[i,i]*state[i]).real
+                for j in range(n):
+                    if i != j:
+                        nlist[t0] += (mat4[i,i,j,j]*state[i]*state[j]).real
+                        nlist[t0] += -(mat4[i,j,j,i]*state[i]*state[j]).real
+                        
+        imblist[site] = ((-1)**site)*nlist/n
+        imblist2[site] = ((-1)**site)*nlist2/n
+
+    # Compute the imbalance over the entire system
+    # Note that the (-1)^i factors are included in imblist already
+    imblist = 2*jnp.sum(imblist,axis=0)
+    imblist2 = 2*jnp.sum(imblist2,axis=0)
+
+    output = {"H0_diag":H0_diag,"Hint":Hintfinal,"LIOM Interactions":lbits,"LIOM":liom,"Invariant":0,"Imbalance":imblist}
+    if store_flow == True:
+        output["flow"] = sol_int
+        output["dl_list"] = dl_list[::-1]
+
+    return output
+
+
+# CPU各个优化版本
+def flow_dyn_density(
+    n,
+    hamiltonian,
+    num,
+    num_int,
+    dl_list,
+    qmax,
+    cutoff,
+    tlist,
+    state=None,
+    method='jit',
+    ckpt_step=None,
+):
+    """
+    计算含相互作用费米子系统中各格点数密度算符 <n_i(t)> 的时间演化。
+
+    通过环境变量的组合选择计算分支（节省内存 vs 节省计算量的权衡）：
+
+        pipeline_switch   (千位) : 重算哈密顿量与算符方向流的流水线实现
+        parallel_switch   (百位) : 所有格点算符同时正向/反向流，减少 H 轨迹重算
+        compress_switch   (十位) : 矩阵压缩
+        checkpoint_switch (个位) : 稀疏检查点 + 按需重算，降低峰值内存
+
+        switch_num = 1000*pipeline + 100*parallel + 10*compress + 1*checkpoint
+
+    压缩配置（在进入分支前从环境变量统一读取）：
+        compress_mode           (0-4) : 压缩策略统一开关
+                                          0 = 不压缩（FP32 稠密、无缩放）
+                                          1 = 稠密 + 指数缩放
+                                          2 = 纯 rSVD 低秩
+                                          3 = 纯 COO 稀疏
+                                          4 = COO + rSVD 三级管线
+        compress_eps            (浮点) : COO 阈值，默认 1e-7
+        compress_svd_rank_h2    (整数) : H2 SVD 目标秩，默认 16
+        compress_svd_rank_h4    (整数) : H4 SVD 目标秩，默认 64
+        compress_svd_oversample (整数) : 过采样量，默认 8
+        compress_svd_niter      (整数) : 功率迭代次数，默认 1
+        compress_buffer_dtype   (str)  : 稠密 buffer 精度 fp16/fp32，默认 fp16（mode=0 强制 fp32）
+        compress_svd_store_dtype(str)  : SVD 因子精度 fp16/fp32，默认 fp16
+
+    Parameters
+    ----------
+    n           : 格点数
+    hamiltonian : 哈密顿量对象，需含 H2_spinless 和 H4_spinless 属性
+    num         : 保留参数（未使用）
+    num_int     : 保留参数（未使用）
+    dl_list     : 流时间步列表
+    qmax        : 最大流步数
+    cutoff      : 非对角元截断阈值
+    tlist       : 实时间列表
+    state       : 初态占据数分布，shape=(n,)；默认 CDW（偶数格点占据）
+    method      : 缩并方法，可选 'jit'/'einsum'/'tensordot'/'vec'
+    ckpt_step   : 检查点间距（仅 checkpoint 分支有效），默认 ≈ √qmax
+
+    Returns
+    -------
+    dict，包含：
+        H0_diag          : 最终对角二次哈密顿量，shape=(n,n)
+        Hint             : 最终四次哈密顿量，shape=(n,n,n,n)
+        LIOM Interactions: l-bit 相互作用随距离的对数衰减，shape=(n-1,)
+        LIOM             : 中心格点 LIOM 算符轨迹（仅初始值有效）
+        Invariant        : 0（预留）
+        density          : <n_i(t)>（含相互作用），shape=(n, len(tlist))
+        density_nonint   : <n_i(t)>（单粒子近似），shape=(n, len(tlist))
+        steps_evolved    : 实际完成的流步数
+    """
+
+    import os
+    pipeline_switch   = int(os.environ.get('pipeline_switch',   '0'))
+    parallel_switch   = int(os.environ.get('parallel_switch',   '0'))
+    compress_switch   = int(os.environ.get('compress_switch',   '0'))
+    checkpoint_switch = int(os.environ.get('checkpoint_switch', '0'))
+    switch_num = (1000 * pipeline_switch
+                  + 100 * parallel_switch
+                  +  10 * compress_switch
+                  +   1 * checkpoint_switch)
+
+    # 压缩策略统一开关：0=不压缩 1=稠密+缩放 2=纯rSVD 3=纯COO 4=COO+rSVD
+    compress_mode = int(os.environ.get('compress_mode', '0'))
+    if compress_mode not in (0, 1, 2, 3, 4):
+        raise ValueError(f"compress_mode must be in {{0,1,2,3,4}}, got {compress_mode}")
+
+    if dyn_exact is None:
+        raise ImportError("dyn_exact is unavailable. Please ensure dynamics dependencies are installed.")
+
+    # 初态：默认为 CDW（偶数格点占据）
+    if state is None:
+        state = np.zeros(n, dtype=np.float32)
+        state[::2] = 1.0
+    else:
+        state = np.asarray(state, dtype=np.float32)
+        if state.shape != (n,):
+            raise ValueError(f"state must have shape ({n},), got {state.shape}")
+
+    # ══════════════════════════════════════════════════════════════════════
+    if switch_num == 0:
+        # 分支 0：默认版本
+        # 保存完整 H 轨迹（sol_int），逐格点串行计算算符流
+        # 内存占用 O(K·n⁴)，无需重算
+        # ══════════════════════════════════════════════════════════════════
+
+        H2 = hamiltonian.H2_spinless
+        H4 = hamiltonian.H4_spinless
+
+        # --- 1. 正向流：对角化哈密顿量，保存全轨迹 ---
+        sol_int = jnp.zeros((qmax, n**2 + n**4), dtype=jnp.float32)
+        init = jnp.zeros(n**2 + n**4, dtype=jnp.float32)
+        init[:n**2] = H2.reshape(n**2)
+        init[n**2:] = H4.reshape(n**4)
+        sol_int[0] = init
+
+        r_int = ode(int_ode).set_integrator('dopri5', nsteps=50, atol=1e-6, rtol=1e-3)
+        r_int.set_initial_value(init, dl_list[0])
+        r_int.set_f_params(n, [], method)
+
+        k = 1
+        J0 = 10.0
+        while r_int.successful() and k < qmax - 1 and J0 > cutoff:
+            r_int.integrate(dl_list[k])
+            sol_int[k] = r_int.y
+            mat = sol_int[k, :n**2].reshape(n, n)
+            off_diag = mat - jnp.diag(jnp.diag(mat))
+            J0 = max(off_diag.reshape(n**2))
+            k += 1
+
+        sol_int = sol_int[:k - 1]
+        dl_list_used = dl_list[:k - 1]
+        final_step = k - 2
+
+        H0_diag = sol_int[-1, :n**2].reshape(n, n)
+        Hintfinal = sol_int[-1, n**2:].reshape(n, n, n, n)
+
+        # --- 2. 提取 l-bit 相互作用 ---
+        HFint = jnp.zeros(n**2).reshape(n, n)
+        for i in range(n):
+            for j in range(n):
+                HFint[i, j] = Hintfinal[i, i, j, j] - Hintfinal[i, j, j, i]
+
+        lbits = jnp.zeros(n - 1)
+        for q in range(1, n):
+            lbits[q - 1] = jnp.median(jnp.log10(jnp.abs(jnp.diag(HFint, q) + jnp.diag(HFint, -q)) / 2.0))
+
+        liom = jnp.zeros((k, n**2 + n**4), dtype=jnp.float32)
+        init_liom = jnp.zeros((n, n))
+        init_liom[n // 2, n // 2] = 1.0
+        liom[0, :n**2] = init_liom.reshape(n**2)
+
+        density = np.zeros((n, len(tlist)), dtype=np.float64)
+        density_nonint = np.zeros((n, len(tlist)), dtype=np.float64)
+
+        # --- 3. 逐格点：算符流 → 时间演化 → 反向流 → 期望值 ---
+        for site in range(n):
+            num_arr = jnp.zeros((k, n**2 + n**4))
+            num_init = jnp.zeros((n, n), dtype=jnp.float32)
+            num_init[site, site] = 1.0
+            num_arr[0, :n**2] = num_init.reshape(n**2)
+
+            dl_fwd = dl_list_used
+
+            num_int_ode = ode(liom_ode).set_integrator('dopri5', nsteps=50, atol=1e-6, rtol=1e-3)
+            num_int_ode.set_initial_value(num_arr[0], dl_fwd[0])
+            k0 = 1
+            while num_int_ode.successful() and k0 < k - 1:
+                num_int_ode.set_f_params(n, sol_int[k0], method)
+                num_int_ode.integrate(dl_fwd[k0])
+                k0 += 1
+            num_fwd = num_int_ode.y
+
+            evolist2 = dyn_exact(n, num_fwd, sol_int[-1], tlist)
+
+            dl_bwd = dl_list_used[::-1]
+            num_t_list2 = jnp.zeros((len(tlist), n**2 + n**4))
+            for t0 in range(len(tlist)):
+                num_int_ode = ode(liom_ode).set_integrator('dopri5', nsteps=50, atol=1e-8, rtol=1e-8)
+                num_int_ode.set_initial_value(evolist2[t0], dl_bwd[0])
+                k0 = 1
+                while num_int_ode.successful() and k0 < k - 1:
+                    num_int_ode.set_f_params(n, sol_int[-(k0)], method, True)
+                    num_int_ode.integrate(dl_bwd[k0])
+                    k0 += 1
+                num_t_list2[t0] = num_int_ode.y
+
+            nlist = np.zeros(len(tlist), dtype=np.float64)
+            nlist2 = np.zeros(len(tlist), dtype=np.float64)
+            n2list = num_t_list2[:, :n**2]
+            n4list = num_t_list2[:, n**2:]
+            for t0 in range(len(tlist)):
+                mat = n2list[t0].reshape(n, n)
+                mat4 = n4list[t0].reshape(n, n, n, n)
+                for i in range(n):
+                    nlist[t0] += (mat[i, i] * state[i]).real
+                    nlist2[t0] += (mat[i, i] * state[i]).real
+                    for j in range(n):
+                        if i != j:
+                            nlist[t0] += (mat4[i, i, j, j] * state[i] * state[j]).real
+                            nlist[t0] += -(mat4[i, j, j, i] * state[i] * state[j]).real
+
+            density[site] = nlist
+            density_nonint[site] = nlist2
+
+        output = {
+            # 初始值
+            "H2_init":   np.array(H2),
+            "Hint_init": np.array(H4),
+            "state":     np.array(state),
+            # 流方程信息
+            "steps_evolved":    int(final_step),
+            "flow_time_final":  float(dl_list_used[-1]),
+            "J0_final":         float(J0),
+            # 对角化结果
+            "H0_diag":          np.array(H0_diag),
+            "Hint_diag":        np.array(Hintfinal),
+            "LIOM Interactions": np.array(lbits),
+            # 动力学结果
+            "density":          np.array(density),
+            "density_nonint":   np.array(density_nonint),
+        }
+        return output
+
+    # ══════════════════════════════════════════════════════════════════════
+    elif switch_num == 1:
+        # 分支 1：checkpoint only
+
+        H2_init = jnp.array(hamiltonian.H2_spinless)
+        H4_init = jnp.array(hamiltonian.H4_spinless)
+        orig_dtype = H2_init.dtype
+
+        dl_arr = np.array(dl_list, dtype=np.float64)
+        if dl_arr.ndim != 1 or len(dl_arr) < 2:
+            raise ValueError("dl_list must be a 1D array with at least two time points.")
+
+        max_steps = min(int(qmax), len(dl_arr))
+        if max_steps < 2:
+            raise ValueError("qmax and dl_list imply fewer than two usable time points.")
+        dl_arr = dl_arr[:max_steps]
+
+        if ckpt_step is None:
+            ckpt_step = min(40, int(np.sqrt(max_steps)))
+        ckpt_step = max(1, int(ckpt_step))
+
+        _rtol = 1e-6
+        _atol = 1e-6
+
+        # --- 1. 正向流：对角化哈密顿量，稀疏存储检查点 ---
+        curr_H2 = H2_init
+        curr_H4 = H4_init
+        checkpoints = [(0, np.array(curr_H2, dtype=orig_dtype), np.array(curr_H4, dtype=orig_dtype))]
+
+        k = 1
+        J0 = 1.0
+        while k < len(dl_arr) and J0 > cutoff:
+            steps = np.array([dl_arr[k - 1], dl_arr[k]], dtype=dl_arr.dtype)
+            soln = ode(int_ode, [curr_H2, curr_H4], steps, rtol=_rtol, atol=_atol)
+            curr_H2 = soln[0][-1]
+            curr_H4 = soln[1][-1]
+            if k % ckpt_step == 0:
+                checkpoints.append((k, np.array(curr_H2, dtype=orig_dtype), np.array(curr_H4, dtype=orig_dtype)))
+            J0 = float(jnp.max(jnp.abs(curr_H2 - jnp.diag(jnp.diag(curr_H2)))))
+            k += 1
+
+        final_step = k - 1
+        if checkpoints[-1][0] != final_step:
+            checkpoints.append((final_step, np.array(curr_H2, dtype=orig_dtype), np.array(curr_H4, dtype=orig_dtype)))
+
+        dl_list_final = dl_arr[:final_step + 1]
+
+        H0_diag = curr_H2
+        Hintfinal = curr_H4
+        h_final_flat = jnp.concatenate((curr_H2.reshape(n**2), curr_H4.reshape(n**4)))
+
+        # --- 2. 提取 l-bit 相互作用 ---
+        HFint = np.zeros((n, n), dtype=np.float64)
+        Hint_np = np.array(Hintfinal)
+        for i in range(n):
+            for j in range(n):
+                HFint[i, j] = Hint_np[i, i, j, j] - Hint_np[i, j, j, i]
+
+        lbits = np.zeros(n - 1, dtype=np.float64)
+        for q in range(1, n):
+            vals = np.abs(np.diag(HFint, q) + np.diag(HFint, -q)) / 2.0
+            vals = np.maximum(vals, 1e-30)
+            lbits[q - 1] = np.median(np.log10(vals))
+
+        liom = np.zeros((final_step + 1, n**2 + n**4), dtype=np.float32)
+        liom0 = np.zeros((n, n), dtype=np.float32)
+        liom0[n // 2, n // 2] = 1.0
+        liom[0, :n**2] = liom0.reshape(n**2)
+
+        density = np.zeros((n, len(tlist)), dtype=np.float64)
+        density_nonint = np.zeros((n, len(tlist)), dtype=np.float64)
+        update_op = jit(functools.partial(update, method=method))
+
+        # 算符流 RHS（正向）：dn/dl = [η(H), n]
+        def _rhs_op_H(y, l, H2_c, H4_c):
+            n2, n4 = y[0], y[1]
+            h0, v0, hint0, vint = extract_diag(H2_c, H4_c)
+            eta2 = contract(h0, v0, method=method, eta=True)
+            eta4 = contract(hint0, v0, method=method, eta=True) + contract(h0, vint, method=method, eta=True)
+            dn2 = contract(eta2, n2, method=method, comp=False)
+            dn4 = contract(eta4, n2, method=method, comp=False) + contract(eta2, n4, method=method, comp=False)
+            return [dn2, dn4]
+
+        # 算符流 RHS（反向）：dn/dl = -[η(H), n]
+        def _rhs_op_H_bck(y, l, H2_c, H4_c):
+            n2, n4 = y[0], y[1]
+            h0, v0, hint0, vint = extract_diag(H2_c, H4_c)
+            eta2 = contract(h0, v0, method=method, eta=True)
+            eta4 = contract(hint0, v0, method=method, eta=True) + contract(h0, vint, method=method, eta=True)
+            dn2 = contract(eta2, n2, method=method, comp=False)
+            dn4 = contract(eta4, n2, method=method, comp=False) + contract(eta2, n4, method=method, comp=False)
+            return [-dn2, -dn4]
+
+        # 从检查点重算指定段内每步的 H(l)
+        def _recompute_segment(start_step_idx, end_step_idx):
+            segment_len = end_step_idx - start_step_idx
+            if segment_len <= 0:
+                return [], []
+            temp_H2 = jnp.array(checkpoints_map[start_step_idx][0])
+            temp_H4 = jnp.array(checkpoints_map[start_step_idx][1])
+            seg_h2 = [None] * segment_len
+            seg_h4 = [None] * segment_len
+            for curr_step in range(start_step_idx, end_step_idx):
+                local_idx = curr_step - start_step_idx
+                seg_h2[local_idx] = temp_H2
+                seg_h4[local_idx] = temp_H4
+                steps = np.array([dl_list_final[curr_step], dl_list_final[curr_step + 1]], dtype=dl_list_final.dtype)
+                soln = ode(int_ode, [temp_H2, temp_H4], steps, rtol=_rtol, atol=_atol)
+                temp_H2 = soln[0][-1]
+                temp_H4 = soln[1][-1]
+            return seg_h2, seg_h4
+
+        checkpoints_map = {}
+        for step_idx, h2_cp, h4_cp in checkpoints:
+            checkpoints_map[int(step_idx)] = (h2_cp, h4_cp)
+
+        # --- 3. 逐格点：算符流 → 时间演化 → 反向流 → 期望值 ---
+        for site in range(n):
+            num2 = jnp.zeros((n, n), dtype=jnp.float32)
+            num2 = num2.at[site, site].set(1.0)
+            num4 = jnp.zeros((n, n, n, n), dtype=jnp.float32)
+
+            # 正向算符流
+            for seg_idx in range(1, len(checkpoints)):
+                start_step_idx = int(checkpoints[seg_idx - 1][0])
+                end_step_idx = int(checkpoints[seg_idx][0])
+                seg_h2, seg_h4 = _recompute_segment(start_step_idx, end_step_idx)
+                for local_idx in range(end_step_idx - start_step_idx):
+                    global_step = start_step_idx + local_idx
+                    t0_l = float(dl_list_final[global_step])
+                    t1_l = float(dl_list_final[global_step + 1])
+                    soln = ode(_rhs_op_H, [num2, num4],
+                               jnp.array([t0_l, t1_l]),
+                               seg_h2[local_idx], seg_h4[local_idx],
+                               rtol=_rtol, atol=_atol)
+                    num2 = soln[0][-1]
+                    num4 = soln[1][-1]
+
+            num_diag = jnp.concatenate((num2.reshape(n**2), num4.reshape(n**4)))
+
+            # 实时演化（LIOM 基中精确对角化）
+            evolist2 = dyn_exact(n, num_diag, h_final_flat, tlist)
+
+            ops2 = [jnp.array(evolist2[t0, :n**2]).reshape(n, n) for t0 in range(len(tlist))]
+            ops4 = [jnp.array(evolist2[t0, n**2:]).reshape(n, n, n, n) for t0 in range(len(tlist))]
+
+            # 反向算符流
+            for seg_idx in range(len(checkpoints) - 1, 0, -1):
+                start_step_idx = int(checkpoints[seg_idx - 1][0])
+                end_step_idx = int(checkpoints[seg_idx][0])
+                seg_h2, seg_h4 = _recompute_segment(start_step_idx, end_step_idx)
+                for local_idx in range(end_step_idx - start_step_idx - 1, -1, -1):
+                    global_step = start_step_idx + local_idx
+                    dl_abs = float(dl_list_final[global_step + 1] - dl_list_final[global_step])
+                    for t0 in range(len(tlist)):
+                        soln = ode(_rhs_op_H_bck, [ops2[t0], ops4[t0]],
+                                   jnp.array([0.0, dl_abs]),
+                                   seg_h2[local_idx], seg_h4[local_idx],
+                                   rtol=_rtol, atol=_atol)
+                        ops2[t0] = soln[0][-1]
+                        ops4[t0] = soln[1][-1]
+
+            # 计算期望值 <n_site(t)>
+            nlist = np.zeros(len(tlist), dtype=np.float64)
+            nlist2 = np.zeros(len(tlist), dtype=np.float64)
+            for t0 in range(len(tlist)):
+                mat = np.array(ops2[t0])
+                mat4 = np.array(ops4[t0])
+                for i in range(n):
+                    nlist[t0] += (mat[i, i] * state[i]).real
+                    nlist2[t0] += (mat[i, i] * state[i]).real
+                    for j in range(n):
+                        if i != j:
+                            nlist[t0] += (mat4[i, i, j, j] * state[i] * state[j]).real
+                            nlist[t0] += -(mat4[i, j, j, i] * state[i] * state[j]).real
+            density[site] = nlist
+            density_nonint[site] = nlist2
+
+        output = {
+            "H0_diag": np.array(H0_diag),
+            "Hint": np.array(Hintfinal),
+            "LIOM Interactions": np.array(lbits),
+            "LIOM": np.array(liom),
+            "Invariant": 0,
+            "density": np.array(density),
+            "density_nonint": np.array(density_nonint),
+            "ckpt_step": int(ckpt_step),
+            "steps_evolved": int(final_step),
+        }
+        return output
+
+    # ══════════════════════════════════════════════════════════════════════
+    elif switch_num == 10:
+        # 分支 10：compress only
+        # 在分支 0 基础上，将 H 正向流轨迹的每一步压缩存储；
+        # 后续算符流需要某步 H 时再解压还原成稠密形式。
+        # 由两个子环境变量 (compress_prune, compress_svd_mode) 选择 4 种模式：
+        #   (0,0) 稠密 buffer + 缩放  (1,0) 纯 COO 稀疏
+        #   (0,1) 纯 rSVD 低秩        (1,1) COO 支撑 + rSVD 子块
+        # ══════════════════════════════════════════════════════════════════
+
+        H2 = hamiltonian.H2_spinless
+        H4 = hamiltonian.H4_spinless
+
+        # ── compress_mode → 内部布尔标志 ──
+        # 0=不压缩 1=稠密+缩放 2=纯 rSVD 3=纯 COO 4=COO+rSVD
+        _cmp_prune    = compress_mode in (3, 4)
+        _cmp_svd_mode = compress_mode in (2, 4)
+        _cmp_coo_svd  = (compress_mode == 4)
+        # mode=0 时强制 FP32 + 关缩放（语义上"不压缩"）；其他模式默认开缩放
+        _cmp_exp_scale = (compress_mode != 0)
+
+        _cmp_eps            = float(os.environ.get('compress_eps',            '1e-7'))
+        _cmp_svd_rank_h2    = int(os.environ.get('compress_svd_rank_h2',     '16'))
+        _cmp_svd_rank_h4    = int(os.environ.get('compress_svd_rank_h4',     '64'))
+        _cmp_svd_oversample = int(os.environ.get('compress_svd_oversample',   '8'))
+        _cmp_svd_niter      = int(os.environ.get('compress_svd_niter',        '1'))
+
+        if compress_mode == 0:
+            _cmp_buffer_dtype = np.float32   # mode=0 强制 FP32
+        else:
+            _bdtype_env = os.environ.get('compress_buffer_dtype', '').strip().lower()
+            _cmp_buffer_dtype = np.float32 if _bdtype_env in ('float32', 'fp32') else np.float16
+
+        _sdtype_env = os.environ.get('compress_svd_store_dtype', 'float16').strip().lower()
+        _cmp_svd_store_dtype = np.float32 if _sdtype_env in ('float32', 'fp32') else np.float16
+
+        n2_dim = n * n  # H4 reshape 后的方阵维度
+
+        # ── 预分配压缩存储容器（4 种模式各自独立）──
+        cmp_scale_h2 = np.ones(qmax, dtype=np.float32)
+        cmp_scale_h4 = np.ones(qmax, dtype=np.float32)
+
+        if (not _cmp_prune) and (not _cmp_svd_mode):
+            # 模式 (0,0): 稠密 buffer
+            buf_h2 = np.zeros((qmax, n, n),       dtype=_cmp_buffer_dtype)
+            buf_h4 = np.zeros((qmax, n, n, n, n), dtype=_cmp_buffer_dtype)
+        elif (not _cmp_prune) and _cmp_svd_mode:
+            # 模式 (0,1): 纯 rSVD
+            cmp_h2_U  = [None] * qmax; cmp_h2_S  = [None] * qmax; cmp_h2_Vt = [None] * qmax
+            cmp_h4_U  = [None] * qmax; cmp_h4_S  = [None] * qmax; cmp_h4_Vt = [None] * qmax
+        elif _cmp_coo_svd:
+            # 模式 (1,1): COO 支撑 + rSVD 子块
+            cmp_h2_rows = [None] * qmax; cmp_h2_cols = [None] * qmax
+            cmp_h2_U    = [None] * qmax; cmp_h2_S    = [None] * qmax; cmp_h2_Vt = [None] * qmax
+            cmp_h4_rows = [None] * qmax; cmp_h4_cols = [None] * qmax
+            cmp_h4_U    = [None] * qmax; cmp_h4_S    = [None] * qmax; cmp_h4_Vt = [None] * qmax
+        else:
+            # 模式 (1,0): 纯 COO 稀疏
+            cmp_h2_idx_list = [None] * qmax
+            cmp_h2_val_list = [None] * qmax
+            cmp_h4_idx_list = [None] * qmax
+            cmp_h4_val_list = [None] * qmax
+
+        # ── 压缩存储函数：把 (h2, h4) 压缩存到第 idx 个槽位 ──
+        def _cmp_store(idx, h2_jax, h4_jax):
+            # 1) 提取缩放标量 mu（动态指数缩放）
+            if _cmp_exp_scale:
+                mu2 = float(jnp.max(jnp.abs(h2_jax)))
+                mu4 = float(jnp.max(jnp.abs(h4_jax)))
+                if (not np.isfinite(mu2)) or mu2 <= 0.0: mu2 = 1.0
+                if (not np.isfinite(mu4)) or mu4 <= 0.0: mu4 = 1.0
+            else:
+                mu2 = mu4 = 1.0
+            cmp_scale_h2[idx] = np.float32(mu2)
+            cmp_scale_h4[idx] = np.float32(mu4)
+
+            # 2) JAX → numpy（除以 mu，归一化到 [-1,1]）
+            h2_np = np.array((h2_jax / mu2) if _cmp_exp_scale else h2_jax, dtype=np.float32)
+            h4_np = np.array((h4_jax / mu4) if _cmp_exp_scale else h4_jax, dtype=np.float32)
+
+            # 3) 按模式存入容器
+            if (not _cmp_prune) and (not _cmp_svd_mode):
+                # 稠密
+                buf_h2[idx] = h2_np.astype(_cmp_buffer_dtype, copy=False)
+                buf_h4[idx] = h4_np.astype(_cmp_buffer_dtype, copy=False)
+
+            elif (not _cmp_prune) and _cmp_svd_mode:
+                # 纯 rSVD
+                U2, S2, Vt2 = hybrid_svd(h2_np.reshape(n, n),
+                                          rank=_cmp_svd_rank_h2,
+                                          oversample=_cmp_svd_oversample,
+                                          n_iter=_cmp_svd_niter)
+                cmp_h2_U[idx]  = U2.astype(_cmp_svd_store_dtype, copy=False)
+                cmp_h2_S[idx]  = S2
+                cmp_h2_Vt[idx] = Vt2.astype(_cmp_svd_store_dtype, copy=False)
+
+                U4, S4, Vt4 = hybrid_svd(h4_np.reshape(n2_dim, n2_dim),
+                                          rank=_cmp_svd_rank_h4,
+                                          oversample=_cmp_svd_oversample,
+                                          n_iter=_cmp_svd_niter)
+                cmp_h4_U[idx]  = U4.astype(_cmp_svd_store_dtype, copy=False)
+                cmp_h4_S[idx]  = S4
+                cmp_h4_Vt[idx] = Vt4.astype(_cmp_svd_store_dtype, copy=False)
+
+            elif _cmp_coo_svd:
+                # COO 稀疏支撑 → 稠密子块 → rSVD（H2）
+                th2 = (_cmp_eps / mu2) if _cmp_exp_scale else _cmp_eps
+                h2_flat = h2_np.reshape(-1)
+                h2_idx_arr = np.flatnonzero(np.abs(h2_flat) >= th2).astype(np.int32, copy=False)
+                if h2_idx_arr.size:
+                    ii = (h2_idx_arr // n).astype(np.int32, copy=False)
+                    jj = (h2_idx_arr - ii * n).astype(np.int32, copy=False)
+                    rows2 = np.unique(ii); cols2 = np.unique(jj)
+                    rmap = np.full((n,), -1, dtype=np.int32); rmap[rows2] = np.arange(rows2.size, dtype=np.int32)
+                    cmap = np.full((n,), -1, dtype=np.int32); cmap[cols2] = np.arange(cols2.size, dtype=np.int32)
+                    sub2 = np.zeros((rows2.size, cols2.size), dtype=np.float32)
+                    sub2[rmap[ii], cmap[jj]] = h2_flat[h2_idx_arr]
+                else:
+                    rows2 = np.zeros((0,), dtype=np.int32)
+                    cols2 = np.zeros((0,), dtype=np.int32)
+                    sub2  = np.zeros((0, 0),     dtype=np.float32)
+                r_eff = max(1, min(_cmp_svd_rank_h2, sub2.shape[0], sub2.shape[1]))
+                U2, S2, Vt2 = hybrid_svd(sub2, rank=r_eff,
+                                          oversample=_cmp_svd_oversample,
+                                          n_iter=_cmp_svd_niter)
+                cmp_h2_rows[idx] = rows2; cmp_h2_cols[idx] = cols2
+                cmp_h2_U[idx]    = U2.astype(_cmp_svd_store_dtype, copy=False)
+                cmp_h2_S[idx]    = S2
+                cmp_h2_Vt[idx]   = Vt2.astype(_cmp_svd_store_dtype, copy=False)
+
+                # COO 稀疏支撑 → 稠密子块 → rSVD（H4，基于 (n²,n²) 视角）
+                th4 = (_cmp_eps / mu4) if _cmp_exp_scale else _cmp_eps
+                h4_flat = h4_np.reshape(-1)
+                h4_idx_arr = np.flatnonzero(np.abs(h4_flat) >= th4).astype(np.int32, copy=False)
+                if h4_idx_arr.size:
+                    rr = (h4_idx_arr // n2_dim).astype(np.int32, copy=False)
+                    cc = (h4_idx_arr - rr * n2_dim).astype(np.int32, copy=False)
+                    rows4 = np.unique(rr); cols4 = np.unique(cc)
+                    rmap = np.full((n2_dim,), -1, dtype=np.int32); rmap[rows4] = np.arange(rows4.size, dtype=np.int32)
+                    cmap = np.full((n2_dim,), -1, dtype=np.int32); cmap[cols4] = np.arange(cols4.size, dtype=np.int32)
+                    sub4 = np.zeros((rows4.size, cols4.size), dtype=np.float32)
+                    sub4[rmap[rr], cmap[cc]] = h4_flat[h4_idx_arr]
+                else:
+                    rows4 = np.zeros((0,), dtype=np.int32)
+                    cols4 = np.zeros((0,), dtype=np.int32)
+                    sub4  = np.zeros((0, 0),     dtype=np.float32)
+                r_eff = max(1, min(_cmp_svd_rank_h4, sub4.shape[0], sub4.shape[1]))
+                U4, S4, Vt4 = hybrid_svd(sub4, rank=r_eff,
+                                          oversample=_cmp_svd_oversample,
+                                          n_iter=_cmp_svd_niter)
+                cmp_h4_rows[idx] = rows4; cmp_h4_cols[idx] = cols4
+                cmp_h4_U[idx]    = U4.astype(_cmp_svd_store_dtype, copy=False)
+                cmp_h4_S[idx]    = S4
+                cmp_h4_Vt[idx]   = Vt4.astype(_cmp_svd_store_dtype, copy=False)
+
+            else:
+                # 纯 COO 稀疏
+                th2 = (_cmp_eps / mu2) if _cmp_exp_scale else _cmp_eps
+                th4 = (_cmp_eps / mu4) if _cmp_exp_scale else _cmp_eps
+                h2_flat = h2_np.reshape(-1)
+                h4_flat = h4_np.reshape(-1)
+                h2_idx_arr = np.flatnonzero(np.abs(h2_flat) >= th2).astype(np.int32, copy=False)
+                h4_idx_arr = np.flatnonzero(np.abs(h4_flat) >= th4).astype(np.int32, copy=False)
+                cmp_h2_idx_list[idx] = h2_idx_arr
+                cmp_h2_val_list[idx] = (h2_flat[h2_idx_arr].astype(_cmp_buffer_dtype, copy=False)
+                                         if h2_idx_arr.size else np.zeros((0,), dtype=_cmp_buffer_dtype))
+                cmp_h4_idx_list[idx] = h4_idx_arr
+                cmp_h4_val_list[idx] = (h4_flat[h4_idx_arr].astype(_cmp_buffer_dtype, copy=False)
+                                         if h4_idx_arr.size else np.zeros((0,), dtype=_cmp_buffer_dtype))
+
+        # ── 解压函数：返回 flat (n²+n⁴) numpy 数组（与 sol_int[k] 等价）──
+        def _cmp_load_flat(idx):
+            mu2 = float(cmp_scale_h2[idx])
+            mu4 = float(cmp_scale_h4[idx])
+
+            if (not _cmp_prune) and (not _cmp_svd_mode):
+                h2_dense = np.array(buf_h2[idx], dtype=np.float32)
+                h4_dense = np.array(buf_h4[idx], dtype=np.float32)
+
+            elif (not _cmp_prune) and _cmp_svd_mode:
+                U2 = cmp_h2_U[idx]; S2 = cmp_h2_S[idx]; Vt2 = cmp_h2_Vt[idx]
+                h2_dense = hybrid_svd_decompress(
+                    U2.astype(np.float32, copy=False), S2,
+                    Vt2.astype(np.float32, copy=False),
+                    (n, n), out_dtype=np.float32)
+                U4 = cmp_h4_U[idx]; S4 = cmp_h4_S[idx]; Vt4 = cmp_h4_Vt[idx]
+                h4_mat = hybrid_svd_decompress(
+                    U4.astype(np.float32, copy=False), S4,
+                    Vt4.astype(np.float32, copy=False),
+                    (n2_dim, n2_dim), out_dtype=np.float32)
+                h4_dense = h4_mat.reshape((n, n, n, n))
+
+            elif _cmp_coo_svd:
+                # H2: 解 SVD 子块 → 散射回完整矩阵
+                r2 = cmp_h2_rows[idx]; c2 = cmp_h2_cols[idx]
+                U2 = cmp_h2_U[idx];    S2 = cmp_h2_S[idx];    Vt2 = cmp_h2_Vt[idx]
+                h2_dense = np.zeros((n, n), dtype=np.float32)
+                if (r2 is not None) and (c2 is not None) and r2.size and c2.size and (U2 is not None):
+                    sub = hybrid_svd_decompress(
+                        U2.astype(np.float32, copy=False), S2,
+                        Vt2.astype(np.float32, copy=False),
+                        (int(r2.size), int(c2.size)), out_dtype=np.float32)
+                    h2_dense[np.ix_(r2.astype(np.int64, copy=False),
+                                    c2.astype(np.int64, copy=False))] = sub
+                # H4: 解 (n²×n²) 子块 → 散射回完整张量
+                r4 = cmp_h4_rows[idx]; c4 = cmp_h4_cols[idx]
+                U4 = cmp_h4_U[idx];    S4 = cmp_h4_S[idx];    Vt4 = cmp_h4_Vt[idx]
+                h4_mat = np.zeros((n2_dim, n2_dim), dtype=np.float32)
+                if (r4 is not None) and (c4 is not None) and r4.size and c4.size and (U4 is not None):
+                    sub4 = hybrid_svd_decompress(
+                        U4.astype(np.float32, copy=False), S4,
+                        Vt4.astype(np.float32, copy=False),
+                        (int(r4.size), int(c4.size)), out_dtype=np.float32)
+                    h4_mat[np.ix_(r4.astype(np.int64, copy=False),
+                                  c4.astype(np.int64, copy=False))] = sub4
+                h4_dense = h4_mat.reshape((n, n, n, n))
+
+            else:
+                # 纯 COO：从索引+值散射回稠密
+                idx2 = cmp_h2_idx_list[idx]; val2 = cmp_h2_val_list[idx]
+                h2_dense = np.zeros(n * n, dtype=np.float32)
+                if (idx2 is not None) and idx2.size:
+                    h2_dense[idx2.astype(np.int64, copy=False)] = val2.astype(np.float32, copy=False)
+                h2_dense = h2_dense.reshape(n, n)
+
+                idx4 = cmp_h4_idx_list[idx]; val4 = cmp_h4_val_list[idx]
+                h4_dense = np.zeros(n**4, dtype=np.float32)
+                if (idx4 is not None) and idx4.size:
+                    h4_dense[idx4.astype(np.int64, copy=False)] = val4.astype(np.float32, copy=False)
+                h4_dense = h4_dense.reshape(n, n, n, n)
+
+            # 还原幅值（乘回 mu）
+            if _cmp_exp_scale:
+                h2_dense = h2_dense * mu2
+                h4_dense = h4_dense * mu4
+
+            return np.concatenate([h2_dense.reshape(n**2),
+                                   h4_dense.reshape(n**4)]).astype(np.float32, copy=False)
+
+        # --- 1. 正向流：对角化哈密顿量，逐步压缩存储 ---
+        init = jnp.zeros(n**2 + n**4, dtype=jnp.float32)
+        init[:n**2] = jnp.array(H2).reshape(n**2)
+        init[n**2:] = jnp.array(H4).reshape(n**4)
+        _cmp_store(0, jnp.array(H2), jnp.array(H4))   # 存起点
+
+        r_int = ode(int_ode).set_integrator('dopri5', nsteps=50, atol=1e-6, rtol=1e-3)
+        r_int.set_initial_value(init, dl_list[0])
+        r_int.set_f_params(n, [], method)
+
+        k = 1
+        J0 = 10.0
+        while r_int.successful() and k < qmax - 1 and J0 > cutoff:
+            r_int.integrate(dl_list[k])
+            curr_h2 = jnp.array(r_int.y[:n**2]).reshape(n, n)
+            curr_h4 = jnp.array(r_int.y[n**2:]).reshape(n, n, n, n)
+            _cmp_store(k, curr_h2, curr_h4)
+            off_diag = curr_h2 - jnp.diag(jnp.diag(curr_h2))
+            J0 = float(jnp.max(jnp.abs(off_diag)))
+            k += 1
+
+        dl_list_used = dl_list[:k - 1]
+        final_step = k - 2
+        valid_len  = k - 1   # 等价 default 中 sol_int 切片后的长度
+
+        # 终态 H（等价 default 中 sol_int[-1]）
+        final_flat = _cmp_load_flat(valid_len - 1)
+        H0_diag    = jnp.array(final_flat[:n**2].reshape(n, n))
+        Hintfinal  = jnp.array(final_flat[n**2:].reshape(n, n, n, n))
+
+        # --- 2. 提取 l-bit 相互作用 ---
+        HFint = jnp.zeros(n**2).reshape(n, n)
+        for i in range(n):
+            for j in range(n):
+                HFint[i, j] = Hintfinal[i, i, j, j] - Hintfinal[i, j, j, i]
+
+        lbits = jnp.zeros(n - 1)
+        for q in range(1, n):
+            lbits[q - 1] = jnp.median(jnp.log10(jnp.abs(jnp.diag(HFint, q) + jnp.diag(HFint, -q)) / 2.0))
+
+        liom = jnp.zeros((k, n**2 + n**4), dtype=jnp.float32)
+        init_liom = jnp.zeros((n, n))
+        init_liom[n // 2, n // 2] = 1.0
+        liom[0, :n**2] = init_liom.reshape(n**2)
+
+        density        = np.zeros((n, len(tlist)), dtype=np.float64)
+        density_nonint = np.zeros((n, len(tlist)), dtype=np.float64)
+
+        # --- 3. 逐格点：算符流 → 时间演化 → 反向流 → 期望值 ---
+        for site in range(n):
+            num_arr = jnp.zeros((k, n**2 + n**4))
+            num_init = jnp.zeros((n, n), dtype=jnp.float32)
+            num_init[site, site] = 1.0
+            num_arr[0, :n**2] = num_init.reshape(n**2)
+
+            dl_fwd = dl_list_used
+
+            num_int_ode = ode(liom_ode).set_integrator('dopri5', nsteps=50, atol=1e-6, rtol=1e-3)
+            num_int_ode.set_initial_value(num_arr[0], dl_fwd[0])
+            k0 = 1
+            while num_int_ode.successful() and k0 < k - 1:
+                num_int_ode.set_f_params(n, _cmp_load_flat(k0), method)   # 解压取出第 k0 步 H
+                num_int_ode.integrate(dl_fwd[k0])
+                k0 += 1
+            num_fwd = num_int_ode.y
+
+            evolist2 = dyn_exact(n, num_fwd, final_flat, tlist)
+
+            dl_bwd = dl_list_used[::-1]
+            num_t_list2 = jnp.zeros((len(tlist), n**2 + n**4))
+            for t0 in range(len(tlist)):
+                num_int_ode = ode(liom_ode).set_integrator('dopri5', nsteps=50, atol=1e-8, rtol=1e-8)
+                num_int_ode.set_initial_value(evolist2[t0], dl_bwd[0])
+                k0 = 1
+                while num_int_ode.successful() and k0 < k - 1:
+                    num_int_ode.set_f_params(n, _cmp_load_flat(valid_len - 1 - k0), method, True)  # 反向取
+                    num_int_ode.integrate(dl_bwd[k0])
+                    k0 += 1
+                num_t_list2[t0] = num_int_ode.y
+
+            nlist  = np.zeros(len(tlist), dtype=np.float64)
+            nlist2 = np.zeros(len(tlist), dtype=np.float64)
+            n2list = num_t_list2[:, :n**2]
+            n4list = num_t_list2[:, n**2:]
+            for t0 in range(len(tlist)):
+                mat  = n2list[t0].reshape(n, n)
+                mat4 = n4list[t0].reshape(n, n, n, n)
+                for i in range(n):
+                    nlist[t0]  += (mat[i, i] * state[i]).real
+                    nlist2[t0] += (mat[i, i] * state[i]).real
+                    for j in range(n):
+                        if i != j:
+                            nlist[t0] += (mat4[i, i, j, j] * state[i] * state[j]).real
+                            nlist[t0] += -(mat4[i, j, j, i] * state[i] * state[j]).real
+
+            density[site]        = nlist
+            density_nonint[site] = nlist2
+
+        output = {
+            # 初始值
+            "H2_init":   np.array(H2),
+            "Hint_init": np.array(H4),
+            "state":     np.array(state),
+            # 流方程信息
+            "steps_evolved":    int(final_step),
+            "flow_time_final":  float(dl_list_used[-1]),
+            "J0_final":         float(J0),
+            # 对角化结果
+            "H0_diag":          np.array(H0_diag),
+            "Hint_diag":        np.array(Hintfinal),
+            "LIOM Interactions": np.array(lbits),
+            # 动力学结果
+            "density":          np.array(density),
+            "density_nonint":   np.array(density_nonint),
+            # 压缩配置
+            "compress_mode":    int(compress_mode),
+        }
+        return output
+
+    # ══════════════════════════════════════════════════════════════════════
+    elif switch_num == 11:
+        # 分支 11：checkpoint + compress
+        # 在分支 1 的稀疏检查点机制基础上，把每个检查点的 H 用压缩格式存储
+        # 反向流时通过解压取回作为 _recompute_segment 的起点
+        # 由 (compress_prune, compress_svd_mode) 选择 4 种压缩模式
+        # ══════════════════════════════════════════════════════════════════
+
+        H2_init = jnp.array(hamiltonian.H2_spinless)
+        H4_init = jnp.array(hamiltonian.H4_spinless)
+        orig_dtype = H2_init.dtype
+
+        dl_arr = np.array(dl_list, dtype=np.float64)
+        if dl_arr.ndim != 1 or len(dl_arr) < 2:
+            raise ValueError("dl_list must be a 1D array with at least two time points.")
+
+        max_steps = min(int(qmax), len(dl_arr))
+        if max_steps < 2:
+            raise ValueError("qmax and dl_list imply fewer than two usable time points.")
+        dl_arr = dl_arr[:max_steps]
+
+        if ckpt_step is None:
+            ckpt_step = min(40, int(np.sqrt(max_steps)))
+        ckpt_step = max(1, int(ckpt_step))
+
+        _rtol = 1e-6
+        _atol = 1e-6
+
+        # ── compress_mode → 内部布尔标志 ──
+        # 0=不压缩 1=稠密+缩放 2=纯 rSVD 3=纯 COO 4=COO+rSVD
+        _cmp_prune    = compress_mode in (3, 4)
+        _cmp_svd_mode = compress_mode in (2, 4)
+        _cmp_coo_svd  = (compress_mode == 4)
+        _cmp_exp_scale = (compress_mode != 0)
+
+        _cmp_eps            = float(os.environ.get('compress_eps',            '1e-7'))
+        _cmp_svd_rank_h2    = int(os.environ.get('compress_svd_rank_h2',     '16'))
+        _cmp_svd_rank_h4    = int(os.environ.get('compress_svd_rank_h4',     '64'))
+        _cmp_svd_oversample = int(os.environ.get('compress_svd_oversample',   '8'))
+        _cmp_svd_niter      = int(os.environ.get('compress_svd_niter',        '1'))
+
+        if compress_mode == 0:
+            _cmp_buffer_dtype = np.float32
+        else:
+            _bdtype_env = os.environ.get('compress_buffer_dtype', '').strip().lower()
+            _cmp_buffer_dtype = np.float32 if _bdtype_env in ('float32', 'fp32') else np.float16
+
+        _sdtype_env = os.environ.get('compress_svd_store_dtype', 'float16').strip().lower()
+        _cmp_svd_store_dtype = np.float32 if _sdtype_env in ('float32', 'fp32') else np.float16
+
+        n2_dim = n * n  # H4 reshape 后的方阵维度
+
+        # 检查点数量上限：每 ckpt_step 一个 + 起点 + 终点 + 安全裕度
+        max_ckpts = max_steps // ckpt_step + 4
+
+        # ── 预分配压缩存储容器（按检查点数量分配，远小于 qmax）──
+        cmp_scale_h2 = np.ones(max_ckpts, dtype=np.float32)
+        cmp_scale_h4 = np.ones(max_ckpts, dtype=np.float32)
+
+        if (not _cmp_prune) and (not _cmp_svd_mode):
+            buf_h2 = np.zeros((max_ckpts, n, n),       dtype=_cmp_buffer_dtype)
+            buf_h4 = np.zeros((max_ckpts, n, n, n, n), dtype=_cmp_buffer_dtype)
+        elif (not _cmp_prune) and _cmp_svd_mode:
+            cmp_h2_U  = [None] * max_ckpts; cmp_h2_S  = [None] * max_ckpts; cmp_h2_Vt = [None] * max_ckpts
+            cmp_h4_U  = [None] * max_ckpts; cmp_h4_S  = [None] * max_ckpts; cmp_h4_Vt = [None] * max_ckpts
+        elif _cmp_coo_svd:
+            cmp_h2_rows = [None] * max_ckpts; cmp_h2_cols = [None] * max_ckpts
+            cmp_h2_U    = [None] * max_ckpts; cmp_h2_S    = [None] * max_ckpts; cmp_h2_Vt = [None] * max_ckpts
+            cmp_h4_rows = [None] * max_ckpts; cmp_h4_cols = [None] * max_ckpts
+            cmp_h4_U    = [None] * max_ckpts; cmp_h4_S    = [None] * max_ckpts; cmp_h4_Vt = [None] * max_ckpts
+        else:
+            cmp_h2_idx_list = [None] * max_ckpts; cmp_h2_val_list = [None] * max_ckpts
+            cmp_h4_idx_list = [None] * max_ckpts; cmp_h4_val_list = [None] * max_ckpts
+
+        # ── 压缩存储函数：把 (h2, h4) 压缩存到第 slot 个槽位 ──
+        def _cmp_store(slot, h2_jax, h4_jax):
+            if _cmp_exp_scale:
+                mu2 = float(jnp.max(jnp.abs(h2_jax)))
+                mu4 = float(jnp.max(jnp.abs(h4_jax)))
+                if (not np.isfinite(mu2)) or mu2 <= 0.0: mu2 = 1.0
+                if (not np.isfinite(mu4)) or mu4 <= 0.0: mu4 = 1.0
+            else:
+                mu2 = mu4 = 1.0
+            cmp_scale_h2[slot] = np.float32(mu2)
+            cmp_scale_h4[slot] = np.float32(mu4)
+
+            h2_np = np.array((h2_jax / mu2) if _cmp_exp_scale else h2_jax, dtype=np.float32)
+            h4_np = np.array((h4_jax / mu4) if _cmp_exp_scale else h4_jax, dtype=np.float32)
+
+            if (not _cmp_prune) and (not _cmp_svd_mode):
+                buf_h2[slot] = h2_np.astype(_cmp_buffer_dtype, copy=False)
+                buf_h4[slot] = h4_np.astype(_cmp_buffer_dtype, copy=False)
+
+            elif (not _cmp_prune) and _cmp_svd_mode:
+                U2, S2, Vt2 = hybrid_svd(h2_np.reshape(n, n),
+                                          rank=_cmp_svd_rank_h2,
+                                          oversample=_cmp_svd_oversample,
+                                          n_iter=_cmp_svd_niter)
+                cmp_h2_U[slot]  = U2.astype(_cmp_svd_store_dtype, copy=False)
+                cmp_h2_S[slot]  = S2
+                cmp_h2_Vt[slot] = Vt2.astype(_cmp_svd_store_dtype, copy=False)
+
+                U4, S4, Vt4 = hybrid_svd(h4_np.reshape(n2_dim, n2_dim),
+                                          rank=_cmp_svd_rank_h4,
+                                          oversample=_cmp_svd_oversample,
+                                          n_iter=_cmp_svd_niter)
+                cmp_h4_U[slot]  = U4.astype(_cmp_svd_store_dtype, copy=False)
+                cmp_h4_S[slot]  = S4
+                cmp_h4_Vt[slot] = Vt4.astype(_cmp_svd_store_dtype, copy=False)
+
+            elif _cmp_coo_svd:
+                # H2: COO 支撑 + rSVD 子块
+                th2 = (_cmp_eps / mu2) if _cmp_exp_scale else _cmp_eps
+                h2_flat = h2_np.reshape(-1)
+                h2_idx_arr = np.flatnonzero(np.abs(h2_flat) >= th2).astype(np.int32, copy=False)
+                if h2_idx_arr.size:
+                    ii = (h2_idx_arr // n).astype(np.int32, copy=False)
+                    jj = (h2_idx_arr - ii * n).astype(np.int32, copy=False)
+                    rows2 = np.unique(ii); cols2 = np.unique(jj)
+                    rmap = np.full((n,), -1, dtype=np.int32); rmap[rows2] = np.arange(rows2.size, dtype=np.int32)
+                    cmap = np.full((n,), -1, dtype=np.int32); cmap[cols2] = np.arange(cols2.size, dtype=np.int32)
+                    sub2 = np.zeros((rows2.size, cols2.size), dtype=np.float32)
+                    sub2[rmap[ii], cmap[jj]] = h2_flat[h2_idx_arr]
+                else:
+                    rows2 = np.zeros((0,), dtype=np.int32)
+                    cols2 = np.zeros((0,), dtype=np.int32)
+                    sub2  = np.zeros((0, 0),     dtype=np.float32)
+                r_eff = max(1, min(_cmp_svd_rank_h2, sub2.shape[0], sub2.shape[1]))
+                U2, S2, Vt2 = hybrid_svd(sub2, rank=r_eff,
+                                          oversample=_cmp_svd_oversample,
+                                          n_iter=_cmp_svd_niter)
+                cmp_h2_rows[slot] = rows2; cmp_h2_cols[slot] = cols2
+                cmp_h2_U[slot]    = U2.astype(_cmp_svd_store_dtype, copy=False)
+                cmp_h2_S[slot]    = S2
+                cmp_h2_Vt[slot]   = Vt2.astype(_cmp_svd_store_dtype, copy=False)
+
+                # H4: COO 支撑（n²×n² 视角）+ rSVD 子块
+                th4 = (_cmp_eps / mu4) if _cmp_exp_scale else _cmp_eps
+                h4_flat = h4_np.reshape(-1)
+                h4_idx_arr = np.flatnonzero(np.abs(h4_flat) >= th4).astype(np.int32, copy=False)
+                if h4_idx_arr.size:
+                    rr = (h4_idx_arr // n2_dim).astype(np.int32, copy=False)
+                    cc = (h4_idx_arr - rr * n2_dim).astype(np.int32, copy=False)
+                    rows4 = np.unique(rr); cols4 = np.unique(cc)
+                    rmap = np.full((n2_dim,), -1, dtype=np.int32); rmap[rows4] = np.arange(rows4.size, dtype=np.int32)
+                    cmap = np.full((n2_dim,), -1, dtype=np.int32); cmap[cols4] = np.arange(cols4.size, dtype=np.int32)
+                    sub4 = np.zeros((rows4.size, cols4.size), dtype=np.float32)
+                    sub4[rmap[rr], cmap[cc]] = h4_flat[h4_idx_arr]
+                else:
+                    rows4 = np.zeros((0,), dtype=np.int32)
+                    cols4 = np.zeros((0,), dtype=np.int32)
+                    sub4  = np.zeros((0, 0),     dtype=np.float32)
+                r_eff = max(1, min(_cmp_svd_rank_h4, sub4.shape[0], sub4.shape[1]))
+                U4, S4, Vt4 = hybrid_svd(sub4, rank=r_eff,
+                                          oversample=_cmp_svd_oversample,
+                                          n_iter=_cmp_svd_niter)
+                cmp_h4_rows[slot] = rows4; cmp_h4_cols[slot] = cols4
+                cmp_h4_U[slot]    = U4.astype(_cmp_svd_store_dtype, copy=False)
+                cmp_h4_S[slot]    = S4
+                cmp_h4_Vt[slot]   = Vt4.astype(_cmp_svd_store_dtype, copy=False)
+
+            else:
+                # 纯 COO 稀疏
+                th2 = (_cmp_eps / mu2) if _cmp_exp_scale else _cmp_eps
+                th4 = (_cmp_eps / mu4) if _cmp_exp_scale else _cmp_eps
+                h2_flat = h2_np.reshape(-1)
+                h4_flat = h4_np.reshape(-1)
+                h2_idx_arr = np.flatnonzero(np.abs(h2_flat) >= th2).astype(np.int32, copy=False)
+                h4_idx_arr = np.flatnonzero(np.abs(h4_flat) >= th4).astype(np.int32, copy=False)
+                cmp_h2_idx_list[slot] = h2_idx_arr
+                cmp_h2_val_list[slot] = (h2_flat[h2_idx_arr].astype(_cmp_buffer_dtype, copy=False)
+                                          if h2_idx_arr.size else np.zeros((0,), dtype=_cmp_buffer_dtype))
+                cmp_h4_idx_list[slot] = h4_idx_arr
+                cmp_h4_val_list[slot] = (h4_flat[h4_idx_arr].astype(_cmp_buffer_dtype, copy=False)
+                                          if h4_idx_arr.size else np.zeros((0,), dtype=_cmp_buffer_dtype))
+
+        # ── 解压函数：返回 (h2_jax, h4_jax) JAX (n,n) / (n,n,n,n) 张量 ──
+        def _cmp_load(slot):
+            mu2 = float(cmp_scale_h2[slot])
+            mu4 = float(cmp_scale_h4[slot])
+
+            if (not _cmp_prune) and (not _cmp_svd_mode):
+                h2_dense = np.array(buf_h2[slot], dtype=np.float32)
+                h4_dense = np.array(buf_h4[slot], dtype=np.float32)
+
+            elif (not _cmp_prune) and _cmp_svd_mode:
+                U2 = cmp_h2_U[slot]; S2 = cmp_h2_S[slot]; Vt2 = cmp_h2_Vt[slot]
+                h2_dense = hybrid_svd_decompress(
+                    U2.astype(np.float32, copy=False), S2,
+                    Vt2.astype(np.float32, copy=False),
+                    (n, n), out_dtype=np.float32)
+                U4 = cmp_h4_U[slot]; S4 = cmp_h4_S[slot]; Vt4 = cmp_h4_Vt[slot]
+                h4_mat = hybrid_svd_decompress(
+                    U4.astype(np.float32, copy=False), S4,
+                    Vt4.astype(np.float32, copy=False),
+                    (n2_dim, n2_dim), out_dtype=np.float32)
+                h4_dense = h4_mat.reshape((n, n, n, n))
+
+            elif _cmp_coo_svd:
+                r2 = cmp_h2_rows[slot]; c2 = cmp_h2_cols[slot]
+                U2 = cmp_h2_U[slot];    S2 = cmp_h2_S[slot];    Vt2 = cmp_h2_Vt[slot]
+                h2_dense = np.zeros((n, n), dtype=np.float32)
+                if (r2 is not None) and (c2 is not None) and r2.size and c2.size and (U2 is not None):
+                    sub = hybrid_svd_decompress(
+                        U2.astype(np.float32, copy=False), S2,
+                        Vt2.astype(np.float32, copy=False),
+                        (int(r2.size), int(c2.size)), out_dtype=np.float32)
+                    h2_dense[np.ix_(r2.astype(np.int64, copy=False),
+                                    c2.astype(np.int64, copy=False))] = sub
+
+                r4 = cmp_h4_rows[slot]; c4 = cmp_h4_cols[slot]
+                U4 = cmp_h4_U[slot];    S4 = cmp_h4_S[slot];    Vt4 = cmp_h4_Vt[slot]
+                h4_mat = np.zeros((n2_dim, n2_dim), dtype=np.float32)
+                if (r4 is not None) and (c4 is not None) and r4.size and c4.size and (U4 is not None):
+                    sub4 = hybrid_svd_decompress(
+                        U4.astype(np.float32, copy=False), S4,
+                        Vt4.astype(np.float32, copy=False),
+                        (int(r4.size), int(c4.size)), out_dtype=np.float32)
+                    h4_mat[np.ix_(r4.astype(np.int64, copy=False),
+                                  c4.astype(np.int64, copy=False))] = sub4
+                h4_dense = h4_mat.reshape((n, n, n, n))
+
+            else:
+                idx2 = cmp_h2_idx_list[slot]; val2 = cmp_h2_val_list[slot]
+                h2_dense = np.zeros(n * n, dtype=np.float32)
+                if (idx2 is not None) and idx2.size:
+                    h2_dense[idx2.astype(np.int64, copy=False)] = val2.astype(np.float32, copy=False)
+                h2_dense = h2_dense.reshape(n, n)
+
+                idx4 = cmp_h4_idx_list[slot]; val4 = cmp_h4_val_list[slot]
+                h4_dense = np.zeros(n**4, dtype=np.float32)
+                if (idx4 is not None) and idx4.size:
+                    h4_dense[idx4.astype(np.int64, copy=False)] = val4.astype(np.float32, copy=False)
+                h4_dense = h4_dense.reshape(n, n, n, n)
+
+            if _cmp_exp_scale:
+                h2_dense = h2_dense * mu2
+                h4_dense = h4_dense * mu4
+
+            return jnp.array(h2_dense, dtype=jnp.float32), jnp.array(h4_dense, dtype=jnp.float32)
+
+        # --- 1. 正向流：H 对角化，仅在检查点位置压缩存储 ---
+        curr_H2 = H2_init
+        curr_H4 = H4_init
+
+        checkpoints_steps = [0]
+        ckpt_slot_map = {0: 0}
+        _cmp_store(0, curr_H2, curr_H4)
+        n_ckpts = 1
+
+        k = 1
+        J0 = 1.0
+        while k < len(dl_arr) and J0 > cutoff:
+            steps = np.array([dl_arr[k - 1], dl_arr[k]], dtype=dl_arr.dtype)
+            soln = ode(int_ode, [curr_H2, curr_H4], steps, rtol=_rtol, atol=_atol)
+            curr_H2 = soln[0][-1]
+            curr_H4 = soln[1][-1]
+            if k % ckpt_step == 0 and n_ckpts < max_ckpts:
+                ckpt_slot_map[k] = n_ckpts
+                checkpoints_steps.append(k)
+                _cmp_store(n_ckpts, curr_H2, curr_H4)
+                n_ckpts += 1
+            J0 = float(jnp.max(jnp.abs(curr_H2 - jnp.diag(jnp.diag(curr_H2)))))
+            k += 1
+
+        final_step = k - 1
+        if checkpoints_steps[-1] != final_step and n_ckpts < max_ckpts:
+            ckpt_slot_map[final_step] = n_ckpts
+            checkpoints_steps.append(final_step)
+            _cmp_store(n_ckpts, curr_H2, curr_H4)
+            n_ckpts += 1
+
+        dl_list_final = dl_arr[:final_step + 1]
+
+        H0_diag = curr_H2
+        Hintfinal = curr_H4
+        h_final_flat = jnp.concatenate((curr_H2.reshape(n**2), curr_H4.reshape(n**4)))
+
+        # --- 2. 提取 l-bit 相互作用 ---
+        HFint = np.zeros((n, n), dtype=np.float64)
+        Hint_np = np.array(Hintfinal)
+        for i in range(n):
+            for j in range(n):
+                HFint[i, j] = Hint_np[i, i, j, j] - Hint_np[i, j, j, i]
+
+        lbits = np.zeros(n - 1, dtype=np.float64)
+        for q in range(1, n):
+            vals = np.abs(np.diag(HFint, q) + np.diag(HFint, -q)) / 2.0
+            vals = np.maximum(vals, 1e-30)
+            lbits[q - 1] = np.median(np.log10(vals))
+
+        liom = np.zeros((final_step + 1, n**2 + n**4), dtype=np.float32)
+        liom0 = np.zeros((n, n), dtype=np.float32)
+        liom0[n // 2, n // 2] = 1.0
+        liom[0, :n**2] = liom0.reshape(n**2)
+
+        density = np.zeros((n, len(tlist)), dtype=np.float64)
+        density_nonint = np.zeros((n, len(tlist)), dtype=np.float64)
+        update_op = jit(functools.partial(update, method=method))
+
+        # 算符流 RHS（正向）：dn/dl = [η(H), n]
+        def _rhs_op_H(y, l, H2_c, H4_c):
+            n2, n4 = y[0], y[1]
+            h0, v0, hint0, vint = extract_diag(H2_c, H4_c)
+            eta2 = contract(h0, v0, method=method, eta=True)
+            eta4 = contract(hint0, v0, method=method, eta=True) + contract(h0, vint, method=method, eta=True)
+            dn2 = contract(eta2, n2, method=method, comp=False)
+            dn4 = contract(eta4, n2, method=method, comp=False) + contract(eta2, n4, method=method, comp=False)
+            return [dn2, dn4]
+
+        # 算符流 RHS（反向）：dn/dl = -[η(H), n]
+        def _rhs_op_H_bck(y, l, H2_c, H4_c):
+            n2, n4 = y[0], y[1]
+            h0, v0, hint0, vint = extract_diag(H2_c, H4_c)
+            eta2 = contract(h0, v0, method=method, eta=True)
+            eta4 = contract(hint0, v0, method=method, eta=True) + contract(h0, vint, method=method, eta=True)
+            dn2 = contract(eta2, n2, method=method, comp=False)
+            dn4 = contract(eta4, n2, method=method, comp=False) + contract(eta2, n4, method=method, comp=False)
+            return [-dn2, -dn4]
+
+        # ── 段内 H 压缩/解压（与检查点共用 compress_mode）──
+        # 用紧凑的 tuple 打包，每段独立持有，调用结束后随段一起释放
+        # tuple 首元素为 mode 标识，便于解压时分派
+        def _seg_compress(h2_jax, h4_jax):
+            if compress_mode == 0:
+                # 直通：保留原始 JAX 张量，零开销
+                return (0, h2_jax, h4_jax)
+
+            if _cmp_exp_scale:
+                mu2 = float(jnp.max(jnp.abs(h2_jax)))
+                mu4 = float(jnp.max(jnp.abs(h4_jax)))
+                if (not np.isfinite(mu2)) or mu2 <= 0.0: mu2 = 1.0
+                if (not np.isfinite(mu4)) or mu4 <= 0.0: mu4 = 1.0
+            else:
+                mu2 = mu4 = 1.0
+            h2_np = np.array((h2_jax / mu2) if _cmp_exp_scale else h2_jax, dtype=np.float32)
+            h4_np = np.array((h4_jax / mu4) if _cmp_exp_scale else h4_jax, dtype=np.float32)
+
+            if compress_mode == 1:
+                # 稠密 + 缩放
+                return (1,
+                        h2_np.astype(_cmp_buffer_dtype, copy=False),
+                        h4_np.astype(_cmp_buffer_dtype, copy=False),
+                        mu2, mu4)
+
+            elif compress_mode == 2:
+                # 纯 rSVD
+                U2, S2, Vt2 = hybrid_svd(h2_np.reshape(n, n),
+                                          rank=_cmp_svd_rank_h2,
+                                          oversample=_cmp_svd_oversample,
+                                          n_iter=_cmp_svd_niter)
+                U4, S4, Vt4 = hybrid_svd(h4_np.reshape(n2_dim, n2_dim),
+                                          rank=_cmp_svd_rank_h4,
+                                          oversample=_cmp_svd_oversample,
+                                          n_iter=_cmp_svd_niter)
+                return (2,
+                        U2.astype(_cmp_svd_store_dtype, copy=False), S2,
+                        Vt2.astype(_cmp_svd_store_dtype, copy=False),
+                        U4.astype(_cmp_svd_store_dtype, copy=False), S4,
+                        Vt4.astype(_cmp_svd_store_dtype, copy=False),
+                        mu2, mu4)
+
+            elif compress_mode == 3:
+                # 纯 COO 稀疏
+                th2 = (_cmp_eps / mu2) if _cmp_exp_scale else _cmp_eps
+                th4 = (_cmp_eps / mu4) if _cmp_exp_scale else _cmp_eps
+                h2_flat = h2_np.reshape(-1)
+                h4_flat = h4_np.reshape(-1)
+                h2_idx = np.flatnonzero(np.abs(h2_flat) >= th2).astype(np.int32, copy=False)
+                h4_idx = np.flatnonzero(np.abs(h4_flat) >= th4).astype(np.int32, copy=False)
+                h2_val = (h2_flat[h2_idx].astype(_cmp_buffer_dtype, copy=False)
+                           if h2_idx.size else np.zeros((0,), dtype=_cmp_buffer_dtype))
+                h4_val = (h4_flat[h4_idx].astype(_cmp_buffer_dtype, copy=False)
+                           if h4_idx.size else np.zeros((0,), dtype=_cmp_buffer_dtype))
+                return (3, h2_idx, h2_val, h4_idx, h4_val, mu2, mu4)
+
+            else:  # compress_mode == 4
+                # COO 支撑 + rSVD 子块（H2）
+                th2 = (_cmp_eps / mu2) if _cmp_exp_scale else _cmp_eps
+                h2_flat = h2_np.reshape(-1)
+                h2_idx_arr = np.flatnonzero(np.abs(h2_flat) >= th2).astype(np.int32, copy=False)
+                if h2_idx_arr.size:
+                    ii = (h2_idx_arr // n).astype(np.int32, copy=False)
+                    jj = (h2_idx_arr - ii * n).astype(np.int32, copy=False)
+                    rows2 = np.unique(ii); cols2 = np.unique(jj)
+                    rmap = np.full((n,), -1, dtype=np.int32); rmap[rows2] = np.arange(rows2.size, dtype=np.int32)
+                    cmap = np.full((n,), -1, dtype=np.int32); cmap[cols2] = np.arange(cols2.size, dtype=np.int32)
+                    sub2 = np.zeros((rows2.size, cols2.size), dtype=np.float32)
+                    sub2[rmap[ii], cmap[jj]] = h2_flat[h2_idx_arr]
+                else:
+                    rows2 = np.zeros((0,), dtype=np.int32); cols2 = np.zeros((0,), dtype=np.int32)
+                    sub2  = np.zeros((0, 0),     dtype=np.float32)
+                r_eff = max(1, min(_cmp_svd_rank_h2, sub2.shape[0], sub2.shape[1]))
+                U2, S2, Vt2 = hybrid_svd(sub2, rank=r_eff,
+                                          oversample=_cmp_svd_oversample,
+                                          n_iter=_cmp_svd_niter)
+
+                # COO 支撑 + rSVD 子块（H4）
+                th4 = (_cmp_eps / mu4) if _cmp_exp_scale else _cmp_eps
+                h4_flat = h4_np.reshape(-1)
+                h4_idx_arr = np.flatnonzero(np.abs(h4_flat) >= th4).astype(np.int32, copy=False)
+                if h4_idx_arr.size:
+                    rr = (h4_idx_arr // n2_dim).astype(np.int32, copy=False)
+                    cc = (h4_idx_arr - rr * n2_dim).astype(np.int32, copy=False)
+                    rows4 = np.unique(rr); cols4 = np.unique(cc)
+                    rmap = np.full((n2_dim,), -1, dtype=np.int32); rmap[rows4] = np.arange(rows4.size, dtype=np.int32)
+                    cmap = np.full((n2_dim,), -1, dtype=np.int32); cmap[cols4] = np.arange(cols4.size, dtype=np.int32)
+                    sub4 = np.zeros((rows4.size, cols4.size), dtype=np.float32)
+                    sub4[rmap[rr], cmap[cc]] = h4_flat[h4_idx_arr]
+                else:
+                    rows4 = np.zeros((0,), dtype=np.int32); cols4 = np.zeros((0,), dtype=np.int32)
+                    sub4  = np.zeros((0, 0),     dtype=np.float32)
+                r_eff = max(1, min(_cmp_svd_rank_h4, sub4.shape[0], sub4.shape[1]))
+                U4, S4, Vt4 = hybrid_svd(sub4, rank=r_eff,
+                                          oversample=_cmp_svd_oversample,
+                                          n_iter=_cmp_svd_niter)
+                return (4,
+                        rows2, cols2,
+                        U2.astype(_cmp_svd_store_dtype, copy=False), S2,
+                        Vt2.astype(_cmp_svd_store_dtype, copy=False),
+                        rows4, cols4,
+                        U4.astype(_cmp_svd_store_dtype, copy=False), S4,
+                        Vt4.astype(_cmp_svd_store_dtype, copy=False),
+                        mu2, mu4)
+
+        def _seg_decompress(packed):
+            mode = packed[0]
+            if mode == 0:
+                # 直通
+                return packed[1], packed[2]
+
+            if mode == 1:
+                _, h2_low, h4_low, mu2, mu4 = packed
+                h2_dense = np.array(h2_low, dtype=np.float32) * mu2
+                h4_dense = np.array(h4_low, dtype=np.float32) * mu4
+
+            elif mode == 2:
+                _, U2, S2, Vt2, U4, S4, Vt4, mu2, mu4 = packed
+                h2_dense = hybrid_svd_decompress(
+                    U2.astype(np.float32, copy=False), S2,
+                    Vt2.astype(np.float32, copy=False),
+                    (n, n), out_dtype=np.float32) * mu2
+                h4_mat = hybrid_svd_decompress(
+                    U4.astype(np.float32, copy=False), S4,
+                    Vt4.astype(np.float32, copy=False),
+                    (n2_dim, n2_dim), out_dtype=np.float32) * mu4
+                h4_dense = h4_mat.reshape((n, n, n, n))
+
+            elif mode == 3:
+                _, h2_idx, h2_val, h4_idx, h4_val, mu2, mu4 = packed
+                h2_dense = np.zeros(n * n, dtype=np.float32)
+                if h2_idx.size:
+                    h2_dense[h2_idx.astype(np.int64, copy=False)] = h2_val.astype(np.float32, copy=False)
+                h2_dense = h2_dense.reshape(n, n) * mu2
+
+                h4_dense = np.zeros(n**4, dtype=np.float32)
+                if h4_idx.size:
+                    h4_dense[h4_idx.astype(np.int64, copy=False)] = h4_val.astype(np.float32, copy=False)
+                h4_dense = h4_dense.reshape(n, n, n, n) * mu4
+
+            else:  # mode == 4
+                (_, rows2, cols2, U2, S2, Vt2,
+                    rows4, cols4, U4, S4, Vt4, mu2, mu4) = packed
+                h2_dense = np.zeros((n, n), dtype=np.float32)
+                if rows2.size and cols2.size:
+                    sub = hybrid_svd_decompress(
+                        U2.astype(np.float32, copy=False), S2,
+                        Vt2.astype(np.float32, copy=False),
+                        (int(rows2.size), int(cols2.size)), out_dtype=np.float32)
+                    h2_dense[np.ix_(rows2.astype(np.int64, copy=False),
+                                    cols2.astype(np.int64, copy=False))] = sub
+                h2_dense = h2_dense * mu2
+
+                h4_mat = np.zeros((n2_dim, n2_dim), dtype=np.float32)
+                if rows4.size and cols4.size:
+                    sub4 = hybrid_svd_decompress(
+                        U4.astype(np.float32, copy=False), S4,
+                        Vt4.astype(np.float32, copy=False),
+                        (int(rows4.size), int(cols4.size)), out_dtype=np.float32)
+                    h4_mat[np.ix_(rows4.astype(np.int64, copy=False),
+                                  cols4.astype(np.int64, copy=False))] = sub4
+                h4_dense = h4_mat.reshape((n, n, n, n)) * mu4
+
+            return jnp.array(h2_dense, dtype=jnp.float32), jnp.array(h4_dense, dtype=jnp.float32)
+
+        # 从压缩检查点解压并重算指定段内每步的 H(l)，返回打包列表
+        def _recompute_segment(start_step_idx, end_step_idx):
+            segment_len = end_step_idx - start_step_idx
+            if segment_len <= 0:
+                return []
+            slot = ckpt_slot_map[int(start_step_idx)]
+            temp_H2, temp_H4 = _cmp_load(slot)   # 解压检查点起点
+            seg_packed = [None] * segment_len
+            for curr_step in range(start_step_idx, end_step_idx):
+                local_idx = curr_step - start_step_idx
+                seg_packed[local_idx] = _seg_compress(temp_H2, temp_H4)   # 段内 H 即时压缩
+                steps = np.array([dl_list_final[curr_step], dl_list_final[curr_step + 1]], dtype=dl_list_final.dtype)
+                soln = ode(int_ode, [temp_H2, temp_H4], steps, rtol=_rtol, atol=_atol)
+                temp_H2 = soln[0][-1]
+                temp_H4 = soln[1][-1]
+            return seg_packed
+
+        # --- 3. 逐格点：算符流 → 时间演化 → 反向流 → 期望值 ---
+        for site in range(n):
+            num2 = jnp.zeros((n, n), dtype=jnp.float32)
+            num2 = num2.at[site, site].set(1.0)
+            num4 = jnp.zeros((n, n, n, n), dtype=jnp.float32)
+
+            # 正向算符流
+            for seg_idx in range(1, len(checkpoints_steps)):
+                start_step_idx = int(checkpoints_steps[seg_idx - 1])
+                end_step_idx   = int(checkpoints_steps[seg_idx])
+                seg_packed = _recompute_segment(start_step_idx, end_step_idx)
+                for local_idx in range(end_step_idx - start_step_idx):
+                    global_step = start_step_idx + local_idx
+                    t0_l = float(dl_list_final[global_step])
+                    t1_l = float(dl_list_final[global_step + 1])
+                    h2_local, h4_local = _seg_decompress(seg_packed[local_idx])
+                    soln = ode(_rhs_op_H, [num2, num4],
+                               jnp.array([t0_l, t1_l]),
+                               h2_local, h4_local,
+                               rtol=_rtol, atol=_atol)
+                    num2 = soln[0][-1]
+                    num4 = soln[1][-1]
+
+            num_diag = jnp.concatenate((num2.reshape(n**2), num4.reshape(n**4)))
+
+            # 实时演化（LIOM 基中精确对角化）
+            evolist2 = dyn_exact(n, num_diag, h_final_flat, tlist)
+
+            ops2 = [jnp.array(evolist2[t0, :n**2]).reshape(n, n) for t0 in range(len(tlist))]
+            ops4 = [jnp.array(evolist2[t0, n**2:]).reshape(n, n, n, n) for t0 in range(len(tlist))]
+
+            # 反向算符流
+            for seg_idx in range(len(checkpoints_steps) - 1, 0, -1):
+                start_step_idx = int(checkpoints_steps[seg_idx - 1])
+                end_step_idx   = int(checkpoints_steps[seg_idx])
+                seg_packed = _recompute_segment(start_step_idx, end_step_idx)
+                for local_idx in range(end_step_idx - start_step_idx - 1, -1, -1):
+                    global_step = start_step_idx + local_idx
+                    dl_abs = float(dl_list_final[global_step + 1] - dl_list_final[global_step])
+                    h2_local, h4_local = _seg_decompress(seg_packed[local_idx])   # 一次解压，t0 循环里复用
+                    for t0 in range(len(tlist)):
+                        soln = ode(_rhs_op_H_bck, [ops2[t0], ops4[t0]],
+                                   jnp.array([0.0, dl_abs]),
+                                   h2_local, h4_local,
+                                   rtol=_rtol, atol=_atol)
+                        ops2[t0] = soln[0][-1]
+                        ops4[t0] = soln[1][-1]
+
+            # 计算期望值 <n_site(t)>
+            nlist = np.zeros(len(tlist), dtype=np.float64)
+            nlist2 = np.zeros(len(tlist), dtype=np.float64)
+            for t0 in range(len(tlist)):
+                mat = np.array(ops2[t0])
+                mat4 = np.array(ops4[t0])
+                for i in range(n):
+                    nlist[t0]  += (mat[i, i] * state[i]).real
+                    nlist2[t0] += (mat[i, i] * state[i]).real
+                    for j in range(n):
+                        if i != j:
+                            nlist[t0] += (mat4[i, i, j, j] * state[i] * state[j]).real
+                            nlist[t0] += -(mat4[i, j, j, i] * state[i] * state[j]).real
+            density[site]        = nlist
+            density_nonint[site] = nlist2
+
+        output = {
+            "H0_diag": np.array(H0_diag),
+            "Hint": np.array(Hintfinal),
+            "LIOM Interactions": np.array(lbits),
+            "LIOM": np.array(liom),
+            "Invariant": 0,
+            "density": np.array(density),
+            "density_nonint": np.array(density_nonint),
+            "ckpt_step": int(ckpt_step),
+            "steps_evolved": int(final_step),
+            "compress_mode": int(compress_mode),
+        }
+        return output
+
+    # ══════════════════════════════════════════════════════════════════════
+    elif switch_num == 101:
+        # 分支 101：parallel + checkpoint
+
+        H2_init = jnp.array(hamiltonian.H2_spinless)
+        H4_init = jnp.array(hamiltonian.H4_spinless)
+        orig_dtype = H2_init.dtype
+
+        dl_arr = np.array(dl_list, dtype=np.float64)
+        if dl_arr.ndim != 1 or len(dl_arr) < 2:
+            raise ValueError("dl_list must be a 1D array with at least two time points.")
+
+        max_steps = min(int(qmax), len(dl_arr))
+        if max_steps < 2:
+            raise ValueError("qmax and dl_list imply fewer than two usable time points.")
+        dl_arr = dl_arr[:max_steps]
+
+        if ckpt_step is None:
+            ckpt_step = min(40, int(np.sqrt(max_steps)))
+        ckpt_step = max(1, int(ckpt_step))
+
+        _rtol = 1e-6
+        _atol = 1e-6
+
+        # --- 1. 正向流：H 对角化 + 所有格点算符同步推进，稀疏存储检查点 ---
+        curr_H2 = H2_init
+        curr_H4 = H4_init
+        checkpoints = [(0, np.array(curr_H2, dtype=orig_dtype), np.array(curr_H4, dtype=orig_dtype))]
+
+        # 在主循环前初始化所有格点算符（合并原步骤 3）
+        all_num2 = []
+        all_num4 = []
+        for site in range(n):
+            num2 = jnp.zeros((n, n), dtype=jnp.float32)
+            num2 = num2.at[site, site].set(1.0)
+            all_num2.append(num2)
+            all_num4.append(jnp.zeros((n, n, n, n), dtype=jnp.float32))
+
+        k = 1
+        J0 = 1.0
+        while k < len(dl_arr) and J0 > cutoff:
+            prev_H2 = curr_H2          # 本步开始时的 H，用于算符流 RHS
+            prev_H4 = curr_H4
+            steps = np.array([dl_arr[k - 1], dl_arr[k]], dtype=dl_arr.dtype)
+
+            # 推进 H 一步
+            soln_H = ode(int_ode, [curr_H2, curr_H4], steps, rtol=_rtol, atol=_atol)
+            curr_H2 = soln_H[0][-1]
+            curr_H4 = soln_H[1][-1]
+
+            # 用本步起始 H 同步推进所有格点算符
+            t0_l = float(dl_arr[k - 1])
+            t1_l = float(dl_arr[k])
+            for site in range(n):
+                soln_op = ode(_rhs_op_H, [all_num2[site], all_num4[site]],
+                              jnp.array([t0_l, t1_l]),
+                              prev_H2, prev_H4,
+                              rtol=_rtol, atol=_atol)
+                all_num2[site] = soln_op[0][-1]
+                all_num4[site] = soln_op[1][-1]
+
+            if k % ckpt_step == 0:
+                checkpoints.append((k, np.array(curr_H2, dtype=orig_dtype), np.array(curr_H4, dtype=orig_dtype)))
+            J0 = float(jnp.max(jnp.abs(curr_H2 - jnp.diag(jnp.diag(curr_H2)))))
+            k += 1
+
+        final_step = k - 1
+        if checkpoints[-1][0] != final_step:
+            checkpoints.append((final_step, np.array(curr_H2, dtype=orig_dtype), np.array(curr_H4, dtype=orig_dtype)))
+
+        dl_list_final = dl_arr[:final_step + 1]
+
+        H0_diag = curr_H2
+        Hintfinal = curr_H4
+        h_final_flat = jnp.concatenate((curr_H2.reshape(n**2), curr_H4.reshape(n**4)))
+
+        # --- 2. 提取 l-bit 相互作用 ---
+        HFint = np.zeros((n, n), dtype=np.float64)
+        Hint_np = np.array(Hintfinal)
+        for i in range(n):
+            for j in range(n):
+                HFint[i, j] = Hint_np[i, i, j, j] - Hint_np[i, j, j, i]
+
+        lbits = np.zeros(n - 1, dtype=np.float64)
+        for q in range(1, n):
+            vals = np.abs(np.diag(HFint, q) + np.diag(HFint, -q)) / 2.0
+            vals = np.maximum(vals, 1e-30)
+            lbits[q - 1] = np.median(np.log10(vals))
+
+        liom = np.zeros((final_step + 1, n**2 + n**4), dtype=np.float32)
+        liom0 = np.zeros((n, n), dtype=np.float32)
+        liom0[n // 2, n // 2] = 1.0
+        liom[0, :n**2] = liom0.reshape(n**2)
+
+        density = np.zeros((n, len(tlist)), dtype=np.float64)
+        density_nonint = np.zeros((n, len(tlist)), dtype=np.float64)
+        update_op = jit(functools.partial(update, method=method))
+
+        # 算符流 RHS（正向）：dn/dl = [η(H), n]
+        def _rhs_op_H(y, l, H2_c, H4_c):
+            n2, n4 = y[0], y[1]
+            h0, v0, hint0, vint = extract_diag(H2_c, H4_c)
+            eta2 = contract(h0, v0, method=method, eta=True)
+            eta4 = contract(hint0, v0, method=method, eta=True) + contract(h0, vint, method=method, eta=True)
+            dn2 = contract(eta2, n2, method=method, comp=False)
+            dn4 = contract(eta4, n2, method=method, comp=False) + contract(eta2, n4, method=method, comp=False)
+            return [dn2, dn4]
+
+        # 算符流 RHS（反向）：dn/dl = -[η(H), n]
+        def _rhs_op_H_bck(y, l, H2_c, H4_c):
+            n2, n4 = y[0], y[1]
+            h0, v0, hint0, vint = extract_diag(H2_c, H4_c)
+            eta2 = contract(h0, v0, method=method, eta=True)
+            eta4 = contract(hint0, v0, method=method, eta=True) + contract(h0, vint, method=method, eta=True)
+            dn2 = contract(eta2, n2, method=method, comp=False)
+            dn4 = contract(eta4, n2, method=method, comp=False) + contract(eta2, n4, method=method, comp=False)
+            return [-dn2, -dn4]
+
+        # 从检查点重算指定段内每步的 H(l)（仅反向流使用）
+        def _recompute_segment(start_step_idx, end_step_idx):
+            segment_len = end_step_idx - start_step_idx
+            if segment_len <= 0:
+                return [], []
+            temp_H2 = jnp.array(checkpoints_map[start_step_idx][0])
+            temp_H4 = jnp.array(checkpoints_map[start_step_idx][1])
+            seg_h2 = [None] * segment_len
+            seg_h4 = [None] * segment_len
+            for curr_step in range(start_step_idx, end_step_idx):
+                local_idx = curr_step - start_step_idx
+                seg_h2[local_idx] = temp_H2
+                seg_h4[local_idx] = temp_H4
+                steps = np.array([dl_list_final[curr_step], dl_list_final[curr_step + 1]], dtype=dl_list_final.dtype)
+                soln = ode(int_ode, [temp_H2, temp_H4], steps, rtol=_rtol, atol=_atol)
+                temp_H2 = soln[0][-1]
+                temp_H4 = soln[1][-1]
+            return seg_h2, seg_h4
+
+        checkpoints_map = {}
+        for step_idx, h2_cp, h4_cp in checkpoints:
+            checkpoints_map[int(step_idx)] = (h2_cp, h4_cp)
+
+        # --- 3. 实时演化（LIOM 基中精确对角化） ---
+        all_ops2 = []
+        all_ops4 = []
+        for site in range(n):
+            num_diag = jnp.concatenate((all_num2[site].reshape(n**2), all_num4[site].reshape(n**4)))
+            evolist2 = dyn_exact(n, num_diag, h_final_flat, tlist)
+            ops2 = [jnp.array(evolist2[t0, :n**2]).reshape(n, n) for t0 in range(len(tlist))]
+            ops4 = [jnp.array(evolist2[t0, n**2:]).reshape(n, n, n, n) for t0 in range(len(tlist))]
+            all_ops2.append(ops2)
+            all_ops4.append(ops4)
+
+        del all_num2, all_num4
+
+        # --- 4. 反向算符流：所有格点和时间片同时反变换 ---
+        for seg_idx in range(len(checkpoints) - 1, 0, -1):
+            start_step_idx = int(checkpoints[seg_idx - 1][0])
+            end_step_idx = int(checkpoints[seg_idx][0])
+            seg_h2, seg_h4 = _recompute_segment(start_step_idx, end_step_idx)
+            for local_idx in range(end_step_idx - start_step_idx - 1, -1, -1):
+                global_step = start_step_idx + local_idx
+                dl_abs = float(dl_list_final[global_step + 1] - dl_list_final[global_step])
+                for site in range(n):
+                    for t0 in range(len(tlist)):
+                        soln = ode(_rhs_op_H_bck, [all_ops2[site][t0], all_ops4[site][t0]],
+                                   jnp.array([0.0, dl_abs]),
+                                   seg_h2[local_idx], seg_h4[local_idx],
+                                   rtol=_rtol, atol=_atol)
+                        all_ops2[site][t0] = soln[0][-1]
+                        all_ops4[site][t0] = soln[1][-1]
+
+        # --- 5. 计算期望值 <n_site(t)> ---
+        for site in range(n):
+            nlist = np.zeros(len(tlist), dtype=np.float64)
+            nlist2 = np.zeros(len(tlist), dtype=np.float64)
+            for t0 in range(len(tlist)):
+                mat = np.array(all_ops2[site][t0])
+                mat4 = np.array(all_ops4[site][t0])
+                for i in range(n):
+                    nlist[t0] += (mat[i, i] * state[i]).real
+                    nlist2[t0] += (mat[i, i] * state[i]).real
+                    for j in range(n):
+                        if i != j:
+                            nlist[t0] += (mat4[i, i, j, j] * state[i] * state[j]).real
+                            nlist[t0] += -(mat4[i, j, j, i] * state[i] * state[j]).real
+            density[site] = nlist
+            density_nonint[site] = nlist2
+
+        output = {
+            "H0_diag": np.array(H0_diag),
+            "Hint": np.array(Hintfinal),
+            "LIOM Interactions": np.array(lbits),
+            "LIOM": np.array(liom),
+            "Invariant": 0,
+            "density": np.array(density),
+            "density_nonint": np.array(density_nonint),
+            "ckpt_step": int(ckpt_step),
+            "steps_evolved": int(final_step),
+        }
+        return output
+
+    # ══════════════════════════════════════════════════════════════════════
+    elif switch_num == 111:
+        # 分支 111：parallel + compress + checkpoint
+        # 在分支 101（parallel+checkpoint）的基础上加入矩阵压缩：
+        #   - 检查点 H 用 compress_mode 压缩存储
+        #   - _recompute_segment 内段内 H 也用 compress_mode 压缩
+        # 由 compress_mode 选择具体压缩策略（0~4）
+        # ══════════════════════════════════════════════════════════════════
+
+        H2_init = jnp.array(hamiltonian.H2_spinless)
+        H4_init = jnp.array(hamiltonian.H4_spinless)
+        orig_dtype = H2_init.dtype
+
+        dl_arr = np.array(dl_list, dtype=np.float64)
+        if dl_arr.ndim != 1 or len(dl_arr) < 2:
+            raise ValueError("dl_list must be a 1D array with at least two time points.")
+
+        max_steps = min(int(qmax), len(dl_arr))
+        if max_steps < 2:
+            raise ValueError("qmax and dl_list imply fewer than two usable time points.")
+        dl_arr = dl_arr[:max_steps]
+
+        if ckpt_step is None:
+            ckpt_step = min(40, int(np.sqrt(max_steps)))
+        ckpt_step = max(1, int(ckpt_step))
+
+        _rtol = 1e-6
+        _atol = 1e-6
+
+        # ── compress_mode → 内部布尔标志 ──
+        _cmp_prune    = compress_mode in (3, 4)
+        _cmp_svd_mode = compress_mode in (2, 4)
+        _cmp_coo_svd  = (compress_mode == 4)
+        _cmp_exp_scale = (compress_mode != 0)
+
+        _cmp_eps            = float(os.environ.get('compress_eps',            '1e-7'))
+        _cmp_svd_rank_h2    = int(os.environ.get('compress_svd_rank_h2',     '16'))
+        _cmp_svd_rank_h4    = int(os.environ.get('compress_svd_rank_h4',     '64'))
+        _cmp_svd_oversample = int(os.environ.get('compress_svd_oversample',   '8'))
+        _cmp_svd_niter      = int(os.environ.get('compress_svd_niter',        '1'))
+
+        if compress_mode == 0:
+            _cmp_buffer_dtype = np.float32
+        else:
+            _bdtype_env = os.environ.get('compress_buffer_dtype', '').strip().lower()
+            _cmp_buffer_dtype = np.float32 if _bdtype_env in ('float32', 'fp32') else np.float16
+
+        _sdtype_env = os.environ.get('compress_svd_store_dtype', 'float16').strip().lower()
+        _cmp_svd_store_dtype = np.float32 if _sdtype_env in ('float32', 'fp32') else np.float16
+
+        n2_dim = n * n
+        max_ckpts = max_steps // ckpt_step + 4
+
+        # ── 预分配检查点压缩存储容器 ──
+        cmp_scale_h2 = np.ones(max_ckpts, dtype=np.float32)
+        cmp_scale_h4 = np.ones(max_ckpts, dtype=np.float32)
+
+        if (not _cmp_prune) and (not _cmp_svd_mode):
+            buf_h2 = np.zeros((max_ckpts, n, n),       dtype=_cmp_buffer_dtype)
+            buf_h4 = np.zeros((max_ckpts, n, n, n, n), dtype=_cmp_buffer_dtype)
+        elif (not _cmp_prune) and _cmp_svd_mode:
+            cmp_h2_U  = [None] * max_ckpts; cmp_h2_S  = [None] * max_ckpts; cmp_h2_Vt = [None] * max_ckpts
+            cmp_h4_U  = [None] * max_ckpts; cmp_h4_S  = [None] * max_ckpts; cmp_h4_Vt = [None] * max_ckpts
+        elif _cmp_coo_svd:
+            cmp_h2_rows = [None] * max_ckpts; cmp_h2_cols = [None] * max_ckpts
+            cmp_h2_U    = [None] * max_ckpts; cmp_h2_S    = [None] * max_ckpts; cmp_h2_Vt = [None] * max_ckpts
+            cmp_h4_rows = [None] * max_ckpts; cmp_h4_cols = [None] * max_ckpts
+            cmp_h4_U    = [None] * max_ckpts; cmp_h4_S    = [None] * max_ckpts; cmp_h4_Vt = [None] * max_ckpts
+        else:
+            cmp_h2_idx_list = [None] * max_ckpts; cmp_h2_val_list = [None] * max_ckpts
+            cmp_h4_idx_list = [None] * max_ckpts; cmp_h4_val_list = [None] * max_ckpts
+
+        # ── 检查点压缩存储函数 ──
+        def _cmp_store(slot, h2_jax, h4_jax):
+            if _cmp_exp_scale:
+                mu2 = float(jnp.max(jnp.abs(h2_jax)))
+                mu4 = float(jnp.max(jnp.abs(h4_jax)))
+                if (not np.isfinite(mu2)) or mu2 <= 0.0: mu2 = 1.0
+                if (not np.isfinite(mu4)) or mu4 <= 0.0: mu4 = 1.0
+            else:
+                mu2 = mu4 = 1.0
+            cmp_scale_h2[slot] = np.float32(mu2)
+            cmp_scale_h4[slot] = np.float32(mu4)
+
+            h2_np = np.array((h2_jax / mu2) if _cmp_exp_scale else h2_jax, dtype=np.float32)
+            h4_np = np.array((h4_jax / mu4) if _cmp_exp_scale else h4_jax, dtype=np.float32)
+
+            if (not _cmp_prune) and (not _cmp_svd_mode):
+                buf_h2[slot] = h2_np.astype(_cmp_buffer_dtype, copy=False)
+                buf_h4[slot] = h4_np.astype(_cmp_buffer_dtype, copy=False)
+            elif (not _cmp_prune) and _cmp_svd_mode:
+                U2, S2, Vt2 = hybrid_svd(h2_np.reshape(n, n),
+                                          rank=_cmp_svd_rank_h2,
+                                          oversample=_cmp_svd_oversample,
+                                          n_iter=_cmp_svd_niter)
+                cmp_h2_U[slot]  = U2.astype(_cmp_svd_store_dtype, copy=False)
+                cmp_h2_S[slot]  = S2
+                cmp_h2_Vt[slot] = Vt2.astype(_cmp_svd_store_dtype, copy=False)
+                U4, S4, Vt4 = hybrid_svd(h4_np.reshape(n2_dim, n2_dim),
+                                          rank=_cmp_svd_rank_h4,
+                                          oversample=_cmp_svd_oversample,
+                                          n_iter=_cmp_svd_niter)
+                cmp_h4_U[slot]  = U4.astype(_cmp_svd_store_dtype, copy=False)
+                cmp_h4_S[slot]  = S4
+                cmp_h4_Vt[slot] = Vt4.astype(_cmp_svd_store_dtype, copy=False)
+            elif _cmp_coo_svd:
+                # H2: COO 支撑 + rSVD 子块
+                th2 = (_cmp_eps / mu2) if _cmp_exp_scale else _cmp_eps
+                h2_flat = h2_np.reshape(-1)
+                h2_idx_arr = np.flatnonzero(np.abs(h2_flat) >= th2).astype(np.int32, copy=False)
+                if h2_idx_arr.size:
+                    ii = (h2_idx_arr // n).astype(np.int32, copy=False)
+                    jj = (h2_idx_arr - ii * n).astype(np.int32, copy=False)
+                    rows2 = np.unique(ii); cols2 = np.unique(jj)
+                    rmap = np.full((n,), -1, dtype=np.int32); rmap[rows2] = np.arange(rows2.size, dtype=np.int32)
+                    cmap = np.full((n,), -1, dtype=np.int32); cmap[cols2] = np.arange(cols2.size, dtype=np.int32)
+                    sub2 = np.zeros((rows2.size, cols2.size), dtype=np.float32)
+                    sub2[rmap[ii], cmap[jj]] = h2_flat[h2_idx_arr]
+                else:
+                    rows2 = np.zeros((0,), dtype=np.int32); cols2 = np.zeros((0,), dtype=np.int32)
+                    sub2  = np.zeros((0, 0),     dtype=np.float32)
+                r_eff = max(1, min(_cmp_svd_rank_h2, sub2.shape[0], sub2.shape[1]))
+                U2, S2, Vt2 = hybrid_svd(sub2, rank=r_eff,
+                                          oversample=_cmp_svd_oversample,
+                                          n_iter=_cmp_svd_niter)
+                cmp_h2_rows[slot] = rows2; cmp_h2_cols[slot] = cols2
+                cmp_h2_U[slot]    = U2.astype(_cmp_svd_store_dtype, copy=False)
+                cmp_h2_S[slot]    = S2
+                cmp_h2_Vt[slot]   = Vt2.astype(_cmp_svd_store_dtype, copy=False)
+
+                # H4: COO 支撑 + rSVD 子块
+                th4 = (_cmp_eps / mu4) if _cmp_exp_scale else _cmp_eps
+                h4_flat = h4_np.reshape(-1)
+                h4_idx_arr = np.flatnonzero(np.abs(h4_flat) >= th4).astype(np.int32, copy=False)
+                if h4_idx_arr.size:
+                    rr = (h4_idx_arr // n2_dim).astype(np.int32, copy=False)
+                    cc = (h4_idx_arr - rr * n2_dim).astype(np.int32, copy=False)
+                    rows4 = np.unique(rr); cols4 = np.unique(cc)
+                    rmap = np.full((n2_dim,), -1, dtype=np.int32); rmap[rows4] = np.arange(rows4.size, dtype=np.int32)
+                    cmap = np.full((n2_dim,), -1, dtype=np.int32); cmap[cols4] = np.arange(cols4.size, dtype=np.int32)
+                    sub4 = np.zeros((rows4.size, cols4.size), dtype=np.float32)
+                    sub4[rmap[rr], cmap[cc]] = h4_flat[h4_idx_arr]
+                else:
+                    rows4 = np.zeros((0,), dtype=np.int32); cols4 = np.zeros((0,), dtype=np.int32)
+                    sub4  = np.zeros((0, 0),     dtype=np.float32)
+                r_eff = max(1, min(_cmp_svd_rank_h4, sub4.shape[0], sub4.shape[1]))
+                U4, S4, Vt4 = hybrid_svd(sub4, rank=r_eff,
+                                          oversample=_cmp_svd_oversample,
+                                          n_iter=_cmp_svd_niter)
+                cmp_h4_rows[slot] = rows4; cmp_h4_cols[slot] = cols4
+                cmp_h4_U[slot]    = U4.astype(_cmp_svd_store_dtype, copy=False)
+                cmp_h4_S[slot]    = S4
+                cmp_h4_Vt[slot]   = Vt4.astype(_cmp_svd_store_dtype, copy=False)
+            else:
+                # 纯 COO 稀疏
+                th2 = (_cmp_eps / mu2) if _cmp_exp_scale else _cmp_eps
+                th4 = (_cmp_eps / mu4) if _cmp_exp_scale else _cmp_eps
+                h2_flat = h2_np.reshape(-1)
+                h4_flat = h4_np.reshape(-1)
+                h2_idx_arr = np.flatnonzero(np.abs(h2_flat) >= th2).astype(np.int32, copy=False)
+                h4_idx_arr = np.flatnonzero(np.abs(h4_flat) >= th4).astype(np.int32, copy=False)
+                cmp_h2_idx_list[slot] = h2_idx_arr
+                cmp_h2_val_list[slot] = (h2_flat[h2_idx_arr].astype(_cmp_buffer_dtype, copy=False)
+                                          if h2_idx_arr.size else np.zeros((0,), dtype=_cmp_buffer_dtype))
+                cmp_h4_idx_list[slot] = h4_idx_arr
+                cmp_h4_val_list[slot] = (h4_flat[h4_idx_arr].astype(_cmp_buffer_dtype, copy=False)
+                                          if h4_idx_arr.size else np.zeros((0,), dtype=_cmp_buffer_dtype))
+
+        # ── 检查点解压函数：返回 (h2_jax, h4_jax) JAX 张量 ──
+        def _cmp_load(slot):
+            mu2 = float(cmp_scale_h2[slot])
+            mu4 = float(cmp_scale_h4[slot])
+
+            if (not _cmp_prune) and (not _cmp_svd_mode):
+                h2_dense = np.array(buf_h2[slot], dtype=np.float32)
+                h4_dense = np.array(buf_h4[slot], dtype=np.float32)
+            elif (not _cmp_prune) and _cmp_svd_mode:
+                U2 = cmp_h2_U[slot]; S2 = cmp_h2_S[slot]; Vt2 = cmp_h2_Vt[slot]
+                h2_dense = hybrid_svd_decompress(
+                    U2.astype(np.float32, copy=False), S2,
+                    Vt2.astype(np.float32, copy=False),
+                    (n, n), out_dtype=np.float32)
+                U4 = cmp_h4_U[slot]; S4 = cmp_h4_S[slot]; Vt4 = cmp_h4_Vt[slot]
+                h4_mat = hybrid_svd_decompress(
+                    U4.astype(np.float32, copy=False), S4,
+                    Vt4.astype(np.float32, copy=False),
+                    (n2_dim, n2_dim), out_dtype=np.float32)
+                h4_dense = h4_mat.reshape((n, n, n, n))
+            elif _cmp_coo_svd:
+                r2 = cmp_h2_rows[slot]; c2 = cmp_h2_cols[slot]
+                U2 = cmp_h2_U[slot];    S2 = cmp_h2_S[slot];    Vt2 = cmp_h2_Vt[slot]
+                h2_dense = np.zeros((n, n), dtype=np.float32)
+                if (r2 is not None) and (c2 is not None) and r2.size and c2.size and (U2 is not None):
+                    sub = hybrid_svd_decompress(
+                        U2.astype(np.float32, copy=False), S2,
+                        Vt2.astype(np.float32, copy=False),
+                        (int(r2.size), int(c2.size)), out_dtype=np.float32)
+                    h2_dense[np.ix_(r2.astype(np.int64, copy=False),
+                                    c2.astype(np.int64, copy=False))] = sub
+
+                r4 = cmp_h4_rows[slot]; c4 = cmp_h4_cols[slot]
+                U4 = cmp_h4_U[slot];    S4 = cmp_h4_S[slot];    Vt4 = cmp_h4_Vt[slot]
+                h4_mat = np.zeros((n2_dim, n2_dim), dtype=np.float32)
+                if (r4 is not None) and (c4 is not None) and r4.size and c4.size and (U4 is not None):
+                    sub4 = hybrid_svd_decompress(
+                        U4.astype(np.float32, copy=False), S4,
+                        Vt4.astype(np.float32, copy=False),
+                        (int(r4.size), int(c4.size)), out_dtype=np.float32)
+                    h4_mat[np.ix_(r4.astype(np.int64, copy=False),
+                                  c4.astype(np.int64, copy=False))] = sub4
+                h4_dense = h4_mat.reshape((n, n, n, n))
+            else:
+                idx2 = cmp_h2_idx_list[slot]; val2 = cmp_h2_val_list[slot]
+                h2_dense = np.zeros(n * n, dtype=np.float32)
+                if (idx2 is not None) and idx2.size:
+                    h2_dense[idx2.astype(np.int64, copy=False)] = val2.astype(np.float32, copy=False)
+                h2_dense = h2_dense.reshape(n, n)
+
+                idx4 = cmp_h4_idx_list[slot]; val4 = cmp_h4_val_list[slot]
+                h4_dense = np.zeros(n**4, dtype=np.float32)
+                if (idx4 is not None) and idx4.size:
+                    h4_dense[idx4.astype(np.int64, copy=False)] = val4.astype(np.float32, copy=False)
+                h4_dense = h4_dense.reshape(n, n, n, n)
+
+            if _cmp_exp_scale:
+                h2_dense = h2_dense * mu2
+                h4_dense = h4_dense * mu4
+
+            return jnp.array(h2_dense, dtype=jnp.float32), jnp.array(h4_dense, dtype=jnp.float32)
+
+        # 算符流 RHS（正向）：dn/dl = [η(H), n]
+        def _rhs_op_H(y, l, H2_c, H4_c):
+            n2, n4 = y[0], y[1]
+            h0, v0, hint0, vint = extract_diag(H2_c, H4_c)
+            eta2 = contract(h0, v0, method=method, eta=True)
+            eta4 = contract(hint0, v0, method=method, eta=True) + contract(h0, vint, method=method, eta=True)
+            dn2 = contract(eta2, n2, method=method, comp=False)
+            dn4 = contract(eta4, n2, method=method, comp=False) + contract(eta2, n4, method=method, comp=False)
+            return [dn2, dn4]
+
+        # 算符流 RHS（反向）：dn/dl = -[η(H), n]
+        def _rhs_op_H_bck(y, l, H2_c, H4_c):
+            n2, n4 = y[0], y[1]
+            h0, v0, hint0, vint = extract_diag(H2_c, H4_c)
+            eta2 = contract(h0, v0, method=method, eta=True)
+            eta4 = contract(hint0, v0, method=method, eta=True) + contract(h0, vint, method=method, eta=True)
+            dn2 = contract(eta2, n2, method=method, comp=False)
+            dn4 = contract(eta4, n2, method=method, comp=False) + contract(eta2, n4, method=method, comp=False)
+            return [-dn2, -dn4]
+
+        # --- 1. 正向流：H 对角化 + 所有格点算符同步推进 + 检查点压缩存储 ---
+        curr_H2 = H2_init
+        curr_H4 = H4_init
+
+        checkpoints_steps = [0]
+        ckpt_slot_map = {0: 0}
+        _cmp_store(0, curr_H2, curr_H4)
+        n_ckpts = 1
+
+        # 主循环前初始化所有格点算符
+        all_num2 = []
+        all_num4 = []
+        for site in range(n):
+            num2 = jnp.zeros((n, n), dtype=jnp.float32)
+            num2 = num2.at[site, site].set(1.0)
+            all_num2.append(num2)
+            all_num4.append(jnp.zeros((n, n, n, n), dtype=jnp.float32))
+
+        k = 1
+        J0 = 1.0
+        while k < len(dl_arr) and J0 > cutoff:
+            prev_H2 = curr_H2          # 本步起始 H，用于算符流 RHS（直接用，不压缩）
+            prev_H4 = curr_H4
+            steps = np.array([dl_arr[k - 1], dl_arr[k]], dtype=dl_arr.dtype)
+
+            # 推进 H 一步
+            soln_H = ode(int_ode, [curr_H2, curr_H4], steps, rtol=_rtol, atol=_atol)
+            curr_H2 = soln_H[0][-1]
+            curr_H4 = soln_H[1][-1]
+
+            # 用本步起始 H 同步推进所有格点算符（前向算符流）
+            t0_l = float(dl_arr[k - 1])
+            t1_l = float(dl_arr[k])
+            for site in range(n):
+                soln_op = ode(_rhs_op_H, [all_num2[site], all_num4[site]],
+                              jnp.array([t0_l, t1_l]),
+                              prev_H2, prev_H4,
+                              rtol=_rtol, atol=_atol)
+                all_num2[site] = soln_op[0][-1]
+                all_num4[site] = soln_op[1][-1]
+
+            if k % ckpt_step == 0 and n_ckpts < max_ckpts:
+                ckpt_slot_map[k] = n_ckpts
+                checkpoints_steps.append(k)
+                _cmp_store(n_ckpts, curr_H2, curr_H4)
+                n_ckpts += 1
+
+            J0 = float(jnp.max(jnp.abs(curr_H2 - jnp.diag(jnp.diag(curr_H2)))))
+            k += 1
+
+        final_step = k - 1
+        if checkpoints_steps[-1] != final_step and n_ckpts < max_ckpts:
+            ckpt_slot_map[final_step] = n_ckpts
+            checkpoints_steps.append(final_step)
+            _cmp_store(n_ckpts, curr_H2, curr_H4)
+            n_ckpts += 1
+
+        dl_list_final = dl_arr[:final_step + 1]
+
+        H0_diag = curr_H2
+        Hintfinal = curr_H4
+        h_final_flat = jnp.concatenate((curr_H2.reshape(n**2), curr_H4.reshape(n**4)))
+
+        # --- 2. 提取 l-bit 相互作用 ---
+        HFint = np.zeros((n, n), dtype=np.float64)
+        Hint_np = np.array(Hintfinal)
+        for i in range(n):
+            for j in range(n):
+                HFint[i, j] = Hint_np[i, i, j, j] - Hint_np[i, j, j, i]
+
+        lbits = np.zeros(n - 1, dtype=np.float64)
+        for q in range(1, n):
+            vals = np.abs(np.diag(HFint, q) + np.diag(HFint, -q)) / 2.0
+            vals = np.maximum(vals, 1e-30)
+            lbits[q - 1] = np.median(np.log10(vals))
+
+        liom = np.zeros((final_step + 1, n**2 + n**4), dtype=np.float32)
+        liom0 = np.zeros((n, n), dtype=np.float32)
+        liom0[n // 2, n // 2] = 1.0
+        liom[0, :n**2] = liom0.reshape(n**2)
+
+        density        = np.zeros((n, len(tlist)), dtype=np.float64)
+        density_nonint = np.zeros((n, len(tlist)), dtype=np.float64)
+        update_op = jit(functools.partial(update, method=method))
+
+        # ── 段内 H 压缩/解压（与检查点共用 compress_mode）──
+        def _seg_compress(h2_jax, h4_jax):
+            if compress_mode == 0:
+                return (0, h2_jax, h4_jax)
+
+            if _cmp_exp_scale:
+                mu2 = float(jnp.max(jnp.abs(h2_jax)))
+                mu4 = float(jnp.max(jnp.abs(h4_jax)))
+                if (not np.isfinite(mu2)) or mu2 <= 0.0: mu2 = 1.0
+                if (not np.isfinite(mu4)) or mu4 <= 0.0: mu4 = 1.0
+            else:
+                mu2 = mu4 = 1.0
+            h2_np = np.array((h2_jax / mu2) if _cmp_exp_scale else h2_jax, dtype=np.float32)
+            h4_np = np.array((h4_jax / mu4) if _cmp_exp_scale else h4_jax, dtype=np.float32)
+
+            if compress_mode == 1:
+                return (1,
+                        h2_np.astype(_cmp_buffer_dtype, copy=False),
+                        h4_np.astype(_cmp_buffer_dtype, copy=False),
+                        mu2, mu4)
+
+            elif compress_mode == 2:
+                U2, S2, Vt2 = hybrid_svd(h2_np.reshape(n, n),
+                                          rank=_cmp_svd_rank_h2,
+                                          oversample=_cmp_svd_oversample,
+                                          n_iter=_cmp_svd_niter)
+                U4, S4, Vt4 = hybrid_svd(h4_np.reshape(n2_dim, n2_dim),
+                                          rank=_cmp_svd_rank_h4,
+                                          oversample=_cmp_svd_oversample,
+                                          n_iter=_cmp_svd_niter)
+                return (2,
+                        U2.astype(_cmp_svd_store_dtype, copy=False), S2,
+                        Vt2.astype(_cmp_svd_store_dtype, copy=False),
+                        U4.astype(_cmp_svd_store_dtype, copy=False), S4,
+                        Vt4.astype(_cmp_svd_store_dtype, copy=False),
+                        mu2, mu4)
+
+            elif compress_mode == 3:
+                th2 = (_cmp_eps / mu2) if _cmp_exp_scale else _cmp_eps
+                th4 = (_cmp_eps / mu4) if _cmp_exp_scale else _cmp_eps
+                h2_flat = h2_np.reshape(-1)
+                h4_flat = h4_np.reshape(-1)
+                h2_idx = np.flatnonzero(np.abs(h2_flat) >= th2).astype(np.int32, copy=False)
+                h4_idx = np.flatnonzero(np.abs(h4_flat) >= th4).astype(np.int32, copy=False)
+                h2_val = (h2_flat[h2_idx].astype(_cmp_buffer_dtype, copy=False)
+                           if h2_idx.size else np.zeros((0,), dtype=_cmp_buffer_dtype))
+                h4_val = (h4_flat[h4_idx].astype(_cmp_buffer_dtype, copy=False)
+                           if h4_idx.size else np.zeros((0,), dtype=_cmp_buffer_dtype))
+                return (3, h2_idx, h2_val, h4_idx, h4_val, mu2, mu4)
+
+            else:  # compress_mode == 4
+                th2 = (_cmp_eps / mu2) if _cmp_exp_scale else _cmp_eps
+                h2_flat = h2_np.reshape(-1)
+                h2_idx_arr = np.flatnonzero(np.abs(h2_flat) >= th2).astype(np.int32, copy=False)
+                if h2_idx_arr.size:
+                    ii = (h2_idx_arr // n).astype(np.int32, copy=False)
+                    jj = (h2_idx_arr - ii * n).astype(np.int32, copy=False)
+                    rows2 = np.unique(ii); cols2 = np.unique(jj)
+                    rmap = np.full((n,), -1, dtype=np.int32); rmap[rows2] = np.arange(rows2.size, dtype=np.int32)
+                    cmap = np.full((n,), -1, dtype=np.int32); cmap[cols2] = np.arange(cols2.size, dtype=np.int32)
+                    sub2 = np.zeros((rows2.size, cols2.size), dtype=np.float32)
+                    sub2[rmap[ii], cmap[jj]] = h2_flat[h2_idx_arr]
+                else:
+                    rows2 = np.zeros((0,), dtype=np.int32); cols2 = np.zeros((0,), dtype=np.int32)
+                    sub2  = np.zeros((0, 0),     dtype=np.float32)
+                r_eff = max(1, min(_cmp_svd_rank_h2, sub2.shape[0], sub2.shape[1]))
+                U2, S2, Vt2 = hybrid_svd(sub2, rank=r_eff,
+                                          oversample=_cmp_svd_oversample,
+                                          n_iter=_cmp_svd_niter)
+
+                th4 = (_cmp_eps / mu4) if _cmp_exp_scale else _cmp_eps
+                h4_flat = h4_np.reshape(-1)
+                h4_idx_arr = np.flatnonzero(np.abs(h4_flat) >= th4).astype(np.int32, copy=False)
+                if h4_idx_arr.size:
+                    rr = (h4_idx_arr // n2_dim).astype(np.int32, copy=False)
+                    cc = (h4_idx_arr - rr * n2_dim).astype(np.int32, copy=False)
+                    rows4 = np.unique(rr); cols4 = np.unique(cc)
+                    rmap = np.full((n2_dim,), -1, dtype=np.int32); rmap[rows4] = np.arange(rows4.size, dtype=np.int32)
+                    cmap = np.full((n2_dim,), -1, dtype=np.int32); cmap[cols4] = np.arange(cols4.size, dtype=np.int32)
+                    sub4 = np.zeros((rows4.size, cols4.size), dtype=np.float32)
+                    sub4[rmap[rr], cmap[cc]] = h4_flat[h4_idx_arr]
+                else:
+                    rows4 = np.zeros((0,), dtype=np.int32); cols4 = np.zeros((0,), dtype=np.int32)
+                    sub4  = np.zeros((0, 0),     dtype=np.float32)
+                r_eff = max(1, min(_cmp_svd_rank_h4, sub4.shape[0], sub4.shape[1]))
+                U4, S4, Vt4 = hybrid_svd(sub4, rank=r_eff,
+                                          oversample=_cmp_svd_oversample,
+                                          n_iter=_cmp_svd_niter)
+                return (4,
+                        rows2, cols2,
+                        U2.astype(_cmp_svd_store_dtype, copy=False), S2,
+                        Vt2.astype(_cmp_svd_store_dtype, copy=False),
+                        rows4, cols4,
+                        U4.astype(_cmp_svd_store_dtype, copy=False), S4,
+                        Vt4.astype(_cmp_svd_store_dtype, copy=False),
+                        mu2, mu4)
+
+        def _seg_decompress(packed):
+            mode = packed[0]
+            if mode == 0:
+                return packed[1], packed[2]
+
+            if mode == 1:
+                _, h2_low, h4_low, mu2, mu4 = packed
+                h2_dense = np.array(h2_low, dtype=np.float32) * mu2
+                h4_dense = np.array(h4_low, dtype=np.float32) * mu4
+
+            elif mode == 2:
+                _, U2, S2, Vt2, U4, S4, Vt4, mu2, mu4 = packed
+                h2_dense = hybrid_svd_decompress(
+                    U2.astype(np.float32, copy=False), S2,
+                    Vt2.astype(np.float32, copy=False),
+                    (n, n), out_dtype=np.float32) * mu2
+                h4_mat = hybrid_svd_decompress(
+                    U4.astype(np.float32, copy=False), S4,
+                    Vt4.astype(np.float32, copy=False),
+                    (n2_dim, n2_dim), out_dtype=np.float32) * mu4
+                h4_dense = h4_mat.reshape((n, n, n, n))
+
+            elif mode == 3:
+                _, h2_idx, h2_val, h4_idx, h4_val, mu2, mu4 = packed
+                h2_dense = np.zeros(n * n, dtype=np.float32)
+                if h2_idx.size:
+                    h2_dense[h2_idx.astype(np.int64, copy=False)] = h2_val.astype(np.float32, copy=False)
+                h2_dense = h2_dense.reshape(n, n) * mu2
+
+                h4_dense = np.zeros(n**4, dtype=np.float32)
+                if h4_idx.size:
+                    h4_dense[h4_idx.astype(np.int64, copy=False)] = h4_val.astype(np.float32, copy=False)
+                h4_dense = h4_dense.reshape(n, n, n, n) * mu4
+
+            else:  # mode == 4
+                (_, rows2, cols2, U2, S2, Vt2,
+                    rows4, cols4, U4, S4, Vt4, mu2, mu4) = packed
+                h2_dense = np.zeros((n, n), dtype=np.float32)
+                if rows2.size and cols2.size:
+                    sub = hybrid_svd_decompress(
+                        U2.astype(np.float32, copy=False), S2,
+                        Vt2.astype(np.float32, copy=False),
+                        (int(rows2.size), int(cols2.size)), out_dtype=np.float32)
+                    h2_dense[np.ix_(rows2.astype(np.int64, copy=False),
+                                    cols2.astype(np.int64, copy=False))] = sub
+                h2_dense = h2_dense * mu2
+
+                h4_mat = np.zeros((n2_dim, n2_dim), dtype=np.float32)
+                if rows4.size and cols4.size:
+                    sub4 = hybrid_svd_decompress(
+                        U4.astype(np.float32, copy=False), S4,
+                        Vt4.astype(np.float32, copy=False),
+                        (int(rows4.size), int(cols4.size)), out_dtype=np.float32)
+                    h4_mat[np.ix_(rows4.astype(np.int64, copy=False),
+                                  cols4.astype(np.int64, copy=False))] = sub4
+                h4_dense = h4_mat.reshape((n, n, n, n)) * mu4
+
+            return jnp.array(h2_dense, dtype=jnp.float32), jnp.array(h4_dense, dtype=jnp.float32)
+
+        # 从压缩检查点解压并重算指定段内每步的 H(l)，返回打包列表
+        def _recompute_segment(start_step_idx, end_step_idx):
+            segment_len = end_step_idx - start_step_idx
+            if segment_len <= 0:
+                return []
+            slot = ckpt_slot_map[int(start_step_idx)]
+            temp_H2, temp_H4 = _cmp_load(slot)
+            seg_packed = [None] * segment_len
+            for curr_step in range(start_step_idx, end_step_idx):
+                local_idx = curr_step - start_step_idx
+                seg_packed[local_idx] = _seg_compress(temp_H2, temp_H4)
+                steps = np.array([dl_list_final[curr_step], dl_list_final[curr_step + 1]], dtype=dl_list_final.dtype)
+                soln = ode(int_ode, [temp_H2, temp_H4], steps, rtol=_rtol, atol=_atol)
+                temp_H2 = soln[0][-1]
+                temp_H4 = soln[1][-1]
+            return seg_packed
+
+        # --- 3. 实时演化（LIOM 基中精确对角化），并行处理所有格点 ---
+        all_ops2 = []
+        all_ops4 = []
+        for site in range(n):
+            num_diag = jnp.concatenate((all_num2[site].reshape(n**2), all_num4[site].reshape(n**4)))
+            evolist2 = dyn_exact(n, num_diag, h_final_flat, tlist)
+            ops2 = [jnp.array(evolist2[t0, :n**2]).reshape(n, n) for t0 in range(len(tlist))]
+            ops4 = [jnp.array(evolist2[t0, n**2:]).reshape(n, n, n, n) for t0 in range(len(tlist))]
+            all_ops2.append(ops2)
+            all_ops4.append(ops4)
+
+        del all_num2, all_num4
+
+        # --- 4. 反向算符流：所有格点和时间片同时反变换，段内 H 解压一次复用 ---
+        for seg_idx in range(len(checkpoints_steps) - 1, 0, -1):
+            start_step_idx = int(checkpoints_steps[seg_idx - 1])
+            end_step_idx   = int(checkpoints_steps[seg_idx])
+            seg_packed = _recompute_segment(start_step_idx, end_step_idx)
+            for local_idx in range(end_step_idx - start_step_idx - 1, -1, -1):
+                global_step = start_step_idx + local_idx
+                dl_abs = float(dl_list_final[global_step + 1] - dl_list_final[global_step])
+                h2_local, h4_local = _seg_decompress(seg_packed[local_idx])   # 一次解压，site×t0 循环里复用
+                for site in range(n):
+                    for t0 in range(len(tlist)):
+                        soln = ode(_rhs_op_H_bck, [all_ops2[site][t0], all_ops4[site][t0]],
+                                   jnp.array([0.0, dl_abs]),
+                                   h2_local, h4_local,
+                                   rtol=_rtol, atol=_atol)
+                        all_ops2[site][t0] = soln[0][-1]
+                        all_ops4[site][t0] = soln[1][-1]
+
+        # --- 5. 计算期望值 <n_site(t)> ---
+        for site in range(n):
+            nlist  = np.zeros(len(tlist), dtype=np.float64)
+            nlist2 = np.zeros(len(tlist), dtype=np.float64)
+            for t0 in range(len(tlist)):
+                mat  = np.array(all_ops2[site][t0])
+                mat4 = np.array(all_ops4[site][t0])
+                for i in range(n):
+                    nlist[t0]  += (mat[i, i] * state[i]).real
+                    nlist2[t0] += (mat[i, i] * state[i]).real
+                    for j in range(n):
+                        if i != j:
+                            nlist[t0] += (mat4[i, i, j, j] * state[i] * state[j]).real
+                            nlist[t0] += -(mat4[i, j, j, i] * state[i] * state[j]).real
+            density[site]        = nlist
+            density_nonint[site] = nlist2
+
+        output = {
+            "H0_diag": np.array(H0_diag),
+            "Hint": np.array(Hintfinal),
+            "LIOM Interactions": np.array(lbits),
+            "LIOM": np.array(liom),
+            "Invariant": 0,
+            "density": np.array(density),
+            "density_nonint": np.array(density_nonint),
+            "ckpt_step": int(ckpt_step),
+            "steps_evolved": int(final_step),
+            "compress_mode": int(compress_mode),
+        }
+        return output
+
+    # ══════════════════════════════════════════════════════════════════════
+    elif switch_num == 1101:
+        # 分支 1101：pipeline + parallel + checkpoint
+        # 在分支 101 的基础上，反向流时用一个后台线程预取下一段的 H 重算结果
+        # 任意时刻内存中最多存在 2 段重算的 H：当前消费中的 + 后台预取中的
+        # ══════════════════════════════════════════════════════════════════
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        H2_init = jnp.array(hamiltonian.H2_spinless)
+        H4_init = jnp.array(hamiltonian.H4_spinless)
+        orig_dtype = H2_init.dtype
+
+        dl_arr = np.array(dl_list, dtype=np.float64)
+        if dl_arr.ndim != 1 or len(dl_arr) < 2:
+            raise ValueError("dl_list must be a 1D array with at least two time points.")
+
+        max_steps = min(int(qmax), len(dl_arr))
+        if max_steps < 2:
+            raise ValueError("qmax and dl_list imply fewer than two usable time points.")
+        dl_arr = dl_arr[:max_steps]
+
+        if ckpt_step is None:
+            ckpt_step = min(40, int(np.sqrt(max_steps)))
+        ckpt_step = max(1, int(ckpt_step))
+
+        _rtol = 1e-6
+        _atol = 1e-6
+
+        # 算符流 RHS（提前定义：正向流主循环里就要用）
+        def _rhs_op_H(y, l, H2_c, H4_c):
+            n2, n4 = y[0], y[1]
+            h0, v0, hint0, vint = extract_diag(H2_c, H4_c)
+            eta2 = contract(h0, v0, method=method, eta=True)
+            eta4 = contract(hint0, v0, method=method, eta=True) + contract(h0, vint, method=method, eta=True)
+            dn2 = contract(eta2, n2, method=method, comp=False)
+            dn4 = contract(eta4, n2, method=method, comp=False) + contract(eta2, n4, method=method, comp=False)
+            return [dn2, dn4]
+
+        def _rhs_op_H_bck(y, l, H2_c, H4_c):
+            n2, n4 = y[0], y[1]
+            h0, v0, hint0, vint = extract_diag(H2_c, H4_c)
+            eta2 = contract(h0, v0, method=method, eta=True)
+            eta4 = contract(hint0, v0, method=method, eta=True) + contract(h0, vint, method=method, eta=True)
+            dn2 = contract(eta2, n2, method=method, comp=False)
+            dn4 = contract(eta4, n2, method=method, comp=False) + contract(eta2, n4, method=method, comp=False)
+            return [-dn2, -dn4]
+
+        # --- 1. 正向流：H 对角化 + 所有格点算符同步推进，稀疏存储检查点 ---
+        curr_H2 = H2_init
+        curr_H4 = H4_init
+        checkpoints = [(0, np.array(curr_H2, dtype=orig_dtype), np.array(curr_H4, dtype=orig_dtype))]
+
+        # 主循环前初始化所有格点算符
+        all_num2 = []
+        all_num4 = []
+        for site in range(n):
+            num2 = jnp.zeros((n, n), dtype=jnp.float32)
+            num2 = num2.at[site, site].set(1.0)
+            all_num2.append(num2)
+            all_num4.append(jnp.zeros((n, n, n, n), dtype=jnp.float32))
+
+        k = 1
+        J0 = 1.0
+        while k < len(dl_arr) and J0 > cutoff:
+            prev_H2 = curr_H2          # 本步起始 H，用于算符流 RHS
+            prev_H4 = curr_H4
+            steps = np.array([dl_arr[k - 1], dl_arr[k]], dtype=dl_arr.dtype)
+
+            # 推进 H 一步
+            soln_H = ode(int_ode, [curr_H2, curr_H4], steps, rtol=_rtol, atol=_atol)
+            curr_H2 = soln_H[0][-1]
+            curr_H4 = soln_H[1][-1]
+
+            # 用本步起始 H 同步推进所有格点算符
+            t0_l = float(dl_arr[k - 1])
+            t1_l = float(dl_arr[k])
+            for site in range(n):
+                soln_op = ode(_rhs_op_H, [all_num2[site], all_num4[site]],
+                              jnp.array([t0_l, t1_l]),
+                              prev_H2, prev_H4,
+                              rtol=_rtol, atol=_atol)
+                all_num2[site] = soln_op[0][-1]
+                all_num4[site] = soln_op[1][-1]
+
+            if k % ckpt_step == 0:
+                checkpoints.append((k, np.array(curr_H2, dtype=orig_dtype), np.array(curr_H4, dtype=orig_dtype)))
+            J0 = float(jnp.max(jnp.abs(curr_H2 - jnp.diag(jnp.diag(curr_H2)))))
+            k += 1
+
+        final_step = k - 1
+        if checkpoints[-1][0] != final_step:
+            checkpoints.append((final_step, np.array(curr_H2, dtype=orig_dtype), np.array(curr_H4, dtype=orig_dtype)))
+
+        dl_list_final = dl_arr[:final_step + 1]
+
+        H0_diag = curr_H2
+        Hintfinal = curr_H4
+        h_final_flat = jnp.concatenate((curr_H2.reshape(n**2), curr_H4.reshape(n**4)))
+
+        # --- 2. 提取 l-bit 相互作用 ---
+        HFint = np.zeros((n, n), dtype=np.float64)
+        Hint_np = np.array(Hintfinal)
+        for i in range(n):
+            for j in range(n):
+                HFint[i, j] = Hint_np[i, i, j, j] - Hint_np[i, j, j, i]
+
+        lbits = np.zeros(n - 1, dtype=np.float64)
+        for q in range(1, n):
+            vals = np.abs(np.diag(HFint, q) + np.diag(HFint, -q)) / 2.0
+            vals = np.maximum(vals, 1e-30)
+            lbits[q - 1] = np.median(np.log10(vals))
+
+        liom = np.zeros((final_step + 1, n**2 + n**4), dtype=np.float32)
+        liom0 = np.zeros((n, n), dtype=np.float32)
+        liom0[n // 2, n // 2] = 1.0
+        liom[0, :n**2] = liom0.reshape(n**2)
+
+        density = np.zeros((n, len(tlist)), dtype=np.float64)
+        density_nonint = np.zeros((n, len(tlist)), dtype=np.float64)
+        update_op = jit(functools.partial(update, method=method))
+
+        # 检查点查找表（反向流前构建）
+        checkpoints_map = {}
+        for step_idx, h2_cp, h4_cp in checkpoints:
+            checkpoints_map[int(step_idx)] = (h2_cp, h4_cp)
+
+        # 从检查点重算指定段内每步的 H(l)（仅反向流使用，可在后台线程中调用）
+        def _recompute_segment(start_step_idx, end_step_idx):
+            segment_len = end_step_idx - start_step_idx
+            if segment_len <= 0:
+                return [], []
+            temp_H2 = jnp.array(checkpoints_map[start_step_idx][0])
+            temp_H4 = jnp.array(checkpoints_map[start_step_idx][1])
+            seg_h2 = [None] * segment_len
+            seg_h4 = [None] * segment_len
+            for curr_step in range(start_step_idx, end_step_idx):
+                local_idx = curr_step - start_step_idx
+                seg_h2[local_idx] = temp_H2
+                seg_h4[local_idx] = temp_H4
+                steps = np.array([dl_list_final[curr_step], dl_list_final[curr_step + 1]], dtype=dl_list_final.dtype)
+                soln = ode(int_ode, [temp_H2, temp_H4], steps, rtol=_rtol, atol=_atol)
+                temp_H2 = soln[0][-1]
+                temp_H4 = soln[1][-1]
+            return seg_h2, seg_h4
+
+        # --- 3. 实时演化（LIOM 基中精确对角化），并行处理所有格点 ---
+        all_ops2 = []
+        all_ops4 = []
+        for site in range(n):
+            num_diag = jnp.concatenate((all_num2[site].reshape(n**2), all_num4[site].reshape(n**4)))
+            evolist2 = dyn_exact(n, num_diag, h_final_flat, tlist)
+            ops2 = [jnp.array(evolist2[t0, :n**2]).reshape(n, n) for t0 in range(len(tlist))]
+            ops4 = [jnp.array(evolist2[t0, n**2:]).reshape(n, n, n, n) for t0 in range(len(tlist))]
+            all_ops2.append(ops2)
+            all_ops4.append(ops4)
+
+        del all_num2, all_num4
+
+        # --- 4. 反向算符流：pipeline 版本 ---
+        # 反向 segment 索引（从最后一段到第一段）
+        seg_indices = list(range(len(checkpoints) - 1, 0, -1))
+
+        if seg_indices:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                # 启动第一段的后台重算
+                first_seg = seg_indices[0]
+                first_start = int(checkpoints[first_seg - 1][0])
+                first_end   = int(checkpoints[first_seg][0])
+                future_curr = executor.submit(_recompute_segment, first_start, first_end)
+
+                for i, seg_idx in enumerate(seg_indices):
+                    # 1) 等待当前段就绪（取出后内存中只有 1 段）
+                    seg_h2, seg_h4 = future_curr.result()
+
+                    # 2) 立即在后台启动下一段（与本段消费并发；内存上升到 2 段）
+                    if i + 1 < len(seg_indices):
+                        next_seg   = seg_indices[i + 1]
+                        next_start = int(checkpoints[next_seg - 1][0])
+                        next_end   = int(checkpoints[next_seg][0])
+                        future_curr = executor.submit(_recompute_segment, next_start, next_end)
+
+                    # 3) 消费当前段：所有格点 × 所有时间片同时反变换
+                    start_step_idx = int(checkpoints[seg_idx - 1][0])
+                    end_step_idx   = int(checkpoints[seg_idx][0])
+                    for local_idx in range(end_step_idx - start_step_idx - 1, -1, -1):
+                        global_step = start_step_idx + local_idx
+                        dl_abs = float(dl_list_final[global_step + 1] - dl_list_final[global_step])
+                        for site in range(n):
+                            for t0 in range(len(tlist)):
+                                soln = ode(_rhs_op_H_bck, [all_ops2[site][t0], all_ops4[site][t0]],
+                                           jnp.array([0.0, dl_abs]),
+                                           seg_h2[local_idx], seg_h4[local_idx],
+                                           rtol=_rtol, atol=_atol)
+                                all_ops2[site][t0] = soln[0][-1]
+                                all_ops4[site][t0] = soln[1][-1]
+
+                    # 4) 显式释放当前段，便于 GC（下一段已在后台计算中或已完成）
+                    del seg_h2, seg_h4
+
+        # --- 5. 计算期望值 <n_site(t)> ---
+        for site in range(n):
+            nlist  = np.zeros(len(tlist), dtype=np.float64)
+            nlist2 = np.zeros(len(tlist), dtype=np.float64)
+            for t0 in range(len(tlist)):
+                mat  = np.array(all_ops2[site][t0])
+                mat4 = np.array(all_ops4[site][t0])
+                for i in range(n):
+                    nlist[t0]  += (mat[i, i] * state[i]).real
+                    nlist2[t0] += (mat[i, i] * state[i]).real
+                    for j in range(n):
+                        if i != j:
+                            nlist[t0] += (mat4[i, i, j, j] * state[i] * state[j]).real
+                            nlist[t0] += -(mat4[i, j, j, i] * state[i] * state[j]).real
+            density[site]        = nlist
+            density_nonint[site] = nlist2
+
+        output = {
+            "H0_diag": np.array(H0_diag),
+            "Hint": np.array(Hintfinal),
+            "LIOM Interactions": np.array(lbits),
+            "LIOM": np.array(liom),
+            "Invariant": 0,
+            "density": np.array(density),
+            "density_nonint": np.array(density_nonint),
+            "ckpt_step": int(ckpt_step),
+            "steps_evolved": int(final_step),
+            "pipeline": True,
+        }
+        return output
+
+
+    else:
+        raise NotImplementedError(
+            f"switch_num={switch_num} 尚未实现。"
+            f" (parallel={parallel_switch}, H_to_eta={H_to_eta_switch},"
+            f" checkpoint={checkpoint_switch}, pipeline={pipeline_switch},"
+            f" compress={compress_switch})"
+        )
