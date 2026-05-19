@@ -1,0 +1,26 @@
+{
+  "config": {
+    "qmax": 2000,
+    "lmax": 100.0,
+    "cutoff": 0.001,
+    "L": 3,
+    "dim": 2,
+    "dis": 3.0,
+    "dis_type": "linear",
+    "J": 1.0,
+    "delta": 0.1,
+    "seed": 52
+  },
+  "branch_0": {
+    "elapsed_s": 22.38897756487131,
+    "peak_memory_bytes": 30048408,
+    "steps_evolved": 1122
+  },
+  "branch_1": {
+    "elapsed_s": 147.1978945955634,
+    "peak_memory_bytes": 2098872,
+    "steps_evolved": 1122
+  },
+  "mem_ratio": 0.06984969053934571,
+  "timestamp": "20260515_154616"
+}

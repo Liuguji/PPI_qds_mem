@@ -139,13 +139,11 @@ def run_comparison(
     else:
         lbits_test = None
 
-    # density
-    density_base = np.array(res_base["density"])  # (n, nt)
-    density_test = np.array(res_test["density"])  # (n, nt)
-
-    # imbalance（从 density 重建，用于比较动力学一致性）
-    imb_base = density_to_imbalance(density_base)
-    imb_test = density_to_imbalance(density_test)
+    # LIOM2 / LIOM4（代替原来的 density）
+    liom2_base = np.array(res_base["LIOM2"])  # (n, n, n)
+    liom2_test = np.array(res_test.get("LIOM2", res_test.get("LIOM2")))
+    liom4_base = np.array(res_base["LIOM4"])  # (n, n, n, n, n)
+    liom4_test = np.array(res_test.get("LIOM4", res_test.get("LIOM4")))
 
     # 步数
     steps_base = int(res_base.get("steps_evolved", -1))
@@ -170,13 +168,13 @@ def run_comparison(
             "max_abs_diff": _max_abs(Hint_base, Hint_test),
             "rel_diff": _rel_diff(Hint_base, Hint_test),
         },
-        "density": {
-            "max_abs_diff": _max_abs(density_base, density_test),
-            "rel_diff": _rel_diff(density_base, density_test),
+        "LIOM2": {
+            "max_abs_diff": _max_abs(liom2_base, liom2_test),
+            "rel_diff": _rel_diff(liom2_base, liom2_test),
         },
-        "imbalance": {
-            "max_abs_diff": _max_abs(imb_base, imb_test),
-            "rel_diff": _rel_diff(imb_base, imb_test),
+        "LIOM4": {
+            "max_abs_diff": _max_abs(liom4_base, liom4_test),
+            "rel_diff": _rel_diff(liom4_base, liom4_test),
         },
         "timing": {
             "baseline_s": t_base,
@@ -215,8 +213,8 @@ def run_comparison(
     _print_metric("Hint", comp["Hint"]["max_abs_diff"], comp["Hint"]["rel_diff"])
     if "lbits" in comp:
         _print_metric("lbits", comp["lbits"]["max_abs_diff"], comp["lbits"]["rel_diff"])
-    _print_metric("density", comp["density"]["max_abs_diff"], comp["density"]["rel_diff"])
-    _print_metric("Imbalance", comp["imbalance"]["max_abs_diff"], comp["imbalance"]["rel_diff"])
+    _print_metric("LIOM2", comp["LIOM2"]["max_abs_diff"], comp["LIOM2"]["rel_diff"])
+    _print_metric("LIOM4", comp["LIOM4"]["max_abs_diff"], comp["LIOM4"]["rel_diff"])
 
     print(f"    {'Timing':22s}  base={t_base:.3f}s  test={t_test:.3f}s  "
           f"ratio={comp['timing']['test_over_baseline']:.2f}x")
@@ -224,41 +222,11 @@ def run_comparison(
 
     # 最终判定
     tol = 1e-10
-    check_keys = ["H0_diag", "Hint", "density", "imbalance"]
+    check_keys = ["H0_diag", "Hint", "LIOM2", "LIOM4"]
     all_pass = all(comp[k]["max_abs_diff"] < tol for k in check_keys)
     print()
     print(f"    >>> {'ALL MATCH' if all_pass else 'SOME DEVIATIONS'} "
           f"(tolerance={tol:.0e}) <<<")
-
-    # ==================================================================
-    # 6. 存盘
-    # ==================================================================
-    out_dir = REPO_ROOT / "test_results"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    safe_dis = "".join(c if c.isalnum() else "_" for c in dis_type)
-    out_file = (
-        out_dir
-        / f"density_sw0_vs_sw{test_switch}_L{L}_dim{dim}_qmax{qmax}_cutoff{cutoff:.0e}_{safe_dis}.json"
-    )
-    serializable = {
-        "config": {
-            "L": L,
-            "dim": dim,
-            "n": n,
-            "qmax": qmax,
-            "lmax": lmax,
-            "cutoff": cutoff,
-            "method": method,
-            "dis": dis,
-            "dis_type": dis_type,
-            "test_switch": test_switch,
-            "seed": seed,
-        },
-        "comparison": comp,
-    }
-    with open(out_file, "w") as f:
-        json.dump(serializable, f, indent=2)
-    print(f"    Results saved to: {out_file}")
 
     return {
         "baseline_result": res_base,
@@ -272,7 +240,7 @@ def main():
         description="对比测试：flow_dyn_density 分支 0 vs 其他分支"
     )
     parser.add_argument("--L", type=int, default=4, help="线性尺寸")
-    parser.add_argument("--dim", type=int, default=1, help="空间维度")
+    parser.add_argument("--dim", type=int, default=2, help="空间维度")
     parser.add_argument("--qmax", type=int, default=500, help="最大流步数")
     parser.add_argument("--lmax", type=float, default=100.0, help="最大流时间")
     parser.add_argument("--cutoff", type=float, default=1e-3, help="非对角截断")

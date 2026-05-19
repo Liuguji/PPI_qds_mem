@@ -208,6 +208,13 @@ def dyn_exact(n,num,y,tlist):
             The first two are built-in NumPy methods, while the latter two are custom coded for speed.
 
     """
+    
+    '''
+    n:格点数
+    num:初始算符在对角基下的表达,n2拼接n4
+    y:哈密顿量在对角基下的表达,H拼接Hint
+    tlist:时间列表
+    '''
 
     # Initialise list for time-evolved operator
     num_t_list = np.zeros((len(tlist),len(y)),dtype=np.complex64)

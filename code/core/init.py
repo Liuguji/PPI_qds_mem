@@ -184,54 +184,7 @@ def Hinit(n,d,J,dis_type,x=0,pwrhop=False,alpha=0,Fourier=False,dim=1):
                     templist[q] = J*k**(-alpha)
             V0 += np.diag(templist,k)
             V0 += np.diag(templist,-k)
-
-    #--------------------------------------------------------------------------
-    # elif Fourier == True:
-    #     # Initialise momentum-space Hamiltonian
-
-    #     # Diagonal terms
-    #     y0 = [-2*Jxx*np.cos(2*np.pi*i/n) for i in range(-n//2,n//2)]
-
-    #     # Fourier-transform the on-site disorder
-    #     hlist = [np.random.uniform(-d,d) for i in range(n)]
-    #     H0 += np.diag(hlist)
-    #     H0 += np.diag([Jxx for i in range(n-1)],1)
-    #     H0 += np.diag([Jxx for i in range(n-1)],-1)
-    #     H0[0,n-1] += Jxx
-    #     H0[n-1,0] += Jxx
-
-    #     hmat = np.zeros(n**2,dtype=complex).reshape(n,n)
-    #     for i in range(-n//2,n//2):
-    #         for j in range(-n//2,n//2):
-    #             hmat[i+n//2,j+n//2] = (1/float(n))*np.sum([hlist[k]*np.exp(1j*2*np.pi*(i-j)*k/L) for k in range(n)])
-    #     for k in range(1,n+1):
-    #         jlist += [np.diag(hmat,k)]
-    #     jlist = np.concatenate(jlist)
-    #     diag = y0+np.diag(hmat).real
-    #     dlist = [Jz/np.sqrt(n)]*(n*(n-1)//2) #Diagonal part only
-
-    #     #----------------------------------------------------------------------
-    #     # Set up final Hamiltonian
-
-    #     if intr == False:
-    #         y00 = np.concatenate((diag, jlist.real,jlist.imag),axis=None)
-    #     elif intr == True:
-    #         y00 = np.concatenate((diag, jlist.real,jlist.imag,dlist),axis=None)
-
-         # Compare eigenvalues of free Hamiltonian in momentum- and real-space
-#        H1 = np.zeros(n**2,dtype=complex).reshape(n,n)
-#        H1 += hmat + np.diag(y0)
-#        print(sorted(np.linalg.eigvalsh(H0)))
-#        print(sorted(np.linalg.eigvalsh(H1)))
-#        print('****************************')
-
-    # elif pwrhop == False and dim == 2:
-    #     jmat = np.diagflat(np.concatenate([[Jxx for i in range(L-1)]+[0] for j in range(L)])[0:-1], 1)+np.diagflat([Jxx for i in range(n-L)], L)
-    #     jlist = np.concatenate(list(map(lambda x: np.diag(jmat, k = x), range(1,L**2))))
-    # elif pwrhop == False and dim == 3:
-    #     jmat = np.diagflat(np.concatenate([[Jxx for i in range(L-1)]+[0] for j in range(L**2)])[0:-1], 1)+np.diagflat([Jxx for i in range(n-L)], L)+np.diagflat([Jxx for i in range(n-L**2)], L**2)
-    #     jlist = np.concatenate(list(map(lambda x: np.diag(jmat, k = x), range(1,L**3))))
-
+    
     return H0+V0
 
 def Hint_init(n,delta,pwrint=False,beta=0,dim=1,U=0):
