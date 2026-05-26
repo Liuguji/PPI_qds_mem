@@ -74,3 +74,4 @@ liubo_test_CPU_GPU_data/
 /temp_output_test_0.txt
 /temp_output_test_1.txt
 /run_test_ckpt_torch_batch.sh
+/test_density/data/

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-内存峰值对比测试：flow_dyn_density 分支 0（全轨迹） vs 分支 1（检查点）。
+内存峰值测试：flow_dyn_density 分支 11（compress + checkpoint）。
 
 所有参数都在顶层 PARAM_SETS 列表中设定，直接运行即可：
-    python test_density_0_vs_1.py
+    python test_density_11.py
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from datetime import datetime
 import json
 
 # 数据输出根目录
-DATA_ROOT = REPO_ROOT / "test_density" / "data" / "data_0_vs_1"
+DATA_ROOT = REPO_ROOT / "test_density" / "data" / "data_2"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -48,29 +48,29 @@ PARAM_SETS = [
     # ═════════════════════════════════════════════════════
 
     # ──────── L=2 (n=4) ────────
-    # {"dim": 2, "L": 2, "dis_type": "linear", "dis": 1.0,  "J": 1.0, "delta": 0.1, "seed": 42,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
-    # {"dim": 2, "L": 2, "dis_type": "linear", "dis": 5.0,  "J": 1.0, "delta": 0.1, "seed": 43,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
-    # {"dim": 2, "L": 2, "dis_type": "linear", "dis": 10.0, "J": 1.0, "delta": 0.1, "seed": 44,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
+    {"dim": 2, "L": 2, "dis_type": "linear", "dis": 1.0,  "J": 1.0, "delta": 0.1, "seed": 42,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
+    {"dim": 2, "L": 2, "dis_type": "linear", "dis": 5.0,  "J": 1.0, "delta": 0.1, "seed": 43,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
+    {"dim": 2, "L": 2, "dis_type": "linear", "dis": 10.0, "J": 1.0, "delta": 0.1, "seed": 44,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
 
-    # # ──────── L=3 (n=9) ────────
-    # {"dim": 2, "L": 3, "dis_type": "linear", "dis": 1.0,  "J": 1.0, "delta": 0.1, "seed": 47,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
-    # {"dim": 2, "L": 3, "dis_type": "linear", "dis": 1.0,  "J": 1.0, "delta": 0.1, "seed": 50,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
-    # {"dim": 2, "L": 3, "dis_type": "linear", "dis": 2.0,  "J": 1.0, "delta": 0.1, "seed": 51,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
-    # {"dim": 2, "L": 3, "dis_type": "linear", "dis": 3.0,  "J": 1.0, "delta": 0.1, "seed": 52,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
-    # {"dim": 2, "L": 3, "dis_type": "linear", "dis": 4.0,  "J": 1.0, "delta": 0.1, "seed": 53,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
-    # {"dim": 2, "L": 3, "dis_type": "linear", "dis": 5.0,  "J": 1.0, "delta": 0.1, "seed": 54,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
-    # {"dim": 2, "L": 3, "dis_type": "linear", "dis": 10.0, "J": 1.0, "delta": 0.1, "seed": 55,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
+    # ──────── L=3 (n=9) ────────
+    {"dim": 2, "L": 3, "dis_type": "linear", "dis": 1.0,  "J": 1.0, "delta": 0.1, "seed": 47,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
+    {"dim": 2, "L": 3, "dis_type": "linear", "dis": 1.0,  "J": 1.0, "delta": 0.1, "seed": 50,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
+    {"dim": 2, "L": 3, "dis_type": "linear", "dis": 2.0,  "J": 1.0, "delta": 0.1, "seed": 51,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
+    {"dim": 2, "L": 3, "dis_type": "linear", "dis": 3.0,  "J": 1.0, "delta": 0.1, "seed": 52,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
+    {"dim": 2, "L": 3, "dis_type": "linear", "dis": 4.0,  "J": 1.0, "delta": 0.1, "seed": 53,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
+    {"dim": 2, "L": 3, "dis_type": "linear", "dis": 5.0,  "J": 1.0, "delta": 0.1, "seed": 54,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
+    {"dim": 2, "L": 3, "dis_type": "linear", "dis": 10.0, "J": 1.0, "delta": 0.1, "seed": 55,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
 
-    # # ──────── L=4 (n=16) ────────
-    # {"dim": 2, "L": 4, "dis_type": "linear", "dis": 1.0,  "J": 1.0, "delta": 0.1, "seed": 48,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
-    # {"dim": 2, "L": 4, "dis_type": "linear", "dis": 1.0,  "J": 1.0, "delta": 0.1, "seed": 56,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
-    # {"dim": 2, "L": 4, "dis_type": "linear", "dis": 2.0,  "J": 1.0, "delta": 0.1, "seed": 57,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
-    # {"dim": 2, "L": 4, "dis_type": "linear", "dis": 3.0,  "J": 1.0, "delta": 0.1, "seed": 58,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
-    # {"dim": 2, "L": 4, "dis_type": "linear", "dis": 4.0,  "J": 1.0, "delta": 0.1, "seed": 59,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
-    # {"dim": 2, "L": 4, "dis_type": "linear", "dis": 5.0,  "J": 1.0, "delta": 0.1, "seed": 60,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
-    # {"dim": 2, "L": 4, "dis_type": "linear", "dis": 10.0, "J": 1.0, "delta": 0.1, "seed": 61,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
+    # ──────── L=4 (n=16) ────────
+    {"dim": 2, "L": 4, "dis_type": "linear", "dis": 1.0,  "J": 1.0, "delta": 0.1, "seed": 48,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
+    {"dim": 2, "L": 4, "dis_type": "linear", "dis": 1.0,  "J": 1.0, "delta": 0.1, "seed": 56,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
+    {"dim": 2, "L": 4, "dis_type": "linear", "dis": 2.0,  "J": 1.0, "delta": 0.1, "seed": 57,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
+    {"dim": 2, "L": 4, "dis_type": "linear", "dis": 3.0,  "J": 1.0, "delta": 0.1, "seed": 58,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
+    {"dim": 2, "L": 4, "dis_type": "linear", "dis": 4.0,  "J": 1.0, "delta": 0.1, "seed": 59,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
+    {"dim": 2, "L": 4, "dis_type": "linear", "dis": 5.0,  "J": 1.0, "delta": 0.1, "seed": 60,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
+    {"dim": 2, "L": 4, "dis_type": "linear", "dis": 10.0, "J": 1.0, "delta": 0.1, "seed": 61,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
 
-    # # ──────── L=5 (n=25) ────────
+    # ──────── L=5 (n=25) ────────
     # {"dim": 2, "L": 5, "dis_type": "linear", "dis": 1.0,  "J": 1.0, "delta": 0.1, "seed": 49,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
     # {"dim": 2, "L": 5, "dis_type": "linear", "dis": 1.0,  "J": 1.0, "delta": 0.1, "seed": 62,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
     # {"dim": 2, "L": 5, "dis_type": "linear", "dis": 2.0,  "J": 1.0, "delta": 0.1, "seed": 63,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
@@ -78,15 +78,16 @@ PARAM_SETS = [
     # {"dim": 2, "L": 5, "dis_type": "linear", "dis": 4.0,  "J": 1.0, "delta": 0.1, "seed": 65,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
     # {"dim": 2, "L": 5, "dis_type": "linear", "dis": 5.0,  "J": 1.0, "delta": 0.1, "seed": 66,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
     # {"dim": 2, "L": 5, "dis_type": "linear", "dis": 10.0, "J": 1.0, "delta": 0.1, "seed": 67,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
-    
+
     # # ──────── L=6 (n=36) ────────
-    {"dim": 2, "L": 6, "dis_type": "linear", "dis": 1.0,  "J": 1.0, "delta": 0.1, "seed": 49,  "lmax": 1000.0, "qmax": 10000, "cutoff": 1e-3},
+    # {"dim": 2, "L": 6, "dis_type": "linear", "dis": 1.0,  "J": 1.0, "delta": 0.1, "seed": 49,  "lmax": 1000.0, "qmax": 10000, "cutoff": 1e-3},
     # {"dim": 2, "L": 6, "dis_type": "linear", "dis": 1.0,  "J": 1.0, "delta": 0.1, "seed": 62,  "lmax": 1000.0, "qmax": 10000, "cutoff": 1e-3},
     # {"dim": 2, "L": 6, "dis_type": "linear", "dis": 2.0,  "J": 1.0, "delta": 0.1, "seed": 63,  "lmax": 1000.0, "qmax": 10000, "cutoff": 1e-3},
     # {"dim": 2, "L": 6, "dis_type": "linear", "dis": 3.0,  "J": 1.0, "delta": 0.1, "seed": 64,  "lmax": 1000.0, "qmax": 10000, "cutoff": 1e-3},
     # {"dim": 2, "L": 6, "dis_type": "linear", "dis": 4.0,  "J": 1.0, "delta": 0.1, "seed": 65,  "lmax": 1000.0, "qmax": 10000, "cutoff": 1e-3},
     # {"dim": 2, "L": 6, "dis_type": "linear", "dis": 5.0,  "J": 1.0, "delta": 0.1, "seed": 66,  "lmax": 1000.0, "qmax": 10000, "cutoff": 1e-3},
     # {"dim": 2, "L": 6, "dis_type": "linear", "dis": 10.0, "J": 1.0, "delta": 0.1, "seed": 67,  "lmax": 1000.0, "qmax": 10000, "cutoff": 1e-3},
+
 ]
 
 
@@ -102,6 +103,9 @@ def set_switch_env(switch_num: int) -> None:
     os.environ["compress_switch"]   = str((switch_num // 10) % 10)
     os.environ["checkpoint_switch"] = str(switch_num % 10)
     os.environ["compress_mode"]     = "0"
+    # Torch GPU 后端控制：设为 "1" 启用 PyTorch GPU 路径，"0" 使用 JAX CPU
+    os.environ["PYFLOW_USE_TORCH"]  = "1"
+    os.environ["PYFLOW_GPU_ID"]     = "0"
 
 
 def fmt_bytes(b: int) -> str:
@@ -178,13 +182,19 @@ def build_hamiltonian(params: dict) -> dict:
     }
 
 
-# 用于判断“已测试”的参数键列表（与 save_result 目录层级一致）
+# 用于判断"已测试"的参数键列表（与 save_result 目录层级一致）
 _RESULT_KEYS = ["dim", "L", "dis_type", "dis", "J", "delta", "seed", "lmax", "qmax", "cutoff"]
 
 
 def get_result_dir(params: dict) -> Path:
     """根据参数 dict 计算对应的结果存储目录路径。"""
-    dir_path = DATA_ROOT
+    use_torch = os.environ.get("PYFLOW_USE_TORCH", "0")
+    if use_torch == "1":
+        base = REPO_ROOT / "test_density" / "data" / "gpu_data_2"
+    else:
+        base = DATA_ROOT
+    compress_mode = os.environ.get("compress_mode", "1")
+    dir_path = base / f"compress_mode_{compress_mode}"
     for key in _RESULT_KEYS:
         val = params[key]
         if isinstance(val, float):
@@ -223,17 +233,11 @@ def save_result(result: dict, timestamp: str):
             for k, v in c.items()
             if k not in ("n", "ham", "dl_list", "tlist")
         },
-        "branch_0": {
-            "elapsed_s": result["branch_0"]["elapsed_s"],
-            "peak_memory_bytes": result["branch_0"]["peak_memory_bytes"],
-            "steps_evolved": result["branch_0"]["steps_evolved"],
+        "branch_11": {
+            "elapsed_s": result["branch_11"]["elapsed_s"],
+            "peak_memory_bytes": result["branch_11"]["peak_memory_bytes"],
+            "steps_evolved": result["branch_11"]["steps_evolved"],
         },
-        "branch_1": {
-            "elapsed_s": result["branch_1"]["elapsed_s"],
-            "peak_memory_bytes": result["branch_1"]["peak_memory_bytes"],
-            "steps_evolved": result["branch_1"]["steps_evolved"],
-        },
-        "mem_ratio": result["mem_ratio"],
         "timestamp": timestamp,
     }
 
@@ -244,7 +248,7 @@ def save_result(result: dict, timestamp: str):
 
 
 def run_config(config: dict) -> dict:
-    """对单个配置运行分支 0 和 1，返回对比结果。"""
+    """对单个配置运行分支 11，返回结果。"""
     c = config
     print(f"\n{'─' * 60}")
     print(f"  配置: L={c['L']}  dim={c['dim']}  n={c['n']}  "
@@ -253,28 +257,24 @@ def run_config(config: dict) -> dict:
     print(f"         qmax={c['qmax']}  lmax={c['lmax']}  cutoff={c['cutoff']:.1e}")
     print(f"{'─' * 60}")
 
-    res0 = run_single(config, 0)
-    res1 = run_single(config, 1)
+    res11 = run_single(config, 11)
 
-    mem0 = res0["peak_memory_bytes"]
-    mem1 = res1["peak_memory_bytes"]
-    ratio = mem1 / mem0 if mem0 > 0 else float("inf")
-
-    print(f"    分支0 内存: {fmt_bytes(mem0)}")
-    print(f"    分支1 内存: {fmt_bytes(mem1)}")
-    print(f"    节省比例:   {mem0 - mem1:+.0f} B  ({1 - ratio:+.1%})")
+    mem11 = res11["peak_memory_bytes"]
+    print(f"    分支11 内存: {fmt_bytes(mem11)}")
 
     return {
         "config": config,
-        "branch_0": res0,
-        "branch_1": res1,
-        "mem_ratio": ratio,
+        "branch_11": res11,
     }
 
 
 def main():
+    # 提前调用 set_switch_env，确保 compress_mode 等环境变量
+    # 在 is_already_tested 和 save_result 中使用同一份值。
+    set_switch_env(11)
+
     print("=" * 70)
-    print("  内存峰值对比：flow_dyn_density 分支 0 vs 分支 1")
+    print("  内存峰值测试：flow_dyn_density 分支 11（compress + checkpoint）")
     print("=" * 70)
     print(f"  共 {len(PARAM_SETS)} 组参数")
 
@@ -299,30 +299,24 @@ def main():
         save_result(result, timestamp)
 
     # ===== 汇总表格 =====
-    print(f"\n{'=' * 100}")
-    print("  汇总：各配置下分支 0 vs 分支 1 内存峰值对比")
-    print(f"{'=' * 100}")
+    print(f"\n{'=' * 90}")
+    print("  汇总：各配置下分支 11 内存峰值")
+    print(f"{'=' * 90}")
     header = (f"{'L':>3s} {'dim':>3s} {'n':>3s} {'dis':>6s} {'J':>5s} {'Δ':>5s} "
               f"{'类型':>8s}  "
-              f"{'分支0内存':>14s} {'分支1内存':>14s} {'节省':>8s} "
-              f"{'耗时0':>8s} {'耗时1':>8s}")
+              f"{'分支11内存':>14s} {'耗时':>8s}")
     print(header)
     print("-" * len(header))
     for r in all_results:
         c = r["config"]
-        r0 = r["branch_0"]
-        r1 = r["branch_1"]
-        saved_pct = (1 - r["mem_ratio"]) * 100 if r["mem_ratio"] <= 1 else float("nan")
+        r11 = r["branch_11"]
         print(f"{c['L']:3d} {c['dim']:3d} {c['n']:3d} "
               f"{c['dis']:6.1f} {c['J']:5.1f} {c['delta']:5.2f} "
               f"{c['dis_type']:>8s}  "
-              f"{fmt_bytes(r0['peak_memory_bytes']):>14s} "
-              f"{fmt_bytes(r1['peak_memory_bytes']):>14s} "
-              f"{saved_pct:>7.1f}% "
-              f"{r0['elapsed_s']:>7.1f}s "
-              f"{r1['elapsed_s']:>7.1f}s")
+              f"{fmt_bytes(r11['peak_memory_bytes']):>14s} "
+              f"{r11['elapsed_s']:>7.1f}s")
 
-    print(f"{'=' * 100}")
+    print(f"{'=' * 90}")
 
     if skipped_params:
         print(f"\n  已跳过 {len(skipped_params)} 组参数（已测试 ≥2 次）：")

@@ -27,6 +27,16 @@ and numerically integrate the flow equation to obtain a diagonal Hamiltonian.
 
 """
 
+try:
+    import torch
+except Exception:
+    torch = None
+
+try:
+    from torchdiffeq import odeint as torch_odeint
+except Exception:
+    torch_odeint = None
+
 import os,functools,time
 from functools import partial
 try:
@@ -6496,6 +6506,8 @@ def verify_roundtrip(n, hamiltonian, num, num_int, dl_list, qmax, cutoff, site=0
         sol_int_H4[k] = np.array(H4_current)
         off_diag = H2_current - jnp.diag(jnp.diag(H2_current))
         J0 = jnp.max(jnp.abs(off_diag))
+        if k % 100 == 0:
+            print(f"  [对角化] 已完成 {k} 步, J0 = {J0:.3e}")
         k += 1
 
     sol_int_H2 = sol_int_H2[:k]
@@ -6514,7 +6526,8 @@ def verify_roundtrip(n, hamiltonian, num, num_int, dl_list, qmax, cutoff, site=0
     # ===== 3. 正向流：原始基 → 对角基（用 ode 自适应积分器保证稳定性）=====
     n2 = n2_init
     n4 = n4_init
-    for k_inner in range(len(dl_list_used) - 1):
+    total_fwd = len(dl_list_used) - 1
+    for k_inner in range(total_fwd):
         H2_k = jnp.array(sol_int_H2[k_inner], dtype=jnp.float32)
         H4_k = jnp.array(sol_int_H4[k_inner], dtype=jnp.float32)
         steps = jnp.array([dl_list_used[k_inner],
@@ -6523,24 +6536,29 @@ def verify_roundtrip(n, hamiltonian, num, num_int, dl_list, qmax, cutoff, site=0
                    [H2_k, H4_k], rtol=1e-3, atol=1e-6)
         n2 = soln[0][-1]
         n4 = soln[1][-1]
-        # if k_inner % 100 == 0 or k_inner == len(dl_list_used) - 2:
-        #     print(n2,'\n')
+        if (k_inner + 1) % 100 == 0 or k_inner == total_fwd - 1:
+            print(f"  [正向流] 已完成 {k_inner + 1}/{total_fwd} 步")
 
     print("正向流后 n2（对角基）:")
     print(n2, "\n")
 
-    # ===== 4. 反向流：对角基 → 原始基（单步欧拉，反向欧拉是正向欧拉的精确逆）=====
+    # ===== 4. 反向流：对角基 → 原始基（使用 ode 自适应积分器）=====
     n2_t = n2
     n4_t = n4
+    total_rev = len(dl_list_used) - 1
     for k_inner in range(len(dl_list_used) - 2, -1, -1):
         H2_k = jnp.array(sol_int_H2[k_inner], dtype=jnp.float32)
         H4_k = jnp.array(sol_int_H4[k_inner], dtype=jnp.float32)
 
-        dl = dl_list_used[k_inner] - dl_list_used[k_inner + 1]  # < 0
-        sol2, sol4 = liom_ode_int_fwd([n2_t, n4_t], 0.0,
-                                       array=[H2_k, H4_k])
-        n2_t = n2_t + dl * sol2
-        n4_t = n4_t + dl * sol4
+        steps = jnp.array([dl_list_used[k_inner + 1],
+                           dl_list_used[k_inner]])  # 反向：dl 从大 → 小
+        soln = ode(liom_ode_int_fwd, [n2_t, n4_t], steps,
+                   [H2_k, H4_k], rtol=1e-3, atol=1e-6)
+        n2_t = soln[0][-1]
+        n4_t = soln[1][-1]
+        step_done = total_rev - k_inner  # 已完成步数（反向计数）
+        if step_done % 100 == 0 or k_inner == 0:
+            print(f"  [反向流] 已完成 {step_done}/{total_rev} 步")
 
     print("反向流后 n2（应 = 初始）:")
     print(n2_t, "\n")
@@ -6854,6 +6872,253 @@ def flow_dyn_density(
     # ══════════════════════════════════════════════════════════════════════
     elif switch_num == 11:
         # 分支 11：checkpoint + compress（检查点 + 反向流段轨迹统一压缩）
+        # ── Torch GPU 子路径 ──
+        if os.environ.get("PYFLOW_USE_TORCH", "0") == "1":
+            if torch is None:
+                raise ImportError(
+                    "PyTorch is not installed. Cannot use PYFLOW_USE_TORCH=1."
+                )
+            if torch_odeint is None:
+                raise ImportError(
+                    "torchdiffeq is not installed. Run: pip install torchdiffeq"
+                )
+            if compress_mode != 0:
+                print(
+                    "  [torch] compress_mode>0 not supported on GPU;"
+                    " falling back to compress_mode=0"
+                )
+
+            # ---- 0. 初始化 ----
+            device = _resolve_torch_flow_device()
+            print(f"        [torch:density] device={device}"
+                  f" (PYFLOW_GPU_ID={os.environ.get('PYFLOW_GPU_ID', '0')})")
+
+            ex_mask = _ex_helper_torch(n, device)
+            no_mask = _no_helper_torch(n, device)
+
+            _rtol = float(os.environ.get('PYFLOW_ODE_RTOL', '1e-6'))
+            _atol = float(os.environ.get('PYFLOW_ODE_ATOL', '1e-6'))
+
+            dl_arr = np.array(dl_list, dtype=np.float64)
+            if dl_arr.ndim != 1 or len(dl_arr) < 2:
+                raise ValueError(
+                    "dl_list must be a 1D array with at least two time points."
+                )
+            max_steps = min(int(qmax), len(dl_arr))
+            if max_steps < 2:
+                raise ValueError(
+                    "qmax and dl_list imply fewer than two usable time points."
+                )
+            dl_arr = dl_arr[:max_steps]
+
+            if ckpt_step is None:
+                ckpt_step = min(40, int(np.sqrt(max_steps)))
+            ckpt_step = max(1, int(ckpt_step))
+
+            curr_H2   = torch.tensor(
+                np.array(hamiltonian.H2_spinless, dtype=np.float32),
+                dtype=torch.float32, device=device,
+            )
+            curr_H4   = torch.tensor(
+                np.array(hamiltonian.H4_spinless, dtype=np.float32),
+                dtype=torch.float32, device=device,
+            )
+
+            # ODE RHS closure (captures loop-invariant n, ex_mask, no_mask)
+            def _ode_fn(t, y):
+                return _int_ode_torch_fn(t, y, n, ex_mask, no_mask)
+
+            n2_dim = n**2
+
+            # ---- 1. 正向流：H 对角化，稀疏检查点（GPU 显存）----
+            checkpoints = [
+                (0,
+                 curr_H2.detach().clone(),
+                 curr_H4.detach().clone(),
+                )
+            ]
+
+            k = 1
+            J0 = 1.0
+            t_span = torch.empty(2, dtype=torch.float32, device=device)
+            y0_flat = torch.empty(n2_dim + n**4, dtype=torch.float32, device=device)
+
+            while k < len(dl_arr) and J0 > cutoff:
+                t_span[0] = float(dl_arr[k - 1])
+                t_span[1] = float(dl_arr[k])
+                _pack_state_torch(y0_flat, curr_H2, curr_H4, n2_dim)
+
+                soln = torch_odeint(
+                    _ode_fn, y0_flat, t_span,
+                    rtol=_rtol, atol=_atol, method='dopri5',
+                )
+                curr_H2 = soln[-1][:n2_dim].reshape(n, n).detach().clone()
+                curr_H4 = soln[-1][n2_dim:].reshape(n, n, n, n).detach().clone()
+                del soln
+
+                if k % ckpt_step == 0:
+                    checkpoints.append((
+                        k,
+                        curr_H2.detach().clone(),
+                        curr_H4.detach().clone(),
+                    ))
+
+                J0 = float(
+                    torch.max(torch.abs(
+                        curr_H2 - torch.diag(torch.diag(curr_H2))
+                    ))
+                )
+
+                if k % 100 == 0:
+                    print(
+                        f"  [对角化] k={k:5d}  l={dl_arr[k - 1]:.4e}"
+                        f"  J0={J0:.3e}  ckpts={len(checkpoints)}"
+                    )
+                k += 1
+
+            final_step = k - 1
+            if checkpoints[-1][0] != final_step:
+                checkpoints.append((
+                    final_step,
+                    curr_H2.detach().clone(),
+                    curr_H4.detach().clone(),
+                ))
+
+            print(
+                f"  对角化完成，共 {final_step} 步，"
+                f"l_final={dl_arr[final_step]:.4e}"
+            )
+
+            dl_list_final = dl_arr[:final_step + 1]
+
+            # ---- 2. 提取 l-bit 相互作用 ----
+            H0_diag = curr_H2
+            Hintfinal = curr_H4
+
+            idx = torch.arange(n, device=device)
+            HFint = (
+                Hintfinal[idx[:, None], idx[:, None],
+                          idx[None, :], idx[None, :]]
+                - Hintfinal[idx[:, None], idx[None, :],
+                            idx[None, :], idx[:, None]]
+            )
+            # l-bit 计算全程在 GPU 上
+            lbits_list = []
+            for q in range(1, n):
+                diag_q  = torch.diagonal(HFint, offset=q)
+                diag_nq = torch.diagonal(HFint, offset=-q)
+                vals = (diag_q.abs() + diag_nq.abs()) / 2.0
+                vals = vals.clamp(min=1e-30)
+                lbits_list.append(vals.log10().median().item())
+            lbits = np.array(lbits_list, dtype=np.float64)
+            del HFint  # 释放 GPU 显存
+
+            # ---- 3. 反向流：串行逐格点 ----
+            liom2_all = torch.zeros(
+                (n, n, n), dtype=torch.float32, device=device,
+            )
+            liom4_all = torch.zeros(
+                (n, n, n, n, n), dtype=torch.float32, device=device,
+            )
+
+            t_span_seg = torch.empty(2, dtype=torch.float32, device=device)
+            y0_flat_seg = torch.empty(
+                n2_dim + n**4, dtype=torch.float32, device=device,
+            )
+
+            for site in range(n):
+                n2_t = torch.zeros(
+                    (n, n), dtype=torch.float32, device=device,
+                )
+                n2_t[site, site] = 1.0
+                n4_t = torch.zeros(
+                    (n, n, n, n), dtype=torch.float32, device=device,
+                )
+
+                for seg_idx in range(len(checkpoints) - 1, 0, -1):
+                    start_step_idx = int(checkpoints[seg_idx - 1][0])
+                    end_step_idx   = int(checkpoints[seg_idx][0])
+                    seg_len = end_step_idx - start_step_idx
+                    if seg_len <= 0:
+                        continue
+
+                    # 从 GPU 检查点直接克隆段起点（无需跨设备拷贝）
+                    temp_H2 = checkpoints[seg_idx - 1][1].detach().clone()
+                    temp_H4 = checkpoints[seg_idx - 1][2].detach().clone()
+
+                    # 重算该段正向轨迹
+                    seg_h2 = [None] * seg_len
+                    seg_h4 = [None] * seg_len
+                    for curr_step in range(start_step_idx, end_step_idx):
+                        local_idx = curr_step - start_step_idx
+                        seg_h2[local_idx] = temp_H2
+                        seg_h4[local_idx] = temp_H4
+
+                        t_span_seg[0] = float(
+                            dl_list_final[curr_step]
+                        )
+                        t_span_seg[1] = float(
+                            dl_list_final[curr_step + 1]
+                        )
+                        _pack_state_torch(
+                            y0_flat_seg, temp_H2, temp_H4, n2_dim,
+                        )
+                        soln = torch_odeint(
+                            _ode_fn, y0_flat_seg, t_span_seg,
+                            rtol=_rtol, atol=_atol, method='dopri5',
+                        )
+                        temp_H2 = (
+                            soln[-1][:n2_dim]
+                            .reshape(n, n).detach().clone()
+                        )
+                        temp_H4 = (
+                            soln[-1][n2_dim:]
+                            .reshape(n, n, n, n).detach().clone()
+                        )
+                        del soln
+
+
+                    # 利用段轨迹反向演化 LIOM
+                    for local_idx in range(seg_len - 1, -1, -1):
+                        global_step = start_step_idx + local_idx
+                        # dl < 0 for backward evolution
+                        dl = float(
+                            dl_list_final[global_step]
+                            - dl_list_final[global_step + 1]
+                        )
+                        n2_t, n4_t = _update_torch(
+                            n2_t, n4_t,
+                            seg_h2[local_idx], seg_h4[local_idx],
+                            dl, ex_mask, no_mask,
+                        )
+
+                    del seg_h2, seg_h4
+
+                liom2_all[site] = n2_t.detach().clone()
+                liom4_all[site] = n4_t.detach().clone()
+                print(f"  [反向流] site={site}/{n} 完成")
+
+            # ---- 4. 内存粗估 ----
+            per_h_elems = n2_dim + n**4
+            ckpt_bytes = len(checkpoints) * per_h_elems * 4   # FP32 GPU
+            seg_bytes  = ckpt_step * per_h_elems * 4          # FP32 GPU
+            liom_bytes = n * per_h_elems * 4                  # FP32 GPU
+
+            output = {
+                "H0_diag": H0_diag.detach().cpu().numpy(),
+                "Hint": Hintfinal.detach().cpu().numpy(),
+                "LIOM Interactions": lbits,
+                "steps_evolved": int(final_step),
+                "ckpt_step": int(ckpt_step),
+                "LIOM2": liom2_all.detach().cpu().numpy(),
+                "LIOM4": liom4_all.detach().cpu().numpy(),
+                "peak_memory_bytes": int(
+                    ckpt_bytes + seg_bytes + liom_bytes
+                ),
+            }
+            return output
+
+        # ── 原有 JAX CPU 路径（不做任何修改）──
         # 在分支 1 的稀疏检查点机制基础上，把检查点本身与 _recompute_segment 内
         # 重算出的段轨迹都用同一套压缩存储（_make_storage / _cmp_store / _cmp_load）
         # 表示，由 compress_mode 选择压缩方案：
@@ -7171,142 +7436,397 @@ def flow_dyn_density(
         return output
 
     # ══════════════════════════════════════════════════════════════════════
-    elif switch_num == 101:
-        # 分支 101：parallel + checkpoint
+    elif switch_num == 111:
+        # 分支 111：parallel + compress + checkpoint (GPU 批处理)
+        if torch is None:
+            raise ImportError(
+                "PyTorch is not installed. Cannot use switch_num=111."
+            )
+        if torch_odeint is None:
+            raise ImportError(
+                "torchdiffeq is not installed. Run: pip install torchdiffeq"
+            )
+        if compress_mode != 0:
+            print(
+                "  [torch:111] compress_mode>0 not supported on GPU;"
+                " falling back to compress_mode=0"
+            )
 
-        H2_init = jnp.array(hamiltonian.H2_spinless)
-        H4_init = jnp.array(hamiltonian.H4_spinless)
-        orig_dtype = H2_init.dtype
+        # ---- 0. 初始化（与分支 11 GPU 相同）----
+        device = _resolve_torch_flow_device()
+        print(f"        [torch:111] device={device}"
+              f" (PYFLOW_GPU_ID={os.environ.get('PYFLOW_GPU_ID', '0')})")
+
+        ex_mask = _ex_helper_torch(n, device)
+        no_mask = _no_helper_torch(n, device)
+
+        _rtol = float(os.environ.get('PYFLOW_ODE_RTOL', '1e-6'))
+        _atol = float(os.environ.get('PYFLOW_ODE_ATOL', '1e-6'))
 
         dl_arr = np.array(dl_list, dtype=np.float64)
         if dl_arr.ndim != 1 or len(dl_arr) < 2:
-            raise ValueError("dl_list must be a 1D array with at least two time points.")
-
+            raise ValueError(
+                "dl_list must be a 1D array with at least two time points."
+            )
         max_steps = min(int(qmax), len(dl_arr))
         if max_steps < 2:
-            raise ValueError("qmax and dl_list imply fewer than two usable time points.")
+            raise ValueError(
+                "qmax and dl_list imply fewer than two usable time points."
+            )
         dl_arr = dl_arr[:max_steps]
 
         if ckpt_step is None:
             ckpt_step = min(40, int(np.sqrt(max_steps)))
         ckpt_step = max(1, int(ckpt_step))
 
-        _rtol = 1e-6
-        _atol = 1e-6
+        curr_H2 = torch.tensor(
+            np.array(hamiltonian.H2_spinless, dtype=np.float32),
+            dtype=torch.float32, device=device,
+        )
+        curr_H4 = torch.tensor(
+            np.array(hamiltonian.H4_spinless, dtype=np.float32),
+            dtype=torch.float32, device=device,
+        )
 
-        # --- 1. 正向流：H 对角化 + 所有格点算符同步推进，稀疏存储检查点 ---
-        curr_H2 = H2_init
-        curr_H4 = H4_init
-        checkpoints = [(0, np.array(curr_H2, dtype=orig_dtype), np.array(curr_H4, dtype=orig_dtype))]
+        def _ode_fn(t, y):
+            return _int_ode_torch_fn(t, y, n, ex_mask, no_mask)
+
+        n2_dim = n**2
+
+        # ---- 1. 正向流：H 对角化，稀疏检查点 ----
+        checkpoints = [
+            (0,
+             curr_H2.detach().clone(),
+             curr_H4.detach().clone(),
+            )
+        ]
 
         k = 1
         J0 = 1.0
-        while k < len(dl_arr) and J0 > cutoff:
-            steps = np.array([dl_arr[k - 1], dl_arr[k]], dtype=dl_arr.dtype)
+        t_span = torch.empty(2, dtype=torch.float32, device=device)
+        y0_flat = torch.empty(n2_dim + n**4, dtype=torch.float32, device=device)
 
-            # 推进 H 一步
-            soln_H = ode(int_ode, [curr_H2, curr_H4], steps, rtol=_rtol, atol=_atol)
-            curr_H2 = soln_H[0][-1]
-            curr_H4 = soln_H[1][-1]
+        while k < len(dl_arr) and J0 > cutoff:
+            t_span[0] = float(dl_arr[k - 1])
+            t_span[1] = float(dl_arr[k])
+            _pack_state_torch(y0_flat, curr_H2, curr_H4, n2_dim)
+
+            soln = torch_odeint(
+                _ode_fn, y0_flat, t_span,
+                rtol=_rtol, atol=_atol, method='dopri5',
+            )
+            curr_H2 = soln[-1][:n2_dim].reshape(n, n).detach().clone()
+            curr_H4 = soln[-1][n2_dim:].reshape(n, n, n, n).detach().clone()
+            del soln
 
             if k % ckpt_step == 0:
-                checkpoints.append((k, np.array(curr_H2, dtype=orig_dtype), np.array(curr_H4, dtype=orig_dtype)))
-            J0 = float(jnp.max(jnp.abs(curr_H2 - jnp.diag(jnp.diag(curr_H2)))))
+                checkpoints.append((
+                    k,
+                    curr_H2.detach().clone(),
+                    curr_H4.detach().clone(),
+                ))
+
+            J0 = float(
+                torch.max(torch.abs(
+                    curr_H2 - torch.diag(torch.diag(curr_H2))
+                ))
+            )
+
+            if k % 100 == 0:
+                print(
+                    f"  [对角化] k={k:5d}  l={dl_arr[k - 1]:.4e}"
+                    f"  J0={J0:.3e}  ckpts={len(checkpoints)}"
+                )
             k += 1
 
         final_step = k - 1
         if checkpoints[-1][0] != final_step:
-            checkpoints.append((final_step, np.array(curr_H2, dtype=orig_dtype), np.array(curr_H4, dtype=orig_dtype)))
+            checkpoints.append((
+                final_step,
+                curr_H2.detach().clone(),
+                curr_H4.detach().clone(),
+            ))
+
+        print(
+            f"  对角化完成，共 {final_step} 步，"
+            f"l_final={dl_arr[final_step]:.4e}"
+        )
 
         dl_list_final = dl_arr[:final_step + 1]
 
+        # ---- 2. l-bit 相互作用 ----
         H0_diag = curr_H2
         Hintfinal = curr_H4
-        h_final_flat = jnp.concatenate((curr_H2.reshape(n**2), curr_H4.reshape(n**4)))
 
-        # --- 2. 提取 l-bit 相互作用 ---
-        HFint = np.zeros((n, n), dtype=np.float64)
-        Hint_np = np.array(Hintfinal)
-        for i in range(n):
-            for j in range(n):
-                HFint[i, j] = Hint_np[i, i, j, j] - Hint_np[i, j, j, i]
-
-        lbits = np.zeros(n - 1, dtype=np.float64)
+        idx = torch.arange(n, device=device)
+        HFint = (
+            Hintfinal[idx[:, None], idx[:, None],
+                      idx[None, :], idx[None, :]]
+            - Hintfinal[idx[:, None], idx[None, :],
+                        idx[None, :], idx[:, None]]
+        )
+        lbits_list = []
         for q in range(1, n):
-            vals = np.abs(np.diag(HFint, q) + np.diag(HFint, -q)) / 2.0
-            vals = np.maximum(vals, 1e-30)
-            lbits[q - 1] = np.median(np.log10(vals))
+            diag_q  = torch.diagonal(HFint, offset=q)
+            diag_nq = torch.diagonal(HFint, offset=-q)
+            vals = (diag_q.abs() + diag_nq.abs()) / 2.0
+            vals = vals.clamp(min=1e-30)
+            lbits_list.append(vals.log10().median().item())
+        lbits = np.array(lbits_list, dtype=np.float64)
+        del HFint
 
-        # --- 3. 反向流：vmap 并行化所有格点（parallel=1）---
-        from jax import vmap
+        # ---- 3. 反向流：批处理所有格点 (parallel=1) ----
+        n2_batch = torch.zeros(
+            (n, n, n), dtype=torch.float32, device=device,
+        )
+        n2_batch[torch.arange(n, device=device),
+                 torch.arange(n, device=device),
+                 torch.arange(n, device=device)] = 1.0
+        n4_batch = torch.zeros(
+            (n, n, n, n, n), dtype=torch.float32, device=device,
+        )
 
-        # n2_batch[site, i, j]: site 格点的二次项 [i, j]
-        n2_batch = jnp.zeros((n, n, n), dtype=jnp.float32)
-        n2_batch = n2_batch.at[jnp.arange(n), jnp.arange(n), jnp.arange(n)].set(1.0)
-        # n4_batch[site, i, j, k, l]: site 格点的四次项 [i, j, k, l]
-        n4_batch = jnp.zeros((n, n, n, n, n), dtype=jnp.float32)
+        def _update_torch_batch(n2_b, n4_b, H2, Hint_b4, dl):
+            """同时更新所有格点的 LIOM。"""
+            H0, V0, Hint0, Vint = _extract_diag_torch(H2, Hint_b4, ex_mask)
+            eta2 = _con22_torch(H0, V0)
+            eta4 = (_con42_torch(Hint0, V0, no_mask)
+                    + _con24_torch(H0, Vint, no_mask))
 
-        # vmapped + jit 编译：一次调用更新所有格点的 LIOM
-        def _update_one(n2, n4, H2, H4, steps):
-            return update(n2, n4, H2, H4, steps)
-        batch_update = jit(vmap(_update_one, in_axes=(0, 0, None, None, None)))
+            dn2 = (torch.einsum('ij,sjk->sik', eta2, n2_b)
+                   - torch.einsum('sij,jk->sik', n2_b, eta2))
 
-        checkpoints_map = {}
-        for step_idx, h2_cp, h4_cp in checkpoints:
-            checkpoints_map[int(step_idx)] = (h2_cp, h4_cp)
+            c42  = torch.einsum('abcd,sdf->sabcf', eta4, n2_b)
+            c42 -= torch.einsum('abcd,sec->sabed', eta4, n2_b)
+            c42 += torch.einsum('abcd,sbf->safcd', eta4, n2_b)
+            c42 -= torch.einsum('abcd,sea->sebcd', eta4, n2_b)
 
-        def _recompute_segment(start_step_idx, end_step_idx):
-            segment_len = end_step_idx - start_step_idx
-            if segment_len <= 0:
-                return [], []
-            temp_H2 = jnp.array(checkpoints_map[start_step_idx][0])
-            temp_H4 = jnp.array(checkpoints_map[start_step_idx][1])
-            seg_h2 = [None] * segment_len
-            seg_h4 = [None] * segment_len
+            c24  = torch.einsum('sabcd,df->sabcf', n4_b, eta2)
+            c24 -= torch.einsum('sabcd,ec->sabed', n4_b, eta2)
+            c24 += torch.einsum('sabcd,bf->safcd', n4_b, eta2)
+            c24 -= torch.einsum('sabcd,ea->sebcd', n4_b, eta2)
+
+            dn4 = c42 - c24
+            dn4 = (no_mask * dn4.reshape(n, n**4)).reshape(
+                n, n, n, n, n,
+            )
+
+            return n2_b + dl * dn2, n4_b + dl * dn4
+
+        t_span_seg = torch.empty(2, dtype=torch.float32, device=device)
+        y0_flat_seg = torch.empty(
+            n2_dim + n**4, dtype=torch.float32, device=device,
+        )
+
+        for seg_idx in range(len(checkpoints) - 1, 0, -1):
+            start_step_idx = int(checkpoints[seg_idx - 1][0])
+            end_step_idx   = int(checkpoints[seg_idx][0])
+            seg_len = end_step_idx - start_step_idx
+            if seg_len <= 0:
+                continue
+            print(
+                f"  [反向流] segment steps {start_step_idx}→{end_step_idx}"
+            )
+
+            temp_H2 = checkpoints[seg_idx - 1][1].detach().clone()
+            temp_H4 = checkpoints[seg_idx - 1][2].detach().clone()
+
+            seg_h2 = [None] * seg_len
+            seg_h4 = [None] * seg_len
             for curr_step in range(start_step_idx, end_step_idx):
                 local_idx = curr_step - start_step_idx
                 seg_h2[local_idx] = temp_H2
                 seg_h4[local_idx] = temp_H4
-                steps = np.array([dl_list_final[curr_step], dl_list_final[curr_step + 1]], dtype=dl_list_final.dtype)
-                soln = ode(int_ode, [temp_H2, temp_H4], steps, rtol=_rtol, atol=_atol)
-                temp_H2 = soln[0][-1]
-                temp_H4 = soln[1][-1]
-            return seg_h2, seg_h4
 
-        for seg_idx in range(len(checkpoints) - 1, 0, -1):
-            start_step_idx = int(checkpoints[seg_idx - 1][0])
-            end_step_idx = int(checkpoints[seg_idx][0])
-            seg_h2, seg_h4 = _recompute_segment(start_step_idx, end_step_idx)
+                t_span_seg[0] = float(dl_list_final[curr_step])
+                t_span_seg[1] = float(dl_list_final[curr_step + 1])
+                _pack_state_torch(y0_flat_seg, temp_H2, temp_H4, n2_dim)
+                soln = torch_odeint(
+                    _ode_fn, y0_flat_seg, t_span_seg,
+                    rtol=_rtol, atol=_atol, method='dopri5',
+                )
+                temp_H2 = (
+                    soln[-1][:n2_dim].reshape(n, n).detach().clone()
+                )
+                temp_H4 = (
+                    soln[-1][n2_dim:].reshape(n, n, n, n).detach().clone()
+                )
+                del soln
 
-            for local_idx in range(end_step_idx - start_step_idx - 1, -1, -1):
+            for local_idx in range(seg_len - 1, -1, -1):
                 global_step = start_step_idx + local_idx
-                steps = np.array([dl_list_final[global_step + 1], dl_list_final[global_step]], dtype=np.float64)
-                n2_batch, n4_batch = batch_update(n2_batch, n4_batch,
-                                                   seg_h2[local_idx], seg_h4[local_idx], steps)
+                dl = float(
+                    dl_list_final[global_step]
+                    - dl_list_final[global_step + 1]
+                )
+                n2_batch, n4_batch = _update_torch_batch(
+                    n2_batch, n4_batch,
+                    seg_h2[local_idx], seg_h4[local_idx], dl,
+                )
 
             del seg_h2, seg_h4
+            del temp_H2, temp_H4
 
-        liom2_all = np.array(n2_batch, dtype=np.float32)   # (n, n, n)
-        liom4_all = np.array(n4_batch, dtype=np.float32)   # (n, n, n, n, n)
+        liom2_all = n2_batch.detach().clone()
+        liom4_all = n4_batch.detach().clone()
+
+        # ---- 4. 内存粗估 ----
+        per_h_elems = n2_dim + n**4
+        ckpt_bytes = len(checkpoints) * per_h_elems * 4
+        seg_bytes  = ckpt_step * per_h_elems * 4
+        liom_bytes = n * per_h_elems * 4
 
         output = {
-            "H0_diag": np.array(H0_diag),
-            "Hint": np.array(Hintfinal),
-            "LIOM Interactions": np.array(lbits),
-            "Invariant": 0,
-            "ckpt_step": int(ckpt_step),
+            "H0_diag": H0_diag.detach().cpu().numpy(),
+            "Hint": Hintfinal.detach().cpu().numpy(),
+            "LIOM Interactions": lbits,
             "steps_evolved": int(final_step),
-            "LIOM2": liom2_all,
-            "LIOM4": liom4_all,
+            "ckpt_step": int(ckpt_step),
+            "LIOM2": liom2_all.detach().cpu().numpy(),
+            "LIOM4": liom4_all.detach().cpu().numpy(),
             "peak_memory_bytes": int(
-                (final_step // ckpt_step + 2) * (n * n + n * n * n * n) * 4  # 检查点
-                + ckpt_step * (n * n + n * n * n * n) * 4                     # 重算段
-                + n * (n * n + n * n * n * n) * 4                             # LIOM2/4_all（并行）
+                ckpt_bytes + seg_bytes + liom_bytes
             ),
         }
         return output
 
     # ══════════════════════════════════════════════════════════════════════
+    # elif switch_num == 101:
+    #     # 分支 101：parallel + checkpoint
+
+    #     H2_init = jnp.array(hamiltonian.H2_spinless)
+    #     H4_init = jnp.array(hamiltonian.H4_spinless)
+    #     orig_dtype = H2_init.dtype
+
+    #     dl_arr = np.array(dl_list, dtype=np.float64)
+    #     if dl_arr.ndim != 1 or len(dl_arr) < 2:
+    #         raise ValueError("dl_list must be a 1D array with at least two time points.")
+
+    #     max_steps = min(int(qmax), len(dl_arr))
+    #     if max_steps < 2:
+    #         raise ValueError("qmax and dl_list imply fewer than two usable time points.")
+    #     dl_arr = dl_arr[:max_steps]
+
+    #     if ckpt_step is None:
+    #         ckpt_step = min(40, int(np.sqrt(max_steps)))
+    #     ckpt_step = max(1, int(ckpt_step))
+
+    #     _rtol = 1e-6
+    #     _atol = 1e-6
+
+    #     # --- 1. 正向流：H 对角化 + 所有格点算符同步推进，稀疏存储检查点 ---
+    #     curr_H2 = H2_init
+    #     curr_H4 = H4_init
+    #     checkpoints = [(0, np.array(curr_H2, dtype=orig_dtype), np.array(curr_H4, dtype=orig_dtype))]
+
+    #     k = 1
+    #     J0 = 1.0
+    #     while k < len(dl_arr) and J0 > cutoff:
+    #         steps = np.array([dl_arr[k - 1], dl_arr[k]], dtype=dl_arr.dtype)
+
+    #         # 推进 H 一步
+    #         soln_H = ode(int_ode, [curr_H2, curr_H4], steps, rtol=_rtol, atol=_atol)
+    #         curr_H2 = soln_H[0][-1]
+    #         curr_H4 = soln_H[1][-1]
+
+    #         if k % ckpt_step == 0:
+    #             checkpoints.append((k, np.array(curr_H2, dtype=orig_dtype), np.array(curr_H4, dtype=orig_dtype)))
+    #         J0 = float(jnp.max(jnp.abs(curr_H2 - jnp.diag(jnp.diag(curr_H2)))))
+    #         k += 1
+
+    #     final_step = k - 1
+    #     if checkpoints[-1][0] != final_step:
+    #         checkpoints.append((final_step, np.array(curr_H2, dtype=orig_dtype), np.array(curr_H4, dtype=orig_dtype)))
+
+    #     dl_list_final = dl_arr[:final_step + 1]
+
+    #     H0_diag = curr_H2
+    #     Hintfinal = curr_H4
+    #     h_final_flat = jnp.concatenate((curr_H2.reshape(n**2), curr_H4.reshape(n**4)))
+
+    #     # --- 2. 提取 l-bit 相互作用 ---
+    #     HFint = np.zeros((n, n), dtype=np.float64)
+    #     Hint_np = np.array(Hintfinal)
+    #     for i in range(n):
+    #         for j in range(n):
+    #             HFint[i, j] = Hint_np[i, i, j, j] - Hint_np[i, j, j, i]
+
+    #     lbits = np.zeros(n - 1, dtype=np.float64)
+    #     for q in range(1, n):
+    #         vals = np.abs(np.diag(HFint, q) + np.diag(HFint, -q)) / 2.0
+    #         vals = np.maximum(vals, 1e-30)
+    #         lbits[q - 1] = np.median(np.log10(vals))
+
+    #     # --- 3. 反向流：vmap 并行化所有格点（parallel=1）---
+    #     from jax import vmap
+
+    #     # n2_batch[site, i, j]: site 格点的二次项 [i, j]
+    #     n2_batch = jnp.zeros((n, n, n), dtype=jnp.float32)
+    #     n2_batch = n2_batch.at[jnp.arange(n), jnp.arange(n), jnp.arange(n)].set(1.0)
+    #     # n4_batch[site, i, j, k, l]: site 格点的四次项 [i, j, k, l]
+    #     n4_batch = jnp.zeros((n, n, n, n, n), dtype=jnp.float32)
+
+    #     # vmapped + jit 编译：一次调用更新所有格点的 LIOM
+    #     def _update_one(n2, n4, H2, H4, steps):
+    #         return update(n2, n4, H2, H4, steps)
+    #     batch_update = jit(vmap(_update_one, in_axes=(0, 0, None, None, None)))
+
+    #     checkpoints_map = {}
+    #     for step_idx, h2_cp, h4_cp in checkpoints:
+    #         checkpoints_map[int(step_idx)] = (h2_cp, h4_cp)
+
+    #     def _recompute_segment(start_step_idx, end_step_idx):
+    #         segment_len = end_step_idx - start_step_idx
+    #         if segment_len <= 0:
+    #             return [], []
+    #         temp_H2 = jnp.array(checkpoints_map[start_step_idx][0])
+    #         temp_H4 = jnp.array(checkpoints_map[start_step_idx][1])
+    #         seg_h2 = [None] * segment_len
+    #         seg_h4 = [None] * segment_len
+    #         for curr_step in range(start_step_idx, end_step_idx):
+    #             local_idx = curr_step - start_step_idx
+    #             seg_h2[local_idx] = temp_H2
+    #             seg_h4[local_idx] = temp_H4
+    #             steps = np.array([dl_list_final[curr_step], dl_list_final[curr_step + 1]], dtype=dl_list_final.dtype)
+    #             soln = ode(int_ode, [temp_H2, temp_H4], steps, rtol=_rtol, atol=_atol)
+    #             temp_H2 = soln[0][-1]
+    #             temp_H4 = soln[1][-1]
+    #         return seg_h2, seg_h4
+
+    #     for seg_idx in range(len(checkpoints) - 1, 0, -1):
+    #         start_step_idx = int(checkpoints[seg_idx - 1][0])
+    #         end_step_idx = int(checkpoints[seg_idx][0])
+    #         seg_h2, seg_h4 = _recompute_segment(start_step_idx, end_step_idx)
+
+    #         for local_idx in range(end_step_idx - start_step_idx - 1, -1, -1):
+    #             global_step = start_step_idx + local_idx
+    #             steps = np.array([dl_list_final[global_step + 1], dl_list_final[global_step]], dtype=np.float64)
+    #             n2_batch, n4_batch = batch_update(n2_batch, n4_batch,
+    #                                                seg_h2[local_idx], seg_h4[local_idx], steps)
+
+    #         del seg_h2, seg_h4
+
+    #     liom2_all = np.array(n2_batch, dtype=np.float32)   # (n, n, n)
+    #     liom4_all = np.array(n4_batch, dtype=np.float32)   # (n, n, n, n, n)
+
+    #     output = {
+    #         "H0_diag": np.array(H0_diag),
+    #         "Hint": np.array(Hintfinal),
+    #         "LIOM Interactions": np.array(lbits),
+    #         "Invariant": 0,
+    #         "ckpt_step": int(ckpt_step),
+    #         "steps_evolved": int(final_step),
+    #         "LIOM2": liom2_all,
+    #         "LIOM4": liom4_all,
+    #         "peak_memory_bytes": int(
+    #             (final_step // ckpt_step + 2) * (n * n + n * n * n * n) * 4  # 检查点
+    #             + ckpt_step * (n * n + n * n * n * n) * 4                     # 重算段
+    #             + n * (n * n + n * n * n * n) * 4                             # LIOM2/4_all（并行）
+    #         ),
+    #     }
+    #     return output
+
+    # # ══════════════════════════════════════════════════════════════════════
     elif switch_num == 111:
         # 分支 111：parallel + compress + checkpoint
         # 在分支 101（parallel+checkpoint）的基础上加入矩阵压缩：
@@ -7649,164 +8169,164 @@ def flow_dyn_density(
         }
         return output
 
-    # ══════════════════════════════════════════════════════════════════════
-    elif switch_num == 1101:
-        # 分支 1101：pipeline + parallel + checkpoint
-        # 在分支 101 的基础上，反向流时用一个后台线程预取下一段的 H 重算结果
-        # 任意时刻内存中最多存在 2 段重算的 H：当前消费中的 + 后台预取中的
-        # ══════════════════════════════════════════════════════════════════
+    # # ══════════════════════════════════════════════════════════════════════
+    # elif switch_num == 1101:
+    #     # 分支 1101：pipeline + parallel + checkpoint
+    #     # 在分支 101 的基础上，反向流时用一个后台线程预取下一段的 H 重算结果
+    #     # 任意时刻内存中最多存在 2 段重算的 H：当前消费中的 + 后台预取中的
+    #     # ══════════════════════════════════════════════════════════════════
 
-        from concurrent.futures import ThreadPoolExecutor
+    #     from concurrent.futures import ThreadPoolExecutor
 
-        H2_init = jnp.array(hamiltonian.H2_spinless)
-        H4_init = jnp.array(hamiltonian.H4_spinless)
-        orig_dtype = H2_init.dtype
+    #     H2_init = jnp.array(hamiltonian.H2_spinless)
+    #     H4_init = jnp.array(hamiltonian.H4_spinless)
+    #     orig_dtype = H2_init.dtype
 
-        dl_arr = np.array(dl_list, dtype=np.float64)
-        if dl_arr.ndim != 1 or len(dl_arr) < 2:
-            raise ValueError("dl_list must be a 1D array with at least two time points.")
+    #     dl_arr = np.array(dl_list, dtype=np.float64)
+    #     if dl_arr.ndim != 1 or len(dl_arr) < 2:
+    #         raise ValueError("dl_list must be a 1D array with at least two time points.")
 
-        max_steps = min(int(qmax), len(dl_arr))
-        if max_steps < 2:
-            raise ValueError("qmax and dl_list imply fewer than two usable time points.")
-        dl_arr = dl_arr[:max_steps]
+    #     max_steps = min(int(qmax), len(dl_arr))
+    #     if max_steps < 2:
+    #         raise ValueError("qmax and dl_list imply fewer than two usable time points.")
+    #     dl_arr = dl_arr[:max_steps]
 
-        if ckpt_step is None:
-            ckpt_step = min(40, int(np.sqrt(max_steps)))
-        ckpt_step = max(1, int(ckpt_step))
+    #     if ckpt_step is None:
+    #         ckpt_step = min(40, int(np.sqrt(max_steps)))
+    #     ckpt_step = max(1, int(ckpt_step))
 
-        _rtol = 1e-6
-        _atol = 1e-6
+    #     _rtol = 1e-6
+    #     _atol = 1e-6
 
-        # --- 1. 正向流：H 对角化，稀疏存储检查点 ---
-        curr_H2 = H2_init
-        curr_H4 = H4_init
-        checkpoints = [(0, np.array(curr_H2, dtype=orig_dtype), np.array(curr_H4, dtype=orig_dtype))]
+    #     # --- 1. 正向流：H 对角化，稀疏存储检查点 ---
+    #     curr_H2 = H2_init
+    #     curr_H4 = H4_init
+    #     checkpoints = [(0, np.array(curr_H2, dtype=orig_dtype), np.array(curr_H4, dtype=orig_dtype))]
 
-        k = 1
-        J0 = 1.0
-        while k < len(dl_arr) and J0 > cutoff:
-            steps = np.array([dl_arr[k - 1], dl_arr[k]], dtype=dl_arr.dtype)
+    #     k = 1
+    #     J0 = 1.0
+    #     while k < len(dl_arr) and J0 > cutoff:
+    #         steps = np.array([dl_arr[k - 1], dl_arr[k]], dtype=dl_arr.dtype)
 
-            # 推进 H 一步
-            soln_H = ode(int_ode, [curr_H2, curr_H4], steps, rtol=_rtol, atol=_atol)
-            curr_H2 = soln_H[0][-1]
-            curr_H4 = soln_H[1][-1]
+    #         # 推进 H 一步
+    #         soln_H = ode(int_ode, [curr_H2, curr_H4], steps, rtol=_rtol, atol=_atol)
+    #         curr_H2 = soln_H[0][-1]
+    #         curr_H4 = soln_H[1][-1]
 
-            if k % ckpt_step == 0:
-                checkpoints.append((k, np.array(curr_H2, dtype=orig_dtype), np.array(curr_H4, dtype=orig_dtype)))
-            J0 = float(jnp.max(jnp.abs(curr_H2 - jnp.diag(jnp.diag(curr_H2)))))
-            k += 1
+    #         if k % ckpt_step == 0:
+    #             checkpoints.append((k, np.array(curr_H2, dtype=orig_dtype), np.array(curr_H4, dtype=orig_dtype)))
+    #         J0 = float(jnp.max(jnp.abs(curr_H2 - jnp.diag(jnp.diag(curr_H2)))))
+    #         k += 1
 
-        final_step = k - 1
-        if checkpoints[-1][0] != final_step:
-            checkpoints.append((final_step, np.array(curr_H2, dtype=orig_dtype), np.array(curr_H4, dtype=orig_dtype)))
+    #     final_step = k - 1
+    #     if checkpoints[-1][0] != final_step:
+    #         checkpoints.append((final_step, np.array(curr_H2, dtype=orig_dtype), np.array(curr_H4, dtype=orig_dtype)))
 
-        dl_list_final = dl_arr[:final_step + 1]
+    #     dl_list_final = dl_arr[:final_step + 1]
 
-        H0_diag = curr_H2
-        Hintfinal = curr_H4
-        h_final_flat = jnp.concatenate((curr_H2.reshape(n**2), curr_H4.reshape(n**4)))
+    #     H0_diag = curr_H2
+    #     Hintfinal = curr_H4
+    #     h_final_flat = jnp.concatenate((curr_H2.reshape(n**2), curr_H4.reshape(n**4)))
 
-        # --- 2. 提取 l-bit 相互作用 ---
-        HFint = np.zeros((n, n), dtype=np.float64)
-        Hint_np = np.array(Hintfinal)
-        for i in range(n):
-            for j in range(n):
-                HFint[i, j] = Hint_np[i, i, j, j] - Hint_np[i, j, j, i]
+    #     # --- 2. 提取 l-bit 相互作用 ---
+    #     HFint = np.zeros((n, n), dtype=np.float64)
+    #     Hint_np = np.array(Hintfinal)
+    #     for i in range(n):
+    #         for j in range(n):
+    #             HFint[i, j] = Hint_np[i, i, j, j] - Hint_np[i, j, j, i]
 
-        lbits = np.zeros(n - 1, dtype=np.float64)
-        for q in range(1, n):
-            vals = np.abs(np.diag(HFint, q) + np.diag(HFint, -q)) / 2.0
-            vals = np.maximum(vals, 1e-30)
-            lbits[q - 1] = np.median(np.log10(vals))
+    #     lbits = np.zeros(n - 1, dtype=np.float64)
+    #     for q in range(1, n):
+    #         vals = np.abs(np.diag(HFint, q) + np.diag(HFint, -q)) / 2.0
+    #         vals = np.maximum(vals, 1e-30)
+    #         lbits[q - 1] = np.median(np.log10(vals))
 
-        # --- 3. 反向流：vmap 并行化 + pipeline 流水线（parallel=1）---
-        from jax import vmap
-        from concurrent.futures import ThreadPoolExecutor
+    #     # --- 3. 反向流：vmap 并行化 + pipeline 流水线（parallel=1）---
+    #     from jax import vmap
+    #     from concurrent.futures import ThreadPoolExecutor
 
-        # n2_batch[site, i, j] / n4_batch[site, i, j, k, l]
-        n2_batch = jnp.zeros((n, n, n), dtype=jnp.float32)
-        n2_batch = n2_batch.at[jnp.arange(n), jnp.arange(n), jnp.arange(n)].set(1.0)
-        n4_batch = jnp.zeros((n, n, n, n, n), dtype=jnp.float32)
+    #     # n2_batch[site, i, j] / n4_batch[site, i, j, k, l]
+    #     n2_batch = jnp.zeros((n, n, n), dtype=jnp.float32)
+    #     n2_batch = n2_batch.at[jnp.arange(n), jnp.arange(n), jnp.arange(n)].set(1.0)
+    #     n4_batch = jnp.zeros((n, n, n, n, n), dtype=jnp.float32)
 
-        def _update_one(n2, n4, H2, H4, steps):
-            return update(n2, n4, H2, H4, steps)
-        batch_update = jit(vmap(_update_one, in_axes=(0, 0, None, None, None)))
+    #     def _update_one(n2, n4, H2, H4, steps):
+    #         return update(n2, n4, H2, H4, steps)
+    #     batch_update = jit(vmap(_update_one, in_axes=(0, 0, None, None, None)))
 
-        checkpoints_map = {}
-        for step_idx, h2_cp, h4_cp in checkpoints:
-            checkpoints_map[int(step_idx)] = (h2_cp, h4_cp)
+    #     checkpoints_map = {}
+    #     for step_idx, h2_cp, h4_cp in checkpoints:
+    #         checkpoints_map[int(step_idx)] = (h2_cp, h4_cp)
 
-        def _recompute_segment(start_step_idx, end_step_idx):
-            segment_len = end_step_idx - start_step_idx
-            if segment_len <= 0:
-                return [], []
-            temp_H2 = jnp.array(checkpoints_map[start_step_idx][0])
-            temp_H4 = jnp.array(checkpoints_map[start_step_idx][1])
-            seg_h2 = [None] * segment_len
-            seg_h4 = [None] * segment_len
-            for curr_step in range(start_step_idx, end_step_idx):
-                local_idx = curr_step - start_step_idx
-                seg_h2[local_idx] = temp_H2
-                seg_h4[local_idx] = temp_H4
-                steps = np.array([dl_list_final[curr_step], dl_list_final[curr_step + 1]], dtype=dl_list_final.dtype)
-                soln = ode(int_ode, [temp_H2, temp_H4], steps, rtol=_rtol, atol=_atol)
-                temp_H2 = soln[0][-1]
-                temp_H4 = soln[1][-1]
-            return seg_h2, seg_h4
+    #     def _recompute_segment(start_step_idx, end_step_idx):
+    #         segment_len = end_step_idx - start_step_idx
+    #         if segment_len <= 0:
+    #             return [], []
+    #         temp_H2 = jnp.array(checkpoints_map[start_step_idx][0])
+    #         temp_H4 = jnp.array(checkpoints_map[start_step_idx][1])
+    #         seg_h2 = [None] * segment_len
+    #         seg_h4 = [None] * segment_len
+    #         for curr_step in range(start_step_idx, end_step_idx):
+    #             local_idx = curr_step - start_step_idx
+    #             seg_h2[local_idx] = temp_H2
+    #             seg_h4[local_idx] = temp_H4
+    #             steps = np.array([dl_list_final[curr_step], dl_list_final[curr_step + 1]], dtype=dl_list_final.dtype)
+    #             soln = ode(int_ode, [temp_H2, temp_H4], steps, rtol=_rtol, atol=_atol)
+    #             temp_H2 = soln[0][-1]
+    #             temp_H4 = soln[1][-1]
+    #         return seg_h2, seg_h4
 
-        seg_indices = list(range(len(checkpoints) - 1, 0, -1))
+    #     seg_indices = list(range(len(checkpoints) - 1, 0, -1))
 
-        if seg_indices:
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                first_seg = seg_indices[0]
-                future_curr = executor.submit(
-                    _recompute_segment,
-                    int(checkpoints[first_seg - 1][0]),
-                    int(checkpoints[first_seg][0]),
-                )
+    #     if seg_indices:
+    #         with ThreadPoolExecutor(max_workers=1) as executor:
+    #             first_seg = seg_indices[0]
+    #             future_curr = executor.submit(
+    #                 _recompute_segment,
+    #                 int(checkpoints[first_seg - 1][0]),
+    #                 int(checkpoints[first_seg][0]),
+    #             )
 
-                for i, seg_idx in enumerate(seg_indices):
-                    seg_h2, seg_h4 = future_curr.result()
+    #             for i, seg_idx in enumerate(seg_indices):
+    #                 seg_h2, seg_h4 = future_curr.result()
 
-                    if i + 1 < len(seg_indices):
-                        next_seg = seg_indices[i + 1]
-                        future_curr = executor.submit(
-                            _recompute_segment,
-                            int(checkpoints[next_seg - 1][0]),
-                            int(checkpoints[next_seg][0]),
-                        )
+    #                 if i + 1 < len(seg_indices):
+    #                     next_seg = seg_indices[i + 1]
+    #                     future_curr = executor.submit(
+    #                         _recompute_segment,
+    #                         int(checkpoints[next_seg - 1][0]),
+    #                         int(checkpoints[next_seg][0]),
+    #                     )
 
-                    start_step_idx = int(checkpoints[seg_idx - 1][0])
-                    end_step_idx = int(checkpoints[seg_idx][0])
-                    for local_idx in range(end_step_idx - start_step_idx - 1, -1, -1):
-                        global_step = start_step_idx + local_idx
-                        steps = np.array([dl_list_final[global_step + 1], dl_list_final[global_step]], dtype=np.float64)
-                        n2_batch, n4_batch = batch_update(n2_batch, n4_batch,
-                                                           seg_h2[local_idx], seg_h4[local_idx], steps)
+    #                 start_step_idx = int(checkpoints[seg_idx - 1][0])
+    #                 end_step_idx = int(checkpoints[seg_idx][0])
+    #                 for local_idx in range(end_step_idx - start_step_idx - 1, -1, -1):
+    #                     global_step = start_step_idx + local_idx
+    #                     steps = np.array([dl_list_final[global_step + 1], dl_list_final[global_step]], dtype=np.float64)
+    #                     n2_batch, n4_batch = batch_update(n2_batch, n4_batch,
+    #                                                        seg_h2[local_idx], seg_h4[local_idx], steps)
 
-                    del seg_h2, seg_h4
+    #                 del seg_h2, seg_h4
 
-        liom2_all = np.array(n2_batch, dtype=np.float32)
-        liom4_all = np.array(n4_batch, dtype=np.float32)
+    #     liom2_all = np.array(n2_batch, dtype=np.float32)
+    #     liom4_all = np.array(n4_batch, dtype=np.float32)
 
-        output = {
-            "H0_diag": np.array(H0_diag),
-            "Hint": np.array(Hintfinal),
-            "LIOM Interactions": np.array(lbits),
-            "Invariant": 0,
-            "ckpt_step": int(ckpt_step),
-            "steps_evolved": int(final_step),
-            "LIOM2": liom2_all,
-            "LIOM4": liom4_all,
-            "peak_memory_bytes": int(
-                (final_step // ckpt_step + 2) * (n * n + n * n * n * n) * 4  # 检查点
-                + 2 * ckpt_step * (n * n + n * n * n * n) * 4                 # 流水线：2 段
-                + n * (n * n + n * n * n * n) * 4                             # LIOM2/4_all（并行）
-            ),
-        }
-        return output
+    #     output = {
+    #         "H0_diag": np.array(H0_diag),
+    #         "Hint": np.array(Hintfinal),
+    #         "LIOM Interactions": np.array(lbits),
+    #         "Invariant": 0,
+    #         "ckpt_step": int(ckpt_step),
+    #         "steps_evolved": int(final_step),
+    #         "LIOM2": liom2_all,
+    #         "LIOM4": liom4_all,
+    #         "peak_memory_bytes": int(
+    #             (final_step // ckpt_step + 2) * (n * n + n * n * n * n) * 4  # 检查点
+    #             + 2 * ckpt_step * (n * n + n * n * n * n) * 4                 # 流水线：2 段
+    #             + n * (n * n + n * n * n * n) * 4                             # LIOM2/4_all（并行）
+    #         ),
+    #     }
+    #     return output
 
 
     else:
@@ -8006,6 +8526,367 @@ def flow_static_int_ckpt_liubo(n,hamiltonian,dl_list,qmax,cutoff,method='tensord
         "ckpt_step": int(ckpt_step),
         "checkpoints_count": int(checkpoints_count),
         "truncation_err": np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float64),
+    }
+
+    if timing_enabled:
+        output["_timing"] = {
+            "part1_init_s": float(t_part1_init_s),
+            "part2_ckpt_s": float(t_part2_ckpt_s),
+            "part3_forward_diag_s": float(t_forward_diag_s),
+            "part4_backward_liom_s": float(t_backward_liom_s),
+            "forward_diag_s": float(t_forward_diag_s),
+            "backward_liom_s": float(t_backward_liom_s),
+        }
+
+    return output
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PyTorch/GPU helpers for flow_static_int_ckpt_torch
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _ex_helper_torch(n, device):
+    """Mask for Hint diagonal elements: positions [i,i,j,j] and [i,j,j,i] set to 1."""
+    mask = torch.zeros(n**4, dtype=torch.float32, device=device)
+    for i in range(n):
+        for j in range(n):
+            mask[i*n**3 + i*n**2 + j*n + j] = 1.0
+            mask[i*n**3 + j*n**2 + j*n + i] = 1.0
+    return mask
+
+
+def _no_helper_torch(n, device):
+    """Mask for con42 result: zeros where a==c or b==d (torch equivalent of JAX no_helper)."""
+    test = np.ones((n, n, n, n), dtype=np.float32)
+    for i in range(n):
+        test[i, :, i, :] = 0
+        test[:, i, :, i] = 0
+    return torch.tensor(test.reshape(n**4), dtype=torch.float32, device=device)
+
+
+def _extract_diag_torch(H2, Hint, ex_mask):
+    """Torch equivalent of extract_diag: split H2/Hint into diagonal and off-diagonal parts."""
+    H2_0 = torch.diag(torch.diag(H2))
+    V0 = H2 - H2_0
+    Hint0 = (ex_mask * Hint.reshape(-1)).reshape(Hint.shape)
+    Vint = Hint - Hint0
+    return H2_0, V0, Hint0, Vint
+
+
+def _con22_torch(A, B):
+    """Matrix commutator [A, B] = AB - BA."""
+    return A @ B - B @ A
+
+
+def _con42_torch(A, B, no_mask):
+    """Rank-4 tensor with rank-2 matrix contraction, antisymmetry-masked."""
+    n = B.shape[0]
+    con  = torch.einsum('abcd,df->abcf', A, B)
+    con -= torch.einsum('abcd,ec->abed', A, B)
+    con += torch.einsum('abcd,bf->afcd', A, B)
+    con -= torch.einsum('abcd,ea->ebcd', A, B)
+    con = (no_mask * con.reshape(n**4)).reshape(n, n, n, n)
+    return con
+
+
+def _con24_torch(A, B, no_mask):
+    """Rank-2 matrix with rank-4 tensor contraction."""
+    return -_con42_torch(B, A, no_mask)
+
+
+def _int_ode_torch_fn(l, y_flat, n, ex_mask, no_mask):
+    """
+    RHS of flow equation dH/dl = [eta, H], compatible with torchdiffeq (func(t, y)).
+    y_flat: 1-D tensor of shape (n**2 + n**4,)
+    """
+    H2   = y_flat[:n**2].reshape(n, n)
+    Hint = y_flat[n**2:].reshape(n, n, n, n)
+    H2_0, V0, Hint0, Vint = _extract_diag_torch(H2, Hint, ex_mask)
+    eta0    = _con22_torch(H2_0, V0)
+    eta_int = _con42_torch(Hint0, V0, no_mask) + _con24_torch(H2_0, Vint, no_mask)
+    sol  = _con22_torch(eta0, H2)
+    sol2 = _con42_torch(eta_int, H2, no_mask) + _con24_torch(eta0, Hint, no_mask)
+    return torch.cat([sol.reshape(-1), sol2.reshape(-1)])
+
+
+def _update_torch(n2, n4, H2, Hint, dl, ex_mask, no_mask):
+    """
+    LIOM single Euler step (torch equivalent of update()).
+    dl > 0 for forward, dl < 0 for backward (time-reversed) evolution.
+    """
+    H0, V0, Hint0, Vint = _extract_diag_torch(H2, Hint, ex_mask)
+    eta2 = _con22_torch(H0, V0)
+    eta4 = _con42_torch(Hint0, V0, no_mask) + _con24_torch(H0, Vint, no_mask)
+    dn2 = _con22_torch(eta2, n2)
+    dn4 = _con42_torch(eta4, n2, no_mask) + _con24_torch(eta2, n4, no_mask)
+    return n2 + dl * dn2, n4 + dl * dn4
+
+
+def _pack_state_torch(y_flat, H2, Hint, n2):
+    """Pack H2/Hint views into preallocated 1-D state buffer (avoids per-step cat allocations)."""
+    y_flat[:n2].copy_(H2.reshape(-1))
+    y_flat[n2:].copy_(Hint.reshape(-1))
+
+
+def _resolve_torch_flow_device():
+    """Resolve torch flow device from PYFLOW_GPU_ID (default 0), with safe fallback."""
+    if (torch is None) or (not torch.cuda.is_available()):
+        return torch.device('cpu')
+
+    gpu_env = os.environ.get("PYFLOW_GPU_ID", "0").strip()
+    try:
+        gpu_id = int(gpu_env) if gpu_env != "" else 0
+    except ValueError:
+        print(f"        [torch] invalid PYFLOW_GPU_ID={gpu_env!r}, fallback to 0")
+        gpu_id = 0
+
+    gpu_count = int(torch.cuda.device_count())
+    if gpu_id < 0 or gpu_id >= gpu_count:
+        print(f"        [torch] PYFLOW_GPU_ID={gpu_id} out of range [0, {gpu_count - 1}], fallback to 0")
+        gpu_id = 0
+
+    device = torch.device(f'cuda:{gpu_id}')
+    try:
+        torch.cuda.set_device(device)
+    except Exception as exc:
+        print(f"        [torch] failed to set cuda device {gpu_id}: {exc}; fallback to cuda:0")
+        device = torch.device('cuda:0')
+        torch.cuda.set_device(device)
+    return device
+
+
+def flow_static_int_ckpt_torch(n, hamiltonian, dl_list, qmax, cutoff,
+                                method='tensordot', norm=False, Hflow=False, store_flow=False):
+
+    if torch is None:
+        raise ImportError("PyTorch is not installed. Cannot use flow_static_int_ckpt_torch.")
+    if torch_odeint is None:
+        raise ImportError("torchdiffeq is not installed. Run: pip install torchdiffeq")
+
+    # If enabled, skip expensive post-processing when forward diagonalization hits
+    # max steps without reaching the off-diagonal cutoff.
+    skip_unconverged = os.environ.get("PYFLOW_GPU_SKIP_UNCONVERGED", "0") in (
+        "1", "true", "True", "on", "ON", "yes", "YES"
+    )
+
+    # Internal flow timing is opt-in. Enable with: PYFLOW_FLOW_TIMING=1
+    timing_enabled = os.environ.get("PYFLOW_FLOW_TIMING", "0") in ("1", "true", "True", "on", "ON", "yes", "YES")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Part 1: Initialization
+    # ═══════════════════════════════════════════════════════════════════
+    t_part1_start = time.perf_counter() if timing_enabled else None
+    print('Part 1: Initialization')
+    device = _resolve_torch_flow_device()
+    print(f"        [torch] device={device} (PYFLOW_GPU_ID={os.environ.get('PYFLOW_GPU_ID', '0')})")
+
+    # Pre-compute masks once (avoid recreating inside loops)
+    ex_mask = _ex_helper_torch(n, device)
+    no_mask = _no_helper_torch(n, device)
+
+    curr_H2   = torch.tensor(np.array(hamiltonian.H2_spinless), dtype=torch.float32, device=device)
+    curr_Hint = torch.tensor(np.array(hamiltonian.H4_spinless), dtype=torch.float32, device=device)
+
+    init_liom2 = torch.zeros((n, n),       dtype=torch.float32, device=device)
+    init_liom2[n // 2, n // 2] = 1.0
+    init_liom4 = torch.zeros((n, n, n, n), dtype=torch.float32, device=device)
+
+    _rtol = float(os.environ.get('PYFLOW_ODE_RTOL', '1e-6'))
+    _atol = float(os.environ.get('PYFLOW_ODE_ATOL', '1e-6'))
+    t_part1_init_s = (time.perf_counter() - t_part1_start) if timing_enabled else np.nan
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Part 2: Checkpoint interval
+    # ═══════════════════════════════════════════════════════════════════
+    t_part2_start = time.perf_counter() if timing_enabled else None
+    print('Part 2: Checkpoint interval')
+
+    _ckpt_step_env = os.environ.get('PYFLOW_CKPT_STEP', '').strip()
+    if _ckpt_step_env:
+        ckpt_step = max(1, int(_ckpt_step_env))
+        print(f"        ckpt_step={ckpt_step} (manual)")
+    else:
+        ckpt_step = min(40, int(np.sqrt(qmax)))
+        print(f"        ckpt_step={ckpt_step} (auto, min(40, sqrt(qmax)))")
+
+    # Checkpoints: list of (step_idx, H2_torch_f32_on_device, Hint_torch_f32_on_device)
+    checkpoints = []
+    checkpoints.append((0,
+        curr_H2.detach().clone(),
+        curr_Hint.detach().clone()))
+    t_part2_ckpt_s = (time.perf_counter() - t_part2_start) if timing_enabled else np.nan
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Part 3: Forward integration
+    # ═══════════════════════════════════════════════════════════════════
+    print('Part 3: Forward integration')
+    t_forward_start = time.perf_counter() if timing_enabled else None
+
+    k = 1
+    J0 = 1.0
+    n2 = n**2
+
+    # Optional: reduce expensive CPU-sync convergence checks by checking every N steps.
+    conv_check_step = max(1, int(os.environ.get("PYFLOW_TORCH_CONV_CHECK_STEP", "1")))
+
+    # Closure capturing loop-invariant n, ex_mask, no_mask for torchdiffeq
+    def _ode_fn(t, y):
+        return _int_ode_torch_fn(t, y, n, ex_mask, no_mask)
+
+    t_span = torch.empty(2, dtype=torch.float32, device=device)
+    y0_flat = torch.empty(n**2 + n**4, dtype=torch.float32, device=device)
+
+    while k < len(dl_list) and J0 > cutoff:
+        t_span[0] = float(dl_list[k - 1])
+        t_span[1] = float(dl_list[k])
+        _pack_state_torch(y0_flat, curr_H2, curr_Hint, n2)
+
+        soln    = torch_odeint(_ode_fn, y0_flat, t_span, rtol=_rtol, atol=_atol, method='dopri5')
+        curr_H2   = soln[-1][:n2].reshape(n, n).detach().clone()
+        curr_Hint = soln[-1][n2:].reshape(n, n, n, n).detach().clone()
+        del soln
+
+        if k % ckpt_step == 0:
+            checkpoints.append((k,
+                curr_H2.detach().clone(),
+                curr_Hint.detach().clone()))
+
+        if (k % conv_check_step == 0) or (k == len(dl_list) - 1):
+            J0 = float(torch.max(torch.abs(curr_H2 - torch.diag(torch.diag(curr_H2)))))
+
+        if k % 100 == 0:
+            print(f"        Step {k}/{len(dl_list)} | l={dl_list[k]:.4f} | off-diag={J0:.2e} | ckpts={len(checkpoints)}", flush=True)
+
+        # if k % 10 == 0:
+        #     memlog("flow:step", step=k, mode="torch_ckpt")
+        k += 1
+
+    # Save final state if not already on a checkpoint boundary
+    if (k - 1) % ckpt_step != 0:
+        checkpoints.append((k - 1,
+            curr_H2.detach().clone(),
+            curr_Hint.detach().clone()))
+    checkpoints_count = len(checkpoints)
+
+    print(f"        Forward pass converged at step {k-1}, off-diag={J0:.2e}, total checkpoints: {checkpoints_count}")
+    t_forward_diag_s = (time.perf_counter() - t_forward_start) if timing_enabled else np.nan
+
+    # Optional fast-exit: reached max allowed steps and still not converged.
+    hit_step_limit_unconverged = (k >= len(dl_list)) and (J0 > cutoff)
+    if skip_unconverged and hit_step_limit_unconverged:
+        output = {
+            "_skip_instance": True,
+            "_skip_reason": "max_steps_reached_unconverged",
+            "steps_evolved": int(max(k - 1, 0)),
+            "H2_offdiag_max": float(J0),
+            "cutoff": float(cutoff),
+            "dl_list": np.array(dl_list[:k]),
+            "ckpt_step": int(ckpt_step),
+            "checkpoints_count": int(checkpoints_count),
+        }
+        if timing_enabled:
+            output["_timing"] = {
+                "part1_init_s": float(t_part1_init_s),
+                "part2_ckpt_s": float(t_part2_ckpt_s),
+                "part3_forward_diag_s": float(t_forward_diag_s),
+            }
+        return output
+
+    # Truncate flow-time grid to actual convergence point
+    dl_list_final = dl_list[:k]
+    del dl_list
+
+    # ─── lbits ───────────────────────────────────────────────────────
+    # Density-density interactions HFint[i,j] = Hint[i,i,j,j] - Hint[i,j,j,i]
+    idx   = torch.arange(n, device=device)
+    HFint = curr_Hint[idx[:, None], idx[:, None], idx[None, :], idx[None, :]] \
+          - curr_Hint[idx[:, None], idx[None, :], idx[None, :], idx[:, None]]
+    HFint_np = HFint.detach().cpu().numpy()
+    lbits = np.zeros(n - 1, dtype=np.float32)
+    for q in range(1, n):
+        vals = (np.diag(HFint_np, q) + np.diag(HFint_np, -q)) / 2.0
+        lbits[q - 1] = float(np.median(np.log10(np.abs(vals) + 1e-30)))
+    del HFint, HFint_np
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Part 4: Backward LIOM integration (segment-by-segment recompute)
+    # ═══════════════════════════════════════════════════════════════════
+    print('Part 4: Backward LIOM integration')
+    t_backward_start = time.perf_counter() if timing_enabled else None
+
+    num_segments = len(checkpoints) - 1
+    print(f"        {num_segments} segments to process")
+
+    t_span_seg = torch.empty(2, dtype=torch.float32, device=device)
+    y0_flat_seg = torch.empty(n**2 + n**4, dtype=torch.float32, device=device)
+
+    for i in range(num_segments, 0, -1):
+        start_step_idx = checkpoints[i - 1][0]
+        end_step_idx   = checkpoints[i][0]
+        segment_len    = end_step_idx - start_step_idx
+        
+        if i % 10 == 0 or i == 1:
+            print(f"        Segment {i}/{num_segments} (steps {start_step_idx}-{end_step_idx})", flush=True)
+
+        # Restore segment start from checkpoint
+        temp_H2   = checkpoints[i - 1][1].detach().clone()
+        temp_Hint = checkpoints[i - 1][2].detach().clone()
+
+        # Recompute forward trajectory for this segment → dense buffer
+        seg_sol2 = [None] * segment_len
+        seg_sol4 = [None] * segment_len
+
+        for curr_step in range(start_step_idx, end_step_idx):
+            local_idx = curr_step - start_step_idx
+            seg_sol2[local_idx] = temp_H2
+            seg_sol4[local_idx] = temp_Hint
+            t_span_seg[0] = float(dl_list_final[curr_step])
+            t_span_seg[1] = float(dl_list_final[curr_step + 1])
+            _pack_state_torch(y0_flat_seg, temp_H2, temp_Hint, n2)
+            
+            soln    = torch_odeint(_ode_fn, y0_flat_seg, t_span_seg, rtol=_rtol, atol=_atol, method='dopri5')
+
+            temp_H2   = soln[-1][:n2].reshape(n, n)
+            temp_Hint = soln[-1][n2:].reshape(n, n, n, n)
+            
+            del soln
+
+        del temp_H2, temp_Hint
+
+        # Backward LIOM Euler steps: time flows from large l → small l (dl < 0)
+        for local_idx in range(segment_len - 1, -1, -1):
+            global_step = start_step_idx + local_idx
+            dl = float(dl_list_final[global_step] - dl_list_final[global_step + 1])  # negative
+            init_liom2, init_liom4 = _update_torch(
+                init_liom2, init_liom4,
+                seg_sol2[local_idx], seg_sol4[local_idx],
+                dl, ex_mask, no_mask)
+
+        del seg_sol2, seg_sol4
+        checkpoints[i] = None
+
+    t_backward_liom_s = (time.perf_counter() - t_backward_start) if timing_enabled else np.nan
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Output (same schema as flow_static_int_ckpt_liubo)
+    # ═══════════════════════════════════════════════════════════════════
+    h0_diag_np = curr_H2.detach().cpu().numpy()
+    hint_np = curr_Hint.detach().cpu().numpy()
+    liom2_np = init_liom2.detach().cpu().numpy()
+    liom4_np = init_liom4.detach().cpu().numpy()
+
+    output = {
+        "H0_diag":           h0_diag_np,
+        "Hint":              hint_np,
+        "LIOM Interactions": lbits,
+        "LIOM2":             liom2_np,
+        "LIOM4":             liom4_np,
+        "LIOM2_FWD":         liom2_np,
+        "LIOM4_FWD":         liom4_np,
+        "Invariant":         0,
+        "dl_list":           np.array(dl_list_final),
+        "ckpt_step":         int(ckpt_step),
+        "checkpoints_count": int(checkpoints_count),
+        "truncation_err":    np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float64),
     }
 
     if timing_enabled:

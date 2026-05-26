@@ -26,11 +26,11 @@ def make_dl_list(lmax: float, qmax: int) -> np.ndarray:
 
 
 if __name__ == "__main__":
-    L = 4
+    L = 2
     dim = 2
     n = L ** dim
     qmax = 10000
-    lmax = 100.0
+    lmax = 1000.0
     cutoff = 1e-3
     method = "tensordot"
     dis = 5.0
