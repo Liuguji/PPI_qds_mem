@@ -160,7 +160,7 @@ def Hinit(n,d,J,dis_type,x=0,pwrhop=False,alpha=0,Fourier=False,dim=1):
 
     # Initialise V0 with nearest-neighbour hopping
     if pwrhop == False and dim ==1:
-        V0 = np.diag(J*np.ones(n-1,dtype=np.float32),1) + np.diag(J*np.ones(n-1,dtype=np.float32),-1)
+        V0 = np.diag(J*np.ones(n-1,dtype=np.float64),1) + np.diag(J*np.ones(n-1,dtype=np.float64),-1)
     elif pwrhop == False and dim == 2:
         # np.int was removed in NumPy>=2.0; use builtin int.
         L = int(np.sqrt(n))
@@ -189,7 +189,7 @@ def Hinit(n,d,J,dis_type,x=0,pwrhop=False,alpha=0,Fourier=False,dim=1):
 
 def Hint_init(n,delta,pwrint=False,beta=0,dim=1,U=0):
     # Interaction tensors
-    Hint = np.zeros((n,n,n,n),dtype=np.float32)
+    Hint = np.zeros((n,n,n,n),dtype=np.float64)
 
     if dim == 2:
         L = int(np.sqrt(n))
@@ -221,7 +221,7 @@ def Hint_init(n,delta,pwrint=False,beta=0,dim=1,U=0):
             Hint[j,j,i,i] = Hint[i,i,j,j]
 
     # Initialise off-diagonal quartic tensor (empty)
-    Vint = np.zeros((n,n,n,n),dtype=np.float32)
+    Vint = np.zeros((n,n,n,n),dtype=np.float64)
 
     return Hint+Vint
 
@@ -251,9 +251,9 @@ def H2_spin_init(n,d,J,dis_type,x=0,pwrhop=False,alpha=0,Fourier=False,dsymm='ch
 def H4_spin_init(n,delta_up=0,delta_down=0,delta_updown=0,delta_onsite=0,delta_mixed=0):
 
     # Interaction tensors
-    Hint_up = np.zeros((n,n,n,n),dtype=np.float32)
-    Hint_down = np.zeros((n,n,n,n),dtype=np.float32)
-    Hint_updown = np.zeros((n,n,n,n),dtype=np.float32)
+    Hint_up = np.zeros((n,n,n,n),dtype=np.float64)
+    Hint_down = np.zeros((n,n,n,n),dtype=np.float64)
+    Hint_updown = np.zeros((n,n,n,n),dtype=np.float64)
     for i in range(n):
         for j in range(n):
             if abs(i-j)==1:

@@ -28,37 +28,10 @@ flow_dyn_density = _mod.flow_dyn_density
 
 from datetime import datetime
 import json
+from params import PARAM_SETS
 
-# 数据输出根目录（GPU 模式下自动切换到 gpu_data_3）
-DATA_ROOT = REPO_ROOT / "test_density" / "data" / "data_2"
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  顶层参数组：{dim, L, dis_type, dis, J, delta, seed, lmax, qmax, cutoff}
-# ══════════════════════════════════════════════════════════════════════
-PARAM_SETS = [
-    # ──────── L=2 (n=4) ────────
-    {"dim": 2, "L": 2, "dis_type": "linear", "dis": 1.0,  "J": 1.0, "delta": 0.1, "seed": 42,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
-    {"dim": 2, "L": 2, "dis_type": "linear", "dis": 5.0,  "J": 1.0, "delta": 0.1, "seed": 43,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
-    {"dim": 2, "L": 2, "dis_type": "linear", "dis": 10.0, "J": 1.0, "delta": 0.1, "seed": 44,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
-
-    # ──────── L=3 (n=9) ────────
-    {"dim": 2, "L": 3, "dis_type": "linear", "dis": 1.0,  "J": 1.0, "delta": 0.1, "seed": 47,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
-    {"dim": 2, "L": 3, "dis_type": "linear", "dis": 2.0,  "J": 1.0, "delta": 0.1, "seed": 51,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
-    {"dim": 2, "L": 3, "dis_type": "linear", "dis": 5.0,  "J": 1.0, "delta": 0.1, "seed": 54,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
-    {"dim": 2, "L": 3, "dis_type": "linear", "dis": 10.0, "J": 1.0, "delta": 0.1, "seed": 55,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
-
-    # ──────── L=4 (n=16) ────────
-    {"dim": 2, "L": 4, "dis_type": "linear", "dis": 1.0,  "J": 1.0, "delta": 0.1, "seed": 48,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
-    {"dim": 2, "L": 4, "dis_type": "linear", "dis": 2.0,  "J": 1.0, "delta": 0.1, "seed": 57,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
-    {"dim": 2, "L": 4, "dis_type": "linear", "dis": 5.0,  "J": 1.0, "delta": 0.1, "seed": 60,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
-    {"dim": 2, "L": 4, "dis_type": "linear", "dis": 10.0, "J": 1.0, "delta": 0.1, "seed": 61,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
-
-    # ──────── L=5 (n=25) ────────
-    {"dim": 2, "L": 5, "dis_type": "linear", "dis": 1.0,  "J": 1.0, "delta": 0.1, "seed": 62,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
-    {"dim": 2, "L": 5, "dis_type": "linear", "dis": 2.0,  "J": 1.0, "delta": 0.1, "seed": 63,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
-    {"dim": 2, "L": 5, "dis_type": "linear", "dis": 5.0,  "J": 1.0, "delta": 0.1, "seed": 66,  "lmax": 100.0, "qmax": 2000, "cutoff": 1e-3},
-]
+# 数据输出根目录
+DATA_ROOT = REPO_ROOT / "test_density" / "datas_last" / "gpu_111"
 
 
 def make_dl_list(lmax: float, qmax: int) -> np.ndarray:
@@ -72,10 +45,9 @@ def set_switch_env(switch_num: int) -> None:
     os.environ["parallel_switch"]   = str((switch_num // 100) % 10)
     os.environ["compress_switch"]   = str((switch_num // 10) % 10)
     os.environ["checkpoint_switch"] = str(switch_num % 10)
-    os.environ["compress_mode"]     = "0"
     # 分支 111 仅 GPU 版本
     os.environ["PYFLOW_USE_TORCH"]  = "1"
-    os.environ["PYFLOW_GPU_ID"]     = "0"
+    os.environ["PYFLOW_GPU_ID"]     = "3"
 
 
 def fmt_bytes(b: int) -> str:
@@ -105,20 +77,21 @@ def run_single(config: dict, switch_num: int) -> dict:
     set_switch_env(switch_num)
     label = f"branch_{switch_num}"
     print(f"    [{label}] 运行中...", end=" ", flush=True)
-    t0 = time.perf_counter()
     res = flow_dyn_density(
         n, ham, num, num_int, dl_list, qmax, cutoff,
         tlist=tlist, state=None, method="tensordot",
     )
-    elapsed = time.perf_counter() - t0
+    elapsed = res.get("elapsed_s", -1.0)
     mem = int(res.get("peak_memory_bytes", -1))
     steps = int(res.get("steps_evolved", -1))
-    print(f"耗时={elapsed:.1f}s  内存峰值={fmt_bytes(mem)}  步数={steps}")
+    ckpt = int(res.get("ckpt_step", -1))
+    print(f"耗时={elapsed:.1f}s  内存峰值={fmt_bytes(mem)}  步数={steps}  ckpt_step={ckpt}")
 
     return {
         "elapsed_s": elapsed,
         "peak_memory_bytes": mem,
         "steps_evolved": steps,
+        "ckpt_step": ckpt,
     }
 
 
@@ -157,13 +130,7 @@ _RESULT_KEYS = ["dim", "L", "dis_type", "dis", "J", "delta", "seed", "lmax", "qm
 
 def get_result_dir(params: dict) -> Path:
     """根据参数 dict 计算对应的结果存储目录路径。"""
-    use_torch = os.environ.get("PYFLOW_USE_TORCH", "0")
-    if use_torch == "1":
-        base = REPO_ROOT / "test_density" / "data" / "gpu_data_3"
-    else:
-        base = DATA_ROOT
-    compress_mode = os.environ.get("compress_mode", "0")
-    dir_path = base / f"compress_mode_{compress_mode}"
+    dir_path = DATA_ROOT
     for key in _RESULT_KEYS:
         val = params[key]
         if isinstance(val, float):
@@ -205,6 +172,7 @@ def save_result(result: dict, timestamp: str):
             "elapsed_s": result["branch_111"]["elapsed_s"],
             "peak_memory_bytes": result["branch_111"]["peak_memory_bytes"],
             "steps_evolved": result["branch_111"]["steps_evolved"],
+            "ckpt_step": result["branch_111"]["ckpt_step"],
         },
         "timestamp": timestamp,
     }

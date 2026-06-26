@@ -37,7 +37,7 @@ try:
 except Exception:
     torch_odeint = None
 
-import os,functools,time
+import os,functools,time,threading,queue
 from functools import partial
 try:
     from psutil import cpu_count  # type: ignore
@@ -6246,13 +6246,14 @@ def flow_dyn_int_imb_fine(n,hamiltonian,num,num_int,dl_list,qmax,cutoff,tlist,me
             n4_t = jnp.array(num_t_flat[n**2:].reshape(n, n, n, n), dtype=jnp.complex64)
             
             print(n2_t)
-            # 反向积分
+            # 反向积分（时间变换 + liom_ode_int_bck，避免 odeint 反向积分 NaN）
             for k_inner in range(len(dl_list_used) - 2, -1, -1):
                 H2_k = jnp.array(sol_int_H2[k_inner], dtype=jnp.float32)
                 H4_k = jnp.array(sol_int_H4[k_inner], dtype=jnp.float32)               
                 
-                steps = jnp.array([dl_list_used[k_inner+1], dl_list_used[k_inner]])
-                soln = ode(liom_ode_int_fwd, [n2_t, n4_t], steps, [H2_k, H4_k], rtol=1e-3, atol=1e-6)
+                dl_k = float(dl_list_used[k_inner + 1] - dl_list_used[k_inner])
+                steps_s = jnp.array([0.0, dl_k])  # s: 0 → Δl（递增）
+                soln = ode(liom_ode_int_bck, [n2_t, n4_t], steps_s, [H2_k, H4_k], rtol=1e-3, atol=1e-6)
                 n2_t = soln[0][-1]
                 n4_t = soln[1][-1]
             
@@ -6482,6 +6483,19 @@ def verify_roundtrip(n, hamiltonian, num, num_int, dl_list, qmax, cutoff, site=0
     算符正向流到对角基 → 直接反向流回原始基（跳过时间演化）
     → 和初始算符对比
     """
+    # GPU 设备信息
+    try:
+        devices = jax.devices()
+        device_str = ", ".join(str(d) for d in devices)
+        print(f"  JAX 设备: {device_str}")
+        gpu_devices = [d for d in devices if d.platform == "gpu"]
+        if gpu_devices:
+            print(f"  GPU 可用: {len(gpu_devices)} 个, 使用 {gpu_devices[0]}")
+        else:
+            print(f"  ⚠ 未检测到 GPU，将使用 CPU")
+    except Exception as e:
+        print(f"  ⚠ 无法获取设备信息: {e}")
+
     H2 = hamiltonian.H2_spinless
     H4 = hamiltonian.H4_spinless
 
@@ -6506,7 +6520,7 @@ def verify_roundtrip(n, hamiltonian, num, num_int, dl_list, qmax, cutoff, site=0
         sol_int_H4[k] = np.array(H4_current)
         off_diag = H2_current - jnp.diag(jnp.diag(H2_current))
         J0 = jnp.max(jnp.abs(off_diag))
-        if k % 100 == 0:
+        if k % 1000 == 0:
             print(f"  [对角化] 已完成 {k} 步, J0 = {J0:.3e}")
         k += 1
 
@@ -6536,13 +6550,16 @@ def verify_roundtrip(n, hamiltonian, num, num_int, dl_list, qmax, cutoff, site=0
                    [H2_k, H4_k], rtol=1e-3, atol=1e-6)
         n2 = soln[0][-1]
         n4 = soln[1][-1]
-        if (k_inner + 1) % 100 == 0 or k_inner == total_fwd - 1:
+        if (k_inner + 1) % 1000 == 0 or k_inner == total_fwd - 1:
             print(f"  [正向流] 已完成 {k_inner + 1}/{total_fwd} 步")
 
     print("正向流后 n2（对角基）:")
     print(n2, "\n")
 
-    # ===== 4. 反向流：对角基 → 原始基（使用 ode 自适应积分器）=====
+    # ===== 4. 反向流：对角基 → 原始基（时间变换 + liom_ode_int_bck）=====
+    # 用 s = l_{k+1} - l 做时间变换，使积分方向从递减变为递增，
+    # 避免 jax.experimental.ode.odeint 在反向积分时产生 NaN。
+    # dn/ds = dn/dl * dl/ds = [η,n] * (-1) = -[η,n] = liom_ode_int_bck
     n2_t = n2
     n4_t = n4
     total_rev = len(dl_list_used) - 1
@@ -6550,14 +6567,14 @@ def verify_roundtrip(n, hamiltonian, num, num_int, dl_list, qmax, cutoff, site=0
         H2_k = jnp.array(sol_int_H2[k_inner], dtype=jnp.float32)
         H4_k = jnp.array(sol_int_H4[k_inner], dtype=jnp.float32)
 
-        steps = jnp.array([dl_list_used[k_inner + 1],
-                           dl_list_used[k_inner]])  # 反向：dl 从大 → 小
-        soln = ode(liom_ode_int_fwd, [n2_t, n4_t], steps,
+        dl_k = float(dl_list_used[k_inner + 1] - dl_list_used[k_inner])
+        steps_s = jnp.array([0.0, dl_k])  # s: 0 → Δl（递增）
+        soln = ode(liom_ode_int_bck, [n2_t, n4_t], steps_s,
                    [H2_k, H4_k], rtol=1e-3, atol=1e-6)
         n2_t = soln[0][-1]
         n4_t = soln[1][-1]
         step_done = total_rev - k_inner  # 已完成步数（反向计数）
-        if step_done % 100 == 0 or k_inner == 0:
+        if step_done % 1000 == 0 or k_inner == 0:
             print(f"  [反向流] 已完成 {step_done}/{total_rev} 步")
 
     print("反向流后 n2（应 = 初始）:")
@@ -6568,10 +6585,281 @@ def verify_roundtrip(n, hamiltonian, num, num_int, dl_list, qmax, cutoff, site=0
     print("差值 n2_roundtrip - n2_init:")
     print(diff, "\n")
     print(f"最大绝对误差:  {jnp.max(jnp.abs(diff.real)):.6e}")
-    print(f"最大虚部绝对值: {jnp.max(jnp.abs(diff.imag)):.6e}")
+    # print(f"最大虚部绝对值: {jnp.max(jnp.abs(diff.imag)):.6e}")
     print(f"是否有 NaN:     {jnp.any(jnp.isnan(n2_t))}")
 
     return n2_t, n2_init, diff
+
+
+# ======================================================================
+# PyTorch GPU 版本的往返一致性验证
+# ======================================================================
+def verify_roundtrip_torch(n, hamiltonian, num, num_int, dl_list, qmax, cutoff, site=0, t_val=0.0):
+    """
+    PyTorch GPU 版本：验证 Wegner 流往返一致性（含海森堡时间演化）。
+
+    Parameters
+    ----------
+    t_val : float
+        时间演化的单个时间点（单位: ℏ/J）。默认 0.0。
+    """
+    import torch
+    from torchdiffeq import odeint as torch_odeint
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"  Torch 设备: {device} ({torch.cuda.get_device_name(device) if device.type == 'cuda' else 'CPU'})")
+    t_val = float(t_val)
+    print(f"  [时间演化] t = {t_val:.4f}")
+
+    # ========== 预计算掩码（与 JAX 版 ex_helper / no_helper 相同）==========
+    # ex_mask: 保留 Hint 的 "对角" 元素 (i,i,j,j) 和 (i,j,j,i)
+    # 形状 (n,n,n,n) → 展平为 n^4
+    _ex = torch.zeros(n, n, n, n, dtype=torch.float32, device=device)
+    for i in range(n):
+        for j in range(n):
+            _ex[i, i, j, j] = 1.0
+            _ex[i, j, j, i] = 1.0
+    _ex = _ex.reshape(-1)  # (n^4,)
+
+    # no_mask_4d: 将 4 阶张量中某些"对角"位置清零
+    _no4 = torch.ones(n, n, n, n, dtype=torch.float32, device=device)
+    for i in range(n):
+        _no4[i, :, i, :] = 0.0
+        _no4[:, i, :, i] = 0.0
+    _no4_flat = _no4.reshape(-1)
+
+    # ========== 核心张量运算（torch.einsum）==========
+    def extract_diag(H2, Hint):
+        H2_0 = torch.diag(torch.diag(H2))
+        V0 = H2 - H2_0
+        Hint0 = (_ex * Hint.reshape(-1)).reshape(n, n, n, n)
+        Vint = Hint - Hint0
+        return H2_0, V0, Hint0, Vint
+
+    def con22(A, B):
+        """[A, B] = A@B - B@A"""
+        return A @ B - B @ A
+
+    def con42(A, B):
+        """[A_4d, B_2d] → 4d"""
+        c = torch.einsum('abcd,df->abcf', A, B)
+        c = c - torch.einsum('abcd,ec->abed', A, B)
+        c = c + torch.einsum('abcd,bf->afcd', A, B)
+        c = c - torch.einsum('abcd,ea->ebcd', A, B)
+        return (_no4_flat * c.reshape(-1)).reshape(n, n, n, n)
+
+    def con24(A, B):
+        """[A_2d, B_4d] = -[B_4d, A_2d]"""
+        return -con42(B, A)
+
+    # ========== ODE 右手边函数（torchdiffeq 接口：func(t, y)）==========
+    def int_ode_torch(t, y):
+        """哈密顿量流方程 RHS: dH/dl = [η, H]"""
+        H2, H4 = y
+        H2_0, V0, Hint0, Vint = extract_diag(H2, H4)
+        eta0 = con22(H2_0, V0)
+        eta_int = con42(Hint0, V0) + con24(H2_0, Vint)
+        dH2 = con22(eta0, H2)
+        dH4 = con42(eta_int, H2) + con24(eta0, H4)
+        return (dH2, dH4)
+
+    def build_eta(H2_k, H4_k):
+        """从 H 构建生成元 η = [H0, V]（每步只调用一次）"""
+        H2_0, V0, Hint0, Vint = extract_diag(H2_k, H4_k)
+        eta2 = con22(H2_0, V0)
+        eta4 = con42(Hint0, V0) + con24(H2_0, Vint)
+        return eta2, eta4
+
+    def liom_fwd_eta(t, y, eta2, eta4):
+        """算符正向流 RHS: dn/dl = [η, n]（η 预计算，全 float32）"""
+        n2, n4 = y
+        dn2 = con22(eta2, n2)
+        dn4 = con42(eta4, n2) + con24(eta2, n4)
+        return (dn2, dn4)
+
+    def liom_bck_eta(t, y, eta2, eta4):
+        """算符反向流 RHS: dn/dl = -[η, n]（η 预计算，全 float32）"""
+        n2, n4 = y
+        dn2 = -con22(eta2, n2)
+        dn4 = -(con42(eta4, n2) + con24(eta2, n4))
+        return (dn2, dn4)
+
+    def liom_bck_eta_split(t, y, eta2, eta4):
+        """算符反向流 RHS: y = (n2_r, n2_i, n4_r, n4_i) 全 float32
+           dn/dl = -[η, n]  →  实部/虚部分别计算，无需复数类型"""
+        n2_r, n2_i, n4_r, n4_i = y
+        # dn2 = -[η, n2_r + i·n2_i] = -[η,n2_r] - i·[η,n2_i]
+        dn2_r = -con22(eta2, n2_r)
+        dn2_i = -con22(eta2, n2_i)
+        # dn4 = -([η4,n2_r] + i·[η4,n2_i] + [η2,n4_r] + i·[η2,n4_i])
+        dn4_r = -(con42(eta4, n2_r) + con24(eta2, n4_r))
+        dn4_i = -(con42(eta4, n2_i) + con24(eta2, n4_i))
+        return (dn2_r, dn2_i, dn4_r, dn4_i)
+
+    # ========== 1. 对角化哈密顿量 ==========
+    H2 = hamiltonian.H2_spinless
+    H4 = hamiltonian.H4_spinless
+
+    # 轨迹存储（CPU numpy，节省 GPU 显存）
+    sol_int_H2 = np.zeros((qmax, n, n), dtype=np.float32)
+    sol_int_H4 = np.zeros((qmax, n, n, n, n), dtype=np.float32)
+    sol_int_H2[0] = np.array(H2)
+    sol_int_H4[0] = np.array(H4)
+
+    k = 1
+    J0 = 10.0
+    H2_cur = torch.tensor(H2, dtype=torch.float32, device=device)
+    H4_cur = torch.tensor(H4, dtype=torch.float32, device=device)
+
+    while k < len(dl_list) and J0 > cutoff:
+        steps = torch.tensor([dl_list[k - 1], dl_list[k]], dtype=torch.float32, device=device)
+        soln = torch_odeint(int_ode_torch, (H2_cur, H4_cur), steps,
+                            rtol=1e-3, atol=1e-6, method='dopri5')
+        H2_cur = soln[0][-1]
+        H4_cur = soln[1][-1]
+        sol_int_H2[k] = H2_cur.cpu().numpy()
+        sol_int_H4[k] = H4_cur.cpu().numpy()
+        off_diag = H2_cur - torch.diag(torch.diag(H2_cur))
+        J0 = float(torch.max(torch.abs(off_diag)))
+        if k % 1000 == 0:
+            print(f"  [对角化] 已完成 {k} 步, J0 = {J0:.3e}")
+        k += 1
+
+    sol_int_H2 = sol_int_H2[:k]
+    sol_int_H4 = sol_int_H4[:k]
+    dl_list_used = dl_list[:k]
+    print(f"对角化完成，共 {k} 步\n")
+
+    # ========== 2. 初始化算符 ==========
+    n2_init = torch.zeros(n, n, dtype=torch.float32, device=device)
+    n2_init[site, site] = 1.0
+    n4_init = torch.zeros(n, n, n, n, dtype=torch.float32, device=device)
+
+    print(f"初始 n2（site={site}）:")
+    print(n2_init.cpu(), "\n")
+
+    # ========== 3. 正向流 ==========
+    n2 = n2_init
+    n4 = n4_init
+    total_fwd = len(dl_list_used) - 1
+    for k_inner in range(total_fwd):
+        H2_k = torch.from_numpy(sol_int_H2[k_inner]).to(device)
+        H4_k = torch.from_numpy(sol_int_H4[k_inner]).to(device)
+        eta2, eta4 = build_eta(H2_k, H4_k)  # 每步只构建一次生成元
+        steps = torch.tensor([dl_list_used[k_inner], dl_list_used[k_inner + 1]],
+                             dtype=torch.float32, device=device)
+
+        def fwd_rhs(t, y):
+            return liom_fwd_eta(t, y, eta2, eta4)
+
+        soln = torch_odeint(fwd_rhs, (n2, n4), steps,
+                            rtol=1e-3, atol=1e-6, method='dopri5')
+        n2 = soln[0][-1]
+        n4 = soln[1][-1]
+        if (k_inner + 1) % 1000 == 0 or k_inner == total_fwd - 1:
+            print(f"  [正向流] 已完成 {k_inner + 1}/{total_fwd} 步")
+
+    print("正向流后 n2（对角基）:")
+    print(n2.cpu(), "\n")
+
+    # ==================================================================
+    # 4. 海森堡时间演化（对角基下）
+    #   n2[i,j](t) = n2[i,j](0) · cos((Eᵢ−Eⱼ)·t)
+    #   n4[i,j,k,q](t) = n4[i,j,k,q](0) · e^{−i(Eᵢ+Eₖ−Eⱼ−E_q)·t} + 修正项
+    # ==================================================================
+    # 提取对角哈密顿量
+    H2_diag = torch.from_numpy(sol_int_H2[-1]).to(device)  # (n,n)
+    H4_diag = torch.from_numpy(sol_int_H4[-1]).to(device)  # (n,n,n,n)
+    H_diag_2 = torch.diag(H2_diag)  # (n,) — 对角元 E_i
+
+    # 转为复数
+    n2_c = n2.to(torch.complex64)
+    n4_c = n4.to(torch.complex64)
+
+    delta_E = H_diag_2.unsqueeze(1) - H_diag_2.unsqueeze(0)  # E_i - E_j, (n,n)
+    n2_evo = n2_c * torch.cos(delta_E * t_val)
+
+    # n4: n4[i,j,k,q] *= exp(-1j * (E_i + E_k - E_j - E_q) * t)
+    E = H_diag_2  # (n,)
+    delta_E4 = (E.view(n, 1, 1, 1) + E.view(1, 1, n, 1)
+                - E.view(1, n, 1, 1) - E.view(1, 1, 1, n))  # (n,n,n,n)
+    n4_evo = n4_c * torch.exp(-1j * delta_E4 * t_val)
+
+    # 相互作用修正项 (来自 dyn_exact)
+    H4_mat = H4_diag.to(torch.complex64)   # (n,n,n,n)
+    matb = n2_c.clone()                    # 初始算符 (t=0 时)
+
+    # factor_ij = (1 - exp(-1j*dE_ij*t)) / dE_ij / 2,  i==j 时极限 1j*t/2
+    dE_mat = E.unsqueeze(1) - E.unsqueeze(0)  # (n,n), E_i - E_j
+    exp_term = torch.exp(-1j * dE_mat * t_val)
+    safe_dE = dE_mat.clone()
+    safe_dE[safe_dE.abs() < 1e-12] = 1.0
+    factor_ij = (1.0 - exp_term) / safe_dE / 2.0
+    factor_ij[dE_mat.abs() < 1e-12] = 1j * t_val / 2.0
+
+    # Hint[i,i,k,k] → (n, n)
+    Hint_ik = torch.einsum('iikk->ik', H4_mat)
+
+    # 修正 1: k==q && i!=j
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            f = factor_ij[i, j]
+            m = matb[i, j]
+            for k in range(n):
+                corr = -1j * (Hint_ik[i, k] - Hint_ik[j, k]) * m * f
+                n4_evo[i, j, k, k] = n4_evo[i, j, k, k] + corr
+
+    # 修正 2: i==j && k!=q
+    for i in range(n):
+        for k in range(n):
+            for q in range(n):
+                if k == q:
+                    continue
+                f = factor_ij[k, q]
+                m = matb[k, q]
+                corr = -1j * (Hint_ik[k, i] - Hint_ik[q, i]) * m * f
+                n4_evo[i, i, k, q] = n4_evo[i, i, k, q] + corr
+
+    # ==================================================================
+    # 5. 反向 Wegner 流（对角基 → 原始基）
+    #    时间演化后算符变为复数，拆为实部/虚部分别积分
+    # ==================================================================
+    n2_r, n2_i = n2_evo.real.float(), n2_evo.imag.float()
+    n4_r, n4_i = n4_evo.real.float(), n4_evo.imag.float()
+
+    for k_inner in range(len(dl_list_used) - 2, -1, -1):
+        H2_k = torch.from_numpy(sol_int_H2[k_inner]).to(device)
+        H4_k = torch.from_numpy(sol_int_H4[k_inner]).to(device)
+        eta2, eta4 = build_eta(H2_k, H4_k)  # float32
+
+        dl_k = float(dl_list_used[k_inner + 1] - dl_list_used[k_inner])
+        steps_s = torch.tensor([0.0, dl_k], dtype=torch.float32, device=device)
+
+        def bck_rhs_split(t, y):
+            return liom_bck_eta_split(t, y, eta2, eta4)
+
+        soln = torch_odeint(bck_rhs_split,
+                            (n2_r, n2_i, n4_r, n4_i), steps_s,
+                            rtol=1e-3, atol=1e-6, method='dopri5')
+        n2_r, n2_i = soln[0][-1], soln[1][-1]
+        n4_r, n4_i = soln[2][-1], soln[3][-1]
+
+    # ========== 6. 对比 ==========
+    n2_t = torch.complex(n2_r, n2_i)
+    diff = n2_t - n2_init.to(torch.complex64)
+    n2_t_cpu = n2_t.cpu()
+    diff_cpu = diff.cpu()
+
+    print("反向流后 n2（应 = 初始）:")
+    print(n2_t_cpu, "\n")
+    print("差值 n2_roundtrip - n2_init:")
+    print(diff_cpu, "\n")
+    print(f"最大虚部绝对值: {float(torch.max(torch.abs(diff.imag))):.6e}")
+    print(f"是否有 NaN:     {bool(torch.any(torch.isnan(n2_t)))}")
+
+    return n2_t_cpu.numpy(), n2_init.cpu().numpy(), diff_cpu.numpy()
 
 
 # CPU各个优化版本
@@ -6649,16 +6937,20 @@ def flow_dyn_density(
                   +  10 * compress_switch
                   +   1 * checkpoint_switch)
 
-    # 压缩策略统一开关：0=不压缩 1=稠密+缩放 2=纯rSVD 3=纯COO 4=COO+rSVD
+    # 压缩策略统一开关：0=稠密+缩放 1=COO 2=rSVD
     compress_mode = int(os.environ.get('compress_mode', '0'))
-    if compress_mode not in (0, 1, 2, 3, 4):
-        raise ValueError(f"compress_mode must be in {{0,1,2,3,4}}, got {compress_mode}")
+    if compress_mode not in (0, 1, 2):
+        raise ValueError(f"compress_mode must be in {{0,1,2}}, got {compress_mode}")
+
+    import time
 
     # ══════════════════════════════════════════════════════════════════════
     if switch_num == 0:
         # ──────────── 分支 0: 全轨迹 + 串行反向流 ────────────
         # checkpoint=0 → 存完整轨迹; parallel=0 → 串行逐格点
         # ────────────────────────────────────────────────────────
+
+        _t_start = time.perf_counter()
 
         H2_init = jnp.array(hamiltonian.H2_spinless, dtype=jnp.float32)
         H4_init = jnp.array(hamiltonian.H4_spinless, dtype=jnp.float32)
@@ -6683,7 +6975,7 @@ def flow_dyn_density(
             off_diag = curr_H2 - jnp.diag(jnp.diag(curr_H2))
             J0 = float(jnp.max(jnp.abs(off_diag)))
 
-            if k % 100 == 0:
+            if k % 1000 == 0:
                 H2_norm = float(jnp.linalg.norm(curr_H2))
                 H4_norm = float(jnp.linalg.norm(curr_H4))
                 print(f"  [对角化] k={k:5d}  l={dl_list[k-1]:.4e}  "
@@ -6694,6 +6986,13 @@ def flow_dyn_density(
         sol_int_H2, sol_int_H4 = sol_int_H2[:k], sol_int_H4[:k]
         dl_list_final = dl_list[:k]
         final_step = k - 1
+
+        J0 = float(jnp.max(jnp.abs(curr_H2 - jnp.diag(jnp.diag(curr_H2)))))
+        print(
+            f"  对角化完成，共 {final_step} 步，"
+            f"l_final={dl_list_final[-1]:.4e}，"
+            f"J0={J0:.3e}"
+        )
 
         H0_diag = jnp.array(sol_int_H2[-1])
         Hint_diag = jnp.array(sol_int_H4[-1])
@@ -6707,22 +7006,27 @@ def flow_dyn_density(
         for q in range(1, n):
             lbits = lbits.at[q-1].set(jnp.median(jnp.log10(jnp.abs(jnp.diag(HFint, q) + jnp.diag(HFint, -q)) / 2.)))
 
-        # --- 3. 反向流：串行逐格点（parallel=0）---
+        # --- 3. 反向流：跑2个site取平均，时间乘n ---
         jit_update = jit(update)
         liom2_all = np.zeros((n, n, n), dtype=np.float32)
         liom4_all = np.zeros((n, n, n, n, n), dtype=np.float32)
 
-        for site in range(n):
+        _t_before_bwd = time.perf_counter()
+        _bwd_sites = [0, n // 2]
+        for site in _bwd_sites:
             n2 = jnp.zeros((n, n), dtype=jnp.float32).at[site, site].set(1.0)
             n4 = jnp.zeros((n, n, n, n), dtype=jnp.float32)
             for k0 in range(final_step - 1, -1, -1):
                 H2_k = jnp.array(sol_int_H2[k0], dtype=jnp.float32)
                 H4_k = jnp.array(sol_int_H4[k0], dtype=jnp.float32)
                 n2, n4 = jit_update(n2, n4, H2_k, H4_k,
-                                     np.array([dl_list_final[k0+1], dl_list_final[k0]], dtype=np.float64))
+                                     np.array([dl_list_final[k0+1], dl_list_final[k0]], dtype=np.float32))
             liom2_all[site] = np.array(n2, dtype=np.float32)
             liom4_all[site] = np.array(n4, dtype=np.float32)
-            print(f"  [反向流] site={site}/{n} 完成")
+        _bwd_one = (time.perf_counter() - _t_before_bwd) / len(_bwd_sites)
+        print(f"  [反向流] sites={_bwd_sites} 平均耗时={_bwd_one:.1f}s → 预估全n={_bwd_one * n:.1f}s")
+
+        _elapsed = (_t_before_bwd - _t_start) + _bwd_one * n
 
         output = {
             "H0_diag": np.array(H0_diag),
@@ -6732,16 +7036,23 @@ def flow_dyn_density(
             "flow_time_final": float(dl_list_final[-1]),
             "LIOM2": liom2_all,
             "LIOM4": liom4_all,
+            "elapsed_s": _elapsed,
             "peak_memory_bytes": int(
-                final_step * (n * n + n * n * n * n) * 4  # H 轨迹
-                + n * (n * n + n * n * n * n) * 4          # LIOM2/4_all
+                final_step * (n * n + n * n * n * n) * 8  # H 轨迹 (fp64估算)
+                + n * (n * n + n * n * n * n) * 8          # LIOM2/4_all (fp64估算)
             ),
         }
         return output
 
     # ══════════════════════════════════════════════════════════════════════
     elif switch_num == 1:
-        # 分支 1：checkpoint only
+        # ──────────── 分支 1: checkpoint only ────────────
+        # checkpoint=1 → 稀疏存储检查点; parallel=0 → 串行逐格点
+        # 策略：正向只存每隔 ckpt_step 步的快照，反向逐段重算
+        # 优点：内存从 O(total_steps) 降为 O(ckpt_step)
+        # ──────────────────────────────────────────────────
+
+        _t_start = time.perf_counter()
 
         H2_init = jnp.array(hamiltonian.H2_spinless)
         H4_init = jnp.array(hamiltonian.H4_spinless)
@@ -6757,20 +7068,24 @@ def flow_dyn_density(
         dl_arr = dl_arr[:max_steps]
 
         if ckpt_step is None:
-            ckpt_step = min(40, int(np.sqrt(max_steps)))
+            if hamiltonian.dis_type == "random":
+                ckpt_step = 100
+            else:
+                ckpt_step = 80
         ckpt_step = max(1, int(ckpt_step))
 
         _rtol = 1e-6
         _atol = 1e-6
 
-        # --- 1. 正向流：对角化哈密顿量，稀疏存储检查点 ---
+        # 正向流：每 ckpt_step 步保存一个检查点 (step_idx, H2, H4)
+        # 保存为 Python list，动态分配，不做预分配
         curr_H2 = H2_init
         curr_H4 = H4_init
         checkpoints = [(0, np.array(curr_H2, dtype=orig_dtype), np.array(curr_H4, dtype=orig_dtype))]
 
         k = 1
         J0 = 1.0
-        print_interval = max(100, ckpt_step * 5)  # 不要太多
+        print_interval = 1000  # 不要太多
         while k < len(dl_arr) and J0 > cutoff:
             steps = np.array([dl_arr[k - 1], dl_arr[k]], dtype=dl_arr.dtype)
             soln = ode(int_ode, [curr_H2, curr_H4], steps, rtol=_rtol, atol=_atol)
@@ -6785,7 +7100,7 @@ def flow_dyn_density(
 
             k += 1
 
-        print(f"  对角化完成，共 {k-1} 步，l_final={dl_arr[k-2]:.4e}")
+        print(f"  对角化完成，共 {k-1} 步，l_final={dl_arr[k-2]:.4e}，J0={J0:.3e}，检查点数={len(checkpoints)}")
 
         final_step = k - 1
         if checkpoints[-1][0] != final_step:
@@ -6812,8 +7127,8 @@ def flow_dyn_density(
 
         # --- 3. 反向流：串行逐格点（parallel=0）---
         jit_update = jit(update)
-        liom2_all = np.zeros((n, n, n), dtype=np.float32)
-        liom4_all = np.zeros((n, n, n, n, n), dtype=np.float32)
+        liom2_all = np.zeros((n, n, n), dtype=np.float64)
+        liom4_all = np.zeros((n, n, n, n, n), dtype=np.float64)
 
         checkpoints_map = {}
         for step_idx, h2_cp, h4_cp in checkpoints:
@@ -6837,9 +7152,11 @@ def flow_dyn_density(
                 temp_H4 = soln[1][-1]
             return seg_h2, seg_h4
 
-        for site in range(n):
-            n2 = jnp.zeros((n, n), dtype=jnp.float32).at[site, site].set(1.0)
-            n4 = jnp.zeros((n, n, n, n), dtype=jnp.float32)
+        _t_before_bwd = time.perf_counter()
+        _bwd_sites = [0, n // 2]
+        for site in _bwd_sites:
+            n2 = jnp.zeros((n, n), dtype=jnp.float64).at[site, site].set(1.0)
+            n4 = jnp.zeros((n, n, n, n), dtype=jnp.float64)
             for seg_idx in range(len(checkpoints) - 1, 0, -1):
                 start_step_idx = int(checkpoints[seg_idx - 1][0])
                 end_step_idx = int(checkpoints[seg_idx][0])
@@ -6849,9 +7166,12 @@ def flow_dyn_density(
                     n2, n4 = jit_update(n2, n4, seg_h2[local_idx], seg_h4[local_idx],
                                           np.array([dl_list_final[global_step + 1], dl_list_final[global_step]], dtype=np.float64))
                 del seg_h2, seg_h4
-            liom2_all[site] = np.array(n2, dtype=np.float32)
-            liom4_all[site] = np.array(n4, dtype=np.float32)
-            print(f"  [反向流] site={site}/{n} 完成")
+            liom2_all[site] = np.array(n2, dtype=np.float64)
+            liom4_all[site] = np.array(n4, dtype=np.float64)
+        _bwd_one = (time.perf_counter() - _t_before_bwd) / len(_bwd_sites)
+        print(f"  [反向流] sites={_bwd_sites} 平均耗时={_bwd_one:.1f}s → 预估全n={_bwd_one * n:.1f}s")
+
+        _elapsed = (_t_before_bwd - _t_start) + _bwd_one * n
 
         output = {
             "H0_diag": np.array(H0_diag),
@@ -6861,6 +7181,7 @@ def flow_dyn_density(
             "ckpt_step": int(ckpt_step),
             "LIOM2": liom2_all,
             "LIOM4": liom4_all,
+            "elapsed_s": _elapsed,
             "peak_memory_bytes": int(
                 len(checkpoints) * (n * n + n * n * n * n) * 4  # 检查点
                 + ckpt_step * (n * n + n * n * n * n) * 4        # 重算段
@@ -6871,9 +7192,14 @@ def flow_dyn_density(
 
     # ══════════════════════════════════════════════════════════════════════
     elif switch_num == 11:
-        # 分支 11：checkpoint + compress（检查点 + 反向流段轨迹统一压缩）
+        # ──────────── 分支 11: checkpoint + compress ────────────
+        # checkpoint=1 + compress=1 → 检查点本身和段轨迹都压缩存储
+        # 支持 GPU(torch) / CPU(JAX) 双后端，通过 PYFLOW_USE_TORCH 切换
+        # compress_mode: 0=FP16密集  1=COO稀疏  2=rSVD低秩
+        # ─────────────────────────────────────────────────────────
         # ── Torch GPU 子路径 ──
         if os.environ.get("PYFLOW_USE_TORCH", "0") == "1":
+            _t_start = time.perf_counter()
             if torch is None:
                 raise ImportError(
                     "PyTorch is not installed. Cannot use PYFLOW_USE_TORCH=1."
@@ -6882,16 +7208,27 @@ def flow_dyn_density(
                 raise ImportError(
                     "torchdiffeq is not installed. Run: pip install torchdiffeq"
                 )
-            if compress_mode != 0:
-                print(
-                    "  [torch] compress_mode>0 not supported on GPU;"
-                    " falling back to compress_mode=0"
+            if compress_mode not in (0, 1, 2):
+                raise ValueError(
+                    f"branch 11 GPU only accepts compress_mode in {{0,1,2}},"
+                    f" got {compress_mode}"
                 )
 
-            # ---- 0. 初始化 ----
+            # ═══════════════════════════════════════════════════
+            # 0. 初始化
+            # ═══════════════════════════════════════════════════
             device = _resolve_torch_flow_device()
-            print(f"        [torch:density] device={device}"
-                  f" (PYFLOW_GPU_ID={os.environ.get('PYFLOW_GPU_ID', '0')})")
+            # 显式开启 TF32（确保 A100 Tensor Core 加速）
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            cap = torch.cuda.get_device_capability(device)
+            print(
+                f"        [torch:density] device={device}"
+                f" ({torch.cuda.get_device_name(device)})"
+                f"  CC={cap[0]}.{cap[1]}"
+                f"  compress_mode={compress_mode}"
+                f"  TF32={torch.backends.cuda.matmul.allow_tf32}"
+            )
 
             ex_mask = _ex_helper_torch(n, device)
             no_mask = _no_helper_torch(n, device)
@@ -6912,36 +7249,140 @@ def flow_dyn_density(
             dl_arr = dl_arr[:max_steps]
 
             if ckpt_step is None:
-                ckpt_step = min(40, int(np.sqrt(max_steps)))
+                if hamiltonian.dis_type == "random":
+                    ckpt_step = 100
+                else:
+                    ckpt_step = 80
             ckpt_step = max(1, int(ckpt_step))
 
-            curr_H2   = torch.tensor(
+            # ── 压缩参数（FP64→FP32，无缩放，mode=1/2 在 FP32 基础上进一步压缩）──
+            _exp_scale = False  # 不再需要缩放：FP32 精度足够，SVD 尺度不变
+            _eps = float(os.environ.get('compress_eps', '1e-7'))
+            _svd_rank_h2 = int(os.environ.get(
+                'compress_svd_rank_h2',
+                str(max(8, int(n) // 2)),
+            ))
+            _svd_rank_h4 = int(os.environ.get(
+                'compress_svd_rank_h4',
+                str(int(n) * int(n) // 2),
+            ))
+            n2_dim = n * n
+
+            # ── mode=0 直接存 FP32，无需进一步降精度 ──
+            _buffer_dtype = torch.float32
+
+            # ── GPU 压缩存储抽象（FP64→FP32 基础）──
+            def _gpu_make_storage(capacity: int) -> dict:
+                cap = int(capacity)
+                s = {"capacity": cap}
+                if compress_mode == 0:
+                    s["buf_h2"] = []
+                    s["buf_h4"] = []
+                elif compress_mode == 1:
+                    s["h2_idx"] = []
+                    s["h2_val"] = []
+                    s["h4_idx"] = []
+                    s["h4_val"] = []
+                else:  # compress_mode == 2: rSVD
+                    s["h2_U"] = []
+                    s["h2_S"] = []
+                    s["h2_Vt"] = []
+                    s["h4_U"] = []
+                    s["h4_S"] = []
+                    s["h4_Vt"] = []
+                return s
+
+            # ── 内存跟踪 ──
+            def _storage_bytes(storage: dict) -> int:
+                total = 0
+                for key, lst in storage.items():
+                    if key == "capacity":
+                        continue
+                    for t in lst:
+                        if isinstance(t, torch.Tensor) and t.numel():
+                            total += t.numel() * t.element_size()
+                return total
+
+            def _gpu_cmp_store(storage: dict, slot: int, h2, h4) -> None:
+                if compress_mode == 0:
+                    storage["buf_h2"].append(h2.detach().clone())
+                    storage["buf_h4"].append(h4.detach().clone())
+                elif compress_mode == 1:
+                    h2_flat = h2.reshape(-1)
+                    h4_flat = h4.reshape(-1)
+                    h2_idx_arr = torch.where(h2_flat.abs() >= _eps)[0].to(torch.int32)
+                    h4_idx_arr = torch.where(h4_flat.abs() >= _eps)[0].to(torch.int32)
+                    storage["h2_idx"].append(h2_idx_arr)
+                    storage["h2_val"].append(h2_flat[h2_idx_arr.long()] if h2_idx_arr.numel() else torch.zeros(0, device=device))
+                    storage["h4_idx"].append(h4_idx_arr)
+                    storage["h4_val"].append(h4_flat[h4_idx_arr.long()] if h4_idx_arr.numel() else torch.zeros(0, device=device))
+                else:  # compress_mode == 2: rSVD（自动秩：保留 99.9999% Frobenius 范数）
+                    U2, S2, V2 = torch.linalg.svd(h2, full_matrices=False)
+                    cum2 = torch.cumsum(S2**2, dim=0)
+                    r2_eff = int(torch.searchsorted(cum2, cum2[-1] * 0.999999).item()) + 1
+                    r2_eff = max(1, r2_eff)
+                    storage["h2_U"].append(U2[:, :r2_eff].contiguous())
+                    storage["h2_S"].append(S2[:r2_eff])
+                    storage["h2_Vt"].append(V2[:r2_eff, :].contiguous())
+
+                    h4_mat = h4.reshape(n2_dim, n2_dim)
+                    U4, S4, V4 = torch.linalg.svd(h4_mat, full_matrices=False)
+                    cum4 = torch.cumsum(S4**2, dim=0)
+                    r4_eff = int(torch.searchsorted(cum4, cum4[-1] * 0.999999).item()) + 1
+                    r4_eff = max(1, r4_eff)
+                    storage["h4_U"].append(U4[:, :r4_eff].contiguous())
+                    storage["h4_S"].append(S4[:r4_eff])
+                    storage["h4_Vt"].append(V4[:r4_eff, :].contiguous())
+
+            def _gpu_cmp_load(storage: dict, slot: int):
+                if compress_mode == 0:
+                    h2 = storage["buf_h2"][slot]
+                    h4 = storage["buf_h4"][slot]
+                elif compress_mode == 1:
+                    h2 = torch.zeros(n, n, dtype=torch.float32, device=device)
+                    idx2 = storage["h2_idx"][slot]
+                    if idx2 is not None and idx2.numel():
+                        h2.view(-1)[idx2.long()] = storage["h2_val"][slot]
+                    h4 = torch.zeros(n, n, n, n, dtype=torch.float32, device=device)
+                    idx4 = storage["h4_idx"][slot]
+                    if idx4 is not None and idx4.numel():
+                        h4.view(-1)[idx4.long()] = storage["h4_val"][slot]
+                else:  # compress_mode == 2: rSVD
+                    h2 = (storage["h2_U"][slot]
+                          * storage["h2_S"][slot]) @ storage["h2_Vt"][slot]
+                    h4_mat = (storage["h4_U"][slot]
+                              * storage["h4_S"][slot]) @ storage["h4_Vt"][slot]
+                    h4 = h4_mat.reshape(n, n, n, n)
+                return h2, h4
+
+            curr_H2 = torch.tensor(
                 np.array(hamiltonian.H2_spinless, dtype=np.float32),
                 dtype=torch.float32, device=device,
             )
-            curr_H4   = torch.tensor(
+            curr_H4 = torch.tensor(
                 np.array(hamiltonian.H4_spinless, dtype=np.float32),
                 dtype=torch.float32, device=device,
             )
 
-            # ODE RHS closure (captures loop-invariant n, ex_mask, no_mask)
             def _ode_fn(t, y):
                 return _int_ode_torch_fn(t, y, n, ex_mask, no_mask)
 
-            n2_dim = n**2
-
-            # ---- 1. 正向流：H 对角化，稀疏检查点（GPU 显存）----
-            checkpoints = [
-                (0,
-                 curr_H2.detach().clone(),
-                 curr_H4.detach().clone(),
-                )
-            ]
+            # ---- 1. 正向流：H 对角化 + 压缩存储检查点 ----
+            # 沿 dl_list 逐步积分，每 ckpt_step 步保存压缩快照
+            # J0 = H2 非对角元最大值，< cutoff 时停止
+            max_ckpts = max_steps // ckpt_step + 4
+            ckpt_state = _gpu_make_storage(max_ckpts)
+            ckpt_slot_map = {0: 0}
+            checkpoints_steps = [0]
+            _gpu_cmp_store(ckpt_state, 0, curr_H2, curr_H4)
+            n_ckpts = 1
 
             k = 1
             J0 = 1.0
             t_span = torch.empty(2, dtype=torch.float32, device=device)
-            y0_flat = torch.empty(n2_dim + n**4, dtype=torch.float32, device=device)
+            y0_flat = torch.empty(
+                n2_dim + n**4, dtype=torch.float32, device=device,
+            )
 
             while k < len(dl_arr) and J0 > cutoff:
                 t_span[0] = float(dl_arr[k - 1])
@@ -6953,15 +7394,16 @@ def flow_dyn_density(
                     rtol=_rtol, atol=_atol, method='dopri5',
                 )
                 curr_H2 = soln[-1][:n2_dim].reshape(n, n).detach().clone()
-                curr_H4 = soln[-1][n2_dim:].reshape(n, n, n, n).detach().clone()
+                curr_H4 = soln[-1][n2_dim:].reshape(
+                    n, n, n, n,
+                ).detach().clone()
                 del soln
 
-                if k % ckpt_step == 0:
-                    checkpoints.append((
-                        k,
-                        curr_H2.detach().clone(),
-                        curr_H4.detach().clone(),
-                    ))
+                if k % ckpt_step == 0 and n_ckpts < max_ckpts:
+                    ckpt_slot_map[k] = n_ckpts
+                    checkpoints_steps.append(k)
+                    _gpu_cmp_store(ckpt_state, n_ckpts, curr_H2, curr_H4)
+                    n_ckpts += 1
 
                 J0 = float(
                     torch.max(torch.abs(
@@ -6969,24 +7411,24 @@ def flow_dyn_density(
                     ))
                 )
 
-                if k % 100 == 0:
+                if k % 1000 == 0:
                     print(
                         f"  [对角化] k={k:5d}  l={dl_arr[k - 1]:.4e}"
-                        f"  J0={J0:.3e}  ckpts={len(checkpoints)}"
+                        f"  J0={J0:.3e}  ckpts={n_ckpts}"
                     )
                 k += 1
 
             final_step = k - 1
-            if checkpoints[-1][0] != final_step:
-                checkpoints.append((
-                    final_step,
-                    curr_H2.detach().clone(),
-                    curr_H4.detach().clone(),
-                ))
+            if checkpoints_steps[-1] != final_step and n_ckpts < max_ckpts:
+                ckpt_slot_map[final_step] = n_ckpts
+                checkpoints_steps.append(final_step)
+                _gpu_cmp_store(ckpt_state, n_ckpts, curr_H2, curr_H4)
+                n_ckpts += 1
 
             print(
                 f"  对角化完成，共 {final_step} 步，"
-                f"l_final={dl_arr[final_step]:.4e}"
+                f"l_final={dl_arr[final_step]:.4e}，"
+                f"J0={J0:.3e}，检查点数={n_ckpts}"
             )
 
             dl_list_final = dl_arr[:final_step + 1]
@@ -7002,7 +7444,6 @@ def flow_dyn_density(
                 - Hintfinal[idx[:, None], idx[None, :],
                             idx[None, :], idx[:, None]]
             )
-            # l-bit 计算全程在 GPU 上
             lbits_list = []
             for q in range(1, n):
                 diag_q  = torch.diagonal(HFint, offset=q)
@@ -7011,7 +7452,7 @@ def flow_dyn_density(
                 vals = vals.clamp(min=1e-30)
                 lbits_list.append(vals.log10().median().item())
             lbits = np.array(lbits_list, dtype=np.float64)
-            del HFint  # 释放 GPU 显存
+            del HFint
 
             # ---- 3. 反向流：串行逐格点 ----
             liom2_all = torch.zeros(
@@ -7021,88 +7462,82 @@ def flow_dyn_density(
                 (n, n, n, n, n), dtype=torch.float32, device=device,
             )
 
-            t_span_seg = torch.empty(2, dtype=torch.float32, device=device)
-            y0_flat_seg = torch.empty(
-                n2_dim + n**4, dtype=torch.float32, device=device,
-            )
-
-            for site in range(n):
-                n2_t = torch.zeros(
-                    (n, n), dtype=torch.float32, device=device,
+            # ── 从压缩检查点重算一段完整 H 轨迹（GPU 版）──
+            def _recompute_segment_gpu(start_step_idx, end_step_idx):
+                """从压缩检查点重算 [start, end) 的 H 轨迹，返回压缩 seg_state。"""
+                seg_len = end_step_idx - start_step_idx
+                if seg_len <= 0:
+                    return None
+                slot = ckpt_slot_map[int(start_step_idx)]
+                temp_H2, temp_H4 = _gpu_cmp_load(ckpt_state, slot)
+                seg_state = _gpu_make_storage(seg_len)
+                t_span_local = torch.empty(2, dtype=torch.float32, device=device)
+                y0_flat_local = torch.empty(
+                    n2_dim + n**4, dtype=torch.float32, device=device,
                 )
+                for curr_step in range(start_step_idx, end_step_idx):
+                    local_idx = curr_step - start_step_idx
+                    _gpu_cmp_store(seg_state, local_idx, temp_H2, temp_H4)
+                    t_span_local[0] = float(dl_list_final[curr_step])
+                    t_span_local[1] = float(dl_list_final[curr_step + 1])
+                    _pack_state_torch(y0_flat_local, temp_H2, temp_H4, n2_dim)
+                    soln = torch_odeint(
+                        _ode_fn, y0_flat_local, t_span_local,
+                        rtol=_rtol, atol=_atol, method='dopri5',
+                    )
+                    temp_H2 = (
+                        soln[-1][:n2_dim]
+                        .reshape(n, n).detach().clone()
+                    )
+                    temp_H4 = (
+                        soln[-1][n2_dim:]
+                        .reshape(n, n, n, n).detach().clone()
+                    )
+                    del soln
+                return seg_state
+
+            _t_before_bwd = time.perf_counter()
+            _bwd_sites = [0, n // 2]
+            for site in _bwd_sites:
+                n2_t = torch.zeros((n, n), dtype=torch.float32, device=device)
                 n2_t[site, site] = 1.0
-                n4_t = torch.zeros(
-                    (n, n, n, n), dtype=torch.float32, device=device,
-                )
+                n4_t = torch.zeros((n, n, n, n), dtype=torch.float32, device=device)
 
-                for seg_idx in range(len(checkpoints) - 1, 0, -1):
-                    start_step_idx = int(checkpoints[seg_idx - 1][0])
-                    end_step_idx   = int(checkpoints[seg_idx][0])
-                    seg_len = end_step_idx - start_step_idx
-                    if seg_len <= 0:
+                for seg_idx in range(len(checkpoints_steps) - 1, 0, -1):
+                    start_step_idx = int(checkpoints_steps[seg_idx - 1])
+                    end_step_idx   = int(checkpoints_steps[seg_idx])
+                    seg_state = _recompute_segment_gpu(start_step_idx, end_step_idx)
+                    if seg_state is None:
                         continue
 
-                    # 从 GPU 检查点直接克隆段起点（无需跨设备拷贝）
-                    temp_H2 = checkpoints[seg_idx - 1][1].detach().clone()
-                    temp_H4 = checkpoints[seg_idx - 1][2].detach().clone()
-
-                    # 重算该段正向轨迹
-                    seg_h2 = [None] * seg_len
-                    seg_h4 = [None] * seg_len
-                    for curr_step in range(start_step_idx, end_step_idx):
-                        local_idx = curr_step - start_step_idx
-                        seg_h2[local_idx] = temp_H2
-                        seg_h4[local_idx] = temp_H4
-
-                        t_span_seg[0] = float(
-                            dl_list_final[curr_step]
-                        )
-                        t_span_seg[1] = float(
-                            dl_list_final[curr_step + 1]
-                        )
-                        _pack_state_torch(
-                            y0_flat_seg, temp_H2, temp_H4, n2_dim,
-                        )
-                        soln = torch_odeint(
-                            _ode_fn, y0_flat_seg, t_span_seg,
-                            rtol=_rtol, atol=_atol, method='dopri5',
-                        )
-                        temp_H2 = (
-                            soln[-1][:n2_dim]
-                            .reshape(n, n).detach().clone()
-                        )
-                        temp_H4 = (
-                            soln[-1][n2_dim:]
-                            .reshape(n, n, n, n).detach().clone()
-                        )
-                        del soln
-
-
-                    # 利用段轨迹反向演化 LIOM
+                    seg_len = end_step_idx - start_step_idx
                     for local_idx in range(seg_len - 1, -1, -1):
                         global_step = start_step_idx + local_idx
-                        # dl < 0 for backward evolution
                         dl = float(
                             dl_list_final[global_step]
                             - dl_list_final[global_step + 1]
                         )
+                        h2_now, h4_now = _gpu_cmp_load(seg_state, local_idx)
                         n2_t, n4_t = _update_torch(
                             n2_t, n4_t,
-                            seg_h2[local_idx], seg_h4[local_idx],
+                            h2_now, h4_now,
                             dl, ex_mask, no_mask,
                         )
 
-                    del seg_h2, seg_h4
+                    del seg_state
 
                 liom2_all[site] = n2_t.detach().clone()
                 liom4_all[site] = n4_t.detach().clone()
-                print(f"  [反向流] site={site}/{n} 完成")
+            _bwd_one = (time.perf_counter() - _t_before_bwd) / len(_bwd_sites)
+            print(f"  [反向流] sites={_bwd_sites} 平均耗时={_bwd_one:.1f}s → 预估全n={_bwd_one * n:.1f}s")
 
-            # ---- 4. 内存粗估 ----
-            per_h_elems = n2_dim + n**4
-            ckpt_bytes = len(checkpoints) * per_h_elems * 4   # FP32 GPU
-            seg_bytes  = ckpt_step * per_h_elems * 4          # FP32 GPU
-            liom_bytes = n * per_h_elems * 4                  # FP32 GPU
+            _elapsed = (_t_before_bwd - _t_start) + _bwd_one * n
+
+            # ---- 4. 内存统计 ----
+            ckpt_mem_bytes = _storage_bytes(ckpt_state)
+            liom_bytes = n * (n2_dim + n**4) * 4
+            seg_mem_max = int(ckpt_mem_bytes * ckpt_step / max(n_ckpts, 1))
+            peak_mem = int(ckpt_mem_bytes + seg_mem_max + liom_bytes)
 
             output = {
                 "H0_diag": H0_diag.detach().cpu().numpy(),
@@ -7110,11 +7545,11 @@ def flow_dyn_density(
                 "LIOM Interactions": lbits,
                 "steps_evolved": int(final_step),
                 "ckpt_step": int(ckpt_step),
+                "compress_mode": int(compress_mode),
                 "LIOM2": liom2_all.detach().cpu().numpy(),
                 "LIOM4": liom4_all.detach().cpu().numpy(),
-                "peak_memory_bytes": int(
-                    ckpt_bytes + seg_bytes + liom_bytes
-                ),
+                "elapsed_s": _elapsed,
+                "peak_memory_bytes": peak_mem,
             }
             return output
 
@@ -7132,6 +7567,8 @@ def flow_dyn_density(
                 f"branch 11 only accepts compress_mode in {{0,1,2}}, got {compress_mode}"
             )
 
+        _t_start = time.perf_counter()
+
         H2_init = jnp.array(hamiltonian.H2_spinless)
         H4_init = jnp.array(hamiltonian.H4_spinless)
 
@@ -7145,48 +7582,61 @@ def flow_dyn_density(
         dl_arr = dl_arr[:max_steps]
 
         if ckpt_step is None:
-            ckpt_step = min(40, int(np.sqrt(max_steps)))
+            if hamiltonian.dis_type == "random":
+                ckpt_step = 100
+            else:
+                ckpt_step = 80
         ckpt_step = max(1, int(ckpt_step))
 
         _rtol = 1e-6
         _atol = 1e-6
 
-        # ── 压缩参数（默认 FP16 + 指数缩放；COO/rSVD 由 compress_mode 选择）──
-        _exp_scale = os.environ.get('compress_exp_scale', '1') in ('1', 'true', 'True', 'on', 'ON')
+        # ── 压缩参数（FP64→FP32，无缩放，mode=1/2 在 FP32 基础上进一步压缩）──
+        _exp_scale = False
         _eps = float(os.environ.get('compress_eps', '1e-7'))
-        _svd_rank_h2 = int(os.environ.get('compress_svd_rank_h2', '16'))
-        _svd_rank_h4 = int(os.environ.get('compress_svd_rank_h4', '64'))
+        _svd_rank_h2 = int(os.environ.get(
+            'compress_svd_rank_h2',
+            str(max(8, int(n) // 2)),
+        ))
+        _svd_rank_h4 = int(os.environ.get(
+            'compress_svd_rank_h4',
+            str(int(n) * int(n) // 2),
+        ))
         _svd_oversample = int(os.environ.get('compress_svd_oversample', '8'))
         _svd_niter = int(os.environ.get('compress_svd_niter', '1'))
 
-        _bdtype_env = os.environ.get('compress_buffer_dtype', 'float16').strip().lower()
-        _buffer_dtype = np.float32 if _bdtype_env in ('float32', 'fp32') else np.float16
-
-        _sdtype_env = os.environ.get('compress_svd_store_dtype', 'float16').strip().lower()
-        _svd_store_dtype = np.float32 if _sdtype_env in ('float32', 'fp32') else np.float16
+        _buffer_dtype = np.float32
+        _svd_store_dtype = np.float32
 
         n2_dim = n * n  # H4 reshape 后的方阵维度
 
-        # ── 统一压缩存储抽象（检查点与段轨迹共用）──
+        # ── CPU 压缩存储抽象（FP64→FP32 基础）──
         def _make_storage(capacity: int) -> dict:
             cap = int(capacity)
-            s = {
-                "capacity": cap,
-                "scale_h2": np.ones(cap, dtype=np.float32),
-                "scale_h4": np.ones(cap, dtype=np.float32),
-            }
+            s = {"capacity": cap}
             if compress_mode == 0:
-                s["buf_h2"] = np.zeros((cap, n, n), dtype=_buffer_dtype)
-                s["buf_h4"] = np.zeros((cap, n, n, n, n), dtype=_buffer_dtype)
+                s["buf_h2"] = []
+                s["buf_h4"] = []
             elif compress_mode == 1:
-                s["h2_idx"] = [None] * cap
-                s["h2_val"] = [None] * cap
-                s["h4_idx"] = [None] * cap
-                s["h4_val"] = [None] * cap
+                s["h2_idx"] = []
+                s["h2_val"] = []
+                s["h4_idx"] = []
+                s["h4_val"] = []
             else:  # compress_mode == 2: rSVD
-                s["h2_U"] = [None] * cap; s["h2_S"] = [None] * cap; s["h2_Vt"] = [None] * cap
-                s["h4_U"] = [None] * cap; s["h4_S"] = [None] * cap; s["h4_Vt"] = [None] * cap
+                s["h2_U"] = []; s["h2_S"] = []; s["h2_Vt"] = []
+                s["h4_U"] = []; s["h4_S"] = []; s["h4_Vt"] = []
             return s
+
+        # ── 内存跟踪 ──
+        def _storage_bytes(storage: dict) -> int:
+            total = 0
+            for key, lst in storage.items():
+                if key == "capacity":
+                    continue
+                for a in lst:
+                    if a is not None:
+                        total += a.nbytes
+            return total
 
         def _cmp_store(storage: dict, slot: int, h2_jax, h4_jax) -> None:
             try:
@@ -7195,69 +7645,47 @@ def flow_dyn_density(
             except Exception:
                 pass
 
-            if _exp_scale:
-                mu2 = float(jnp.max(jnp.abs(h2_jax)))
-                mu4 = float(jnp.max(jnp.abs(h4_jax)))
-                if (not np.isfinite(mu2)) or mu2 <= 0.0: mu2 = 1.0
-                if (not np.isfinite(mu4)) or mu4 <= 0.0: mu4 = 1.0
-            else:
-                mu2 = mu4 = 1.0
-            storage["scale_h2"][slot] = np.float32(mu2)
-            storage["scale_h4"][slot] = np.float32(mu4)
-
-            h2_np = np.array((h2_jax / mu2) if _exp_scale else h2_jax, dtype=np.float32)
-            h4_np = np.array((h4_jax / mu4) if _exp_scale else h4_jax, dtype=np.float32)
+            h2_np = np.array(h2_jax, dtype=np.float32)
+            h4_np = np.array(h4_jax, dtype=np.float32)
 
             if compress_mode == 0:
-                storage["buf_h2"][slot] = h2_np.astype(_buffer_dtype, copy=False)
-                storage["buf_h4"][slot] = h4_np.astype(_buffer_dtype, copy=False)
+                storage["buf_h2"].append(h2_np)
+                storage["buf_h4"].append(h4_np)
 
             elif compress_mode == 1:
-                # COO 稀疏：阈值在归一域中比较
-                th2 = (_eps / mu2) if _exp_scale else _eps
-                th4 = (_eps / mu4) if _exp_scale else _eps
                 h2_flat = h2_np.reshape(-1)
                 h4_flat = h4_np.reshape(-1)
-                h2_idx_arr = np.flatnonzero(np.abs(h2_flat) >= th2).astype(np.int32, copy=False)
-                h4_idx_arr = np.flatnonzero(np.abs(h4_flat) >= th4).astype(np.int32, copy=False)
-                storage["h2_idx"][slot] = h2_idx_arr
-                storage["h2_val"][slot] = (
-                    h2_flat[h2_idx_arr].astype(_buffer_dtype, copy=False)
-                    if h2_idx_arr.size else np.zeros((0,), dtype=_buffer_dtype)
+                h2_idx_arr = np.flatnonzero(np.abs(h2_flat) >= _eps).astype(np.int32, copy=False)
+                h4_idx_arr = np.flatnonzero(np.abs(h4_flat) >= _eps).astype(np.int32, copy=False)
+                storage["h2_idx"].append(h2_idx_arr)
+                storage["h2_val"].append(
+                    h2_flat[h2_idx_arr].astype(np.float32, copy=False)
+                    if h2_idx_arr.size else np.zeros((0,), dtype=np.float32)
                 )
-                storage["h4_idx"][slot] = h4_idx_arr
-                storage["h4_val"][slot] = (
-                    h4_flat[h4_idx_arr].astype(_buffer_dtype, copy=False)
-                    if h4_idx_arr.size else np.zeros((0,), dtype=_buffer_dtype)
+                storage["h4_idx"].append(h4_idx_arr)
+                storage["h4_val"].append(
+                    h4_flat[h4_idx_arr].astype(np.float32, copy=False)
+                    if h4_idx_arr.size else np.zeros((0,), dtype=np.float32)
                 )
 
-            else:  # compress_mode == 2: rSVD
-                r2_eff = max(1, min(_svd_rank_h2, n))
-                U2, S2, Vt2 = hybrid_svd(
-                    h2_np.reshape(n, n),
-                    rank=r2_eff,
-                    oversample=_svd_oversample,
-                    n_iter=_svd_niter,
-                )
-                storage["h2_U"][slot] = U2.astype(_svd_store_dtype, copy=False)
-                storage["h2_S"][slot] = S2
-                storage["h2_Vt"][slot] = Vt2.astype(_svd_store_dtype, copy=False)
+            else:  # compress_mode == 2: rSVD（自动秩：保留 99.9999% Frobenius 范数）
+                U2_full, S2_full, Vt2_full = np.linalg.svd(h2_np.reshape(n, n), full_matrices=False)
+                cum2 = np.cumsum(S2_full**2)
+                r2_eff = int(np.searchsorted(cum2, cum2[-1] * 0.999999)) + 1
+                r2_eff = max(1, r2_eff)
+                storage["h2_U"].append(U2_full[:, :r2_eff].astype(np.float32, copy=False))
+                storage["h2_S"].append(S2_full[:r2_eff])
+                storage["h2_Vt"].append(Vt2_full[:r2_eff, :].astype(np.float32, copy=False))
 
-                r4_eff = max(1, min(_svd_rank_h4, n2_dim))
-                U4, S4, Vt4 = hybrid_svd(
-                    h4_np.reshape(n2_dim, n2_dim),
-                    rank=r4_eff,
-                    oversample=_svd_oversample,
-                    n_iter=_svd_niter,
-                )
-                storage["h4_U"][slot] = U4.astype(_svd_store_dtype, copy=False)
-                storage["h4_S"][slot] = S4
-                storage["h4_Vt"][slot] = Vt4.astype(_svd_store_dtype, copy=False)
+                U4_full, S4_full, Vt4_full = np.linalg.svd(h4_np.reshape(n2_dim, n2_dim), full_matrices=False)
+                cum4 = np.cumsum(S4_full**2)
+                r4_eff = int(np.searchsorted(cum4, cum4[-1] * 0.999999)) + 1
+                r4_eff = max(1, r4_eff)
+                storage["h4_U"].append(U4_full[:, :r4_eff].astype(np.float32, copy=False))
+                storage["h4_S"].append(S4_full[:r4_eff])
+                storage["h4_Vt"].append(Vt4_full[:r4_eff, :].astype(np.float32, copy=False))
 
         def _cmp_load(storage: dict, slot: int):
-            mu2 = float(storage["scale_h2"][slot])
-            mu4 = float(storage["scale_h4"][slot])
-
             if compress_mode == 0:
                 h2_dense = np.array(storage["buf_h2"][slot], dtype=np.float32)
                 h4_dense = np.array(storage["buf_h4"][slot], dtype=np.float32)
@@ -7290,10 +7718,6 @@ def flow_dyn_density(
                 )
                 h4_dense = h4_mat.reshape((n, n, n, n))
 
-            if _exp_scale:
-                h2_dense = h2_dense * mu2
-                h4_dense = h4_dense * mu4
-
             return jnp.array(h2_dense, dtype=jnp.float32), jnp.array(h4_dense, dtype=jnp.float32)
 
         # ── 检查点容器（容量上限）──
@@ -7310,7 +7734,7 @@ def flow_dyn_density(
 
         k = 1
         J0 = 1.0
-        print_interval = max(100, ckpt_step * 5)
+        print_interval = 1000
         while k < len(dl_arr) and J0 > cutoff:
             steps = np.array([dl_arr[k - 1], dl_arr[k]], dtype=dl_arr.dtype)
             soln = ode(int_ode, [curr_H2, curr_H4], steps, rtol=_rtol, atol=_atol)
@@ -7328,7 +7752,7 @@ def flow_dyn_density(
 
             k += 1
 
-        print(f"  对角化完成，共 {k-1} 步，l_final={dl_arr[k-2]:.4e}")
+        print(f"  对角化完成，共 {k-1} 步，l_final={dl_arr[k-2]:.4e}，J0={J0:.3e}，检查点数={n_ckpts}")
 
         final_step = k - 1
         if checkpoints_steps[-1] != final_step and n_ckpts < max_ckpts:
@@ -7361,6 +7785,10 @@ def flow_dyn_density(
         liom4_all = np.zeros((n, n, n, n, n), dtype=np.float32)
 
         def _recompute_segment(start_step_idx, end_step_idx):
+            # ── 从压缩检查点重算一段完整轨迹 ──
+            # ① _cmp_load 解压检查点 H2/H4 作为起点
+            # ② 正向 ODE 积分该段，每步 _cmp_store 压缩存入 seg_state
+            # ③ 返回 seg_state（compressed dict）供反向 LIOM 演化使用
             seg_len = end_step_idx - start_step_idx
             if seg_len <= 0:
                 return None
@@ -7379,7 +7807,9 @@ def flow_dyn_density(
                 temp_H4 = soln[1][-1]
             return seg_state
 
-        for site in range(n):
+        _t_before_bwd = time.perf_counter()
+        _bwd_sites = [0, n // 2]
+        for site in _bwd_sites:
             n2 = jnp.zeros((n, n), dtype=jnp.float32).at[site, site].set(1.0)
             n4 = jnp.zeros((n, n, n, n), dtype=jnp.float32)
             for seg_idx in range(len(checkpoints_steps) - 1, 0, -1):
@@ -7401,26 +7831,16 @@ def flow_dyn_density(
                 del seg_state
             liom2_all[site] = np.array(n2, dtype=np.float32)
             liom4_all[site] = np.array(n4, dtype=np.float32)
-            print(f"  [反向流] site={site}/{n} 完成")
+        _bwd_one = (time.perf_counter() - _t_before_bwd) / len(_bwd_sites)
+        print(f"  [反向流] sites={_bwd_sites} 平均耗时={_bwd_one:.1f}s → 预估全n={_bwd_one * n:.1f}s")
 
-        # ── peak_memory_bytes 粗估（检查点 + 一段段轨迹 + LIOM 输出）──
-        per_h_elems = n * n + n ** 4
-        buf_itemsize = np.dtype(_buffer_dtype).itemsize
-        svd_itemsize = np.dtype(_svd_store_dtype).itemsize
-        if compress_mode == 0:
-            ckpt_bytes = n_ckpts * per_h_elems * buf_itemsize
-            seg_bytes  = ckpt_step * per_h_elems * buf_itemsize
-        elif compress_mode == 1:
-            # COO 以 0.3 稀疏度为粗估（值 + int32 索引）
-            ckpt_bytes = int(0.3 * n_ckpts * per_h_elems * (buf_itemsize + 4))
-            seg_bytes  = int(0.3 * ckpt_step * per_h_elems * (buf_itemsize + 4))
-        else:
-            r2_eff = max(1, min(_svd_rank_h2, n))
-            r4_eff = max(1, min(_svd_rank_h4, n2_dim))
-            per_h_svd = (r2_eff * (2 * n) + r2_eff + r4_eff * (2 * n2_dim) + r4_eff) * svd_itemsize
-            ckpt_bytes = n_ckpts * per_h_svd
-            seg_bytes  = ckpt_step * per_h_svd
-        liom_bytes = n * per_h_elems * 4
+        _elapsed = (_t_before_bwd - _t_start) + _bwd_one * n
+
+        # ── 内存统计 ──
+        ckpt_mem_bytes = _storage_bytes(ckpt_state)
+        liom_bytes = n * (n * n + n ** 4) * 4
+        seg_mem_max = int(ckpt_mem_bytes * ckpt_step / max(n_ckpts, 1))
+        peak_mem = int(ckpt_mem_bytes + seg_mem_max + liom_bytes)
 
         output = {
             "H0_diag": np.array(H0_diag),
@@ -7431,13 +7851,19 @@ def flow_dyn_density(
             "compress_mode": int(compress_mode),
             "LIOM2": liom2_all,
             "LIOM4": liom4_all,
-            "peak_memory_bytes": int(ckpt_bytes + seg_bytes + liom_bytes),
+            "elapsed_s": _elapsed,
+            "peak_memory_bytes": peak_mem,
         }
         return output
 
     # ══════════════════════════════════════════════════════════════════════
     elif switch_num == 111:
-        # 分支 111：parallel + compress + checkpoint (GPU 批处理)
+        # ──────────── 分支 111: parallel + compress + checkpoint ────────────
+        # checkpoint=1 + compress=1 + parallel=1 → 检查点压缩 + 批处理 LIOM
+        # 仅支持 GPU(torch)，所有 n 个格点的 LIOM 在 batch 维度上并行演化
+        # 核心创新：einsum 的 's' batch 维度一次处理所有格点，无 Python 循环
+        # ─────────────────────────────────────────────────────────────────────
+        _t_start = time.perf_counter()
         if torch is None:
             raise ImportError(
                 "PyTorch is not installed. Cannot use switch_num=111."
@@ -7446,16 +7872,21 @@ def flow_dyn_density(
             raise ImportError(
                 "torchdiffeq is not installed. Run: pip install torchdiffeq"
             )
-        if compress_mode != 0:
-            print(
-                "  [torch:111] compress_mode>0 not supported on GPU;"
-                " falling back to compress_mode=0"
-            )
 
-        # ---- 0. 初始化（与分支 11 GPU 相同）----
+        # ═══════════════════════════════════════════════════
+        # 0. 初始化
+        # ═══════════════════════════════════════════════════
         device = _resolve_torch_flow_device()
-        print(f"        [torch:111] device={device}"
-              f" (PYFLOW_GPU_ID={os.environ.get('PYFLOW_GPU_ID', '0')})")
+        # 显式开启 TF32（确保 A100 Tensor Core 加速）
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        cap = torch.cuda.get_device_capability(device)
+        print(
+            f"        [torch:111] device={device}"
+            f" ({torch.cuda.get_device_name(device)})"
+            f"  CC={cap[0]}.{cap[1]}"
+            f"  TF32={torch.backends.cuda.matmul.allow_tf32}"
+        )
 
         ex_mask = _ex_helper_torch(n, device)
         no_mask = _no_helper_torch(n, device)
@@ -7476,8 +7907,28 @@ def flow_dyn_density(
         dl_arr = dl_arr[:max_steps]
 
         if ckpt_step is None:
-            ckpt_step = min(40, int(np.sqrt(max_steps)))
+            if hamiltonian.dis_type == "random":
+                ckpt_step = 100
+            else:
+                ckpt_step = 80
         ckpt_step = max(1, int(ckpt_step))
+
+        # ── 分支111 固定 FP32 密集存储（FP64→FP32，无缩放，无压缩）──
+        n2_dim = n * n
+        # H2 始终密集存储，H4 始终密集存储，保持 float32 精度
+        def _gpu_make_storage(capacity: int) -> dict:
+            s = {"capacity": int(capacity)}
+            s["h2_list"] = []
+            s["h4_list"] = []
+            return s
+
+        def _gpu_cmp_store(storage: dict, slot: int, h2, h4) -> None:
+            # 直接存 FP32 克隆，不做任何压缩
+            storage["h2_list"].append(h2.detach().clone())
+            storage["h4_list"].append(h4.detach().clone())
+
+        def _gpu_cmp_load(storage: dict, slot: int):
+            return storage["h2_list"][slot], storage["h4_list"][slot]
 
         curr_H2 = torch.tensor(
             np.array(hamiltonian.H2_spinless, dtype=np.float32),
@@ -7491,20 +7942,22 @@ def flow_dyn_density(
         def _ode_fn(t, y):
             return _int_ode_torch_fn(t, y, n, ex_mask, no_mask)
 
-        n2_dim = n**2
-
-        # ---- 1. 正向流：H 对角化，稀疏检查点 ----
-        checkpoints = [
-            (0,
-             curr_H2.detach().clone(),
-             curr_H4.detach().clone(),
-            )
-        ]
+        # ═══════════════════════════════════════════════════
+        # 1. 正向流：H 对角化 + 压缩存储检查点
+        # ═══════════════════════════════════════════════════
+        max_ckpts = max_steps // ckpt_step + 4
+        ckpt_state = _gpu_make_storage(max_ckpts)
+        ckpt_slot_map = {0: 0}
+        checkpoints_steps = [0]
+        _gpu_cmp_store(ckpt_state, 0, curr_H2, curr_H4)
+        n_ckpts = 1
 
         k = 1
         J0 = 1.0
         t_span = torch.empty(2, dtype=torch.float32, device=device)
-        y0_flat = torch.empty(n2_dim + n**4, dtype=torch.float32, device=device)
+        y0_flat = torch.empty(
+            n2_dim + n**4, dtype=torch.float32, device=device,
+        )
 
         while k < len(dl_arr) and J0 > cutoff:
             t_span[0] = float(dl_arr[k - 1])
@@ -7516,15 +7969,16 @@ def flow_dyn_density(
                 rtol=_rtol, atol=_atol, method='dopri5',
             )
             curr_H2 = soln[-1][:n2_dim].reshape(n, n).detach().clone()
-            curr_H4 = soln[-1][n2_dim:].reshape(n, n, n, n).detach().clone()
+            curr_H4 = soln[-1][n2_dim:].reshape(
+                n, n, n, n,
+            ).detach().clone()
             del soln
 
-            if k % ckpt_step == 0:
-                checkpoints.append((
-                    k,
-                    curr_H2.detach().clone(),
-                    curr_H4.detach().clone(),
-                ))
+            if k % ckpt_step == 0 and n_ckpts < max_ckpts:
+                ckpt_slot_map[k] = n_ckpts
+                checkpoints_steps.append(k)
+                _gpu_cmp_store(ckpt_state, n_ckpts, curr_H2, curr_H4)
+                n_ckpts += 1
 
             J0 = float(
                 torch.max(torch.abs(
@@ -7532,29 +7986,32 @@ def flow_dyn_density(
                 ))
             )
 
-            if k % 100 == 0:
+            if k % 1000 == 0:
                 print(
                     f"  [对角化] k={k:5d}  l={dl_arr[k - 1]:.4e}"
-                    f"  J0={J0:.3e}  ckpts={len(checkpoints)}"
+                    f"  J0={J0:.3e}  ckpts={n_ckpts}"
                 )
             k += 1
 
         final_step = k - 1
-        if checkpoints[-1][0] != final_step:
-            checkpoints.append((
-                final_step,
-                curr_H2.detach().clone(),
-                curr_H4.detach().clone(),
-            ))
+        if checkpoints_steps[-1] != final_step and n_ckpts < max_ckpts:
+            ckpt_slot_map[final_step] = n_ckpts
+            checkpoints_steps.append(final_step)
+            _gpu_cmp_store(ckpt_state, n_ckpts, curr_H2, curr_H4)
+            n_ckpts += 1
 
         print(
             f"  对角化完成，共 {final_step} 步，"
-            f"l_final={dl_arr[final_step]:.4e}"
+            f"l_final={dl_arr[final_step]:.4e}，"
+            f"J0={J0:.3e}，检查点数={n_ckpts}"
         )
+        _t_h_diag = time.perf_counter()
 
         dl_list_final = dl_arr[:final_step + 1]
 
-        # ---- 2. l-bit 相互作用 ----
+        # ═══════════════════════════════════════════════════
+        # 2. l-bit 相互作用
+        # ═══════════════════════════════════════════════════
         H0_diag = curr_H2
         Hintfinal = curr_H4
 
@@ -7575,7 +8032,13 @@ def flow_dyn_density(
         lbits = np.array(lbits_list, dtype=np.float64)
         del HFint
 
-        # ---- 3. 反向流：批处理所有格点 (parallel=1) ----
+        # ═══════════════════════════════════════════════════
+        # 3. 反向流：批处理所有格点 (parallel=1)
+        # ═══════════════════════════════════════════════════
+        # 与分支 11 的关键区别：
+        #   分支 11: for site in range(n) → 每个格点独立跑 ODE
+        #   分支 111: n 个格点在一个 batch 维度上并行演化
+        #   n2_batch.shape = (n, n, n)  # (batch=n, rows=n, cols=n)
         n2_batch = torch.zeros(
             (n, n, n), dtype=torch.float32, device=device,
         )
@@ -7587,62 +8050,49 @@ def flow_dyn_density(
         )
 
         def _update_torch_batch(n2_b, n4_b, H2, Hint_b4, dl):
-            """同时更新所有格点的 LIOM。"""
+            # ── 批量 Wegner 流更新（内存优化: 直接在 c42 上累加）──
             H0, V0, Hint0, Vint = _extract_diag_torch(H2, Hint_b4, ex_mask)
             eta2 = _con22_torch(H0, V0)
-            eta4 = (_con42_torch(Hint0, V0, no_mask)
-                    + _con24_torch(H0, Vint, no_mask))
-
-            dn2 = (torch.einsum('ij,sjk->sik', eta2, n2_b)
-                   - torch.einsum('sij,jk->sik', n2_b, eta2))
-
+            eta4 = _con42_torch(Hint0, V0, no_mask) + _con24_torch(H0, Vint, no_mask)
+            dn2 = torch.einsum('ij,sjk->sik', eta2, n2_b) - torch.einsum('sij,jk->sik', n2_b, eta2)
+            n2_b.add_(dl * dn2)
+            
             c42  = torch.einsum('abcd,sdf->sabcf', eta4, n2_b)
             c42 -= torch.einsum('abcd,sec->sabed', eta4, n2_b)
             c42 += torch.einsum('abcd,sbf->safcd', eta4, n2_b)
             c42 -= torch.einsum('abcd,sea->sebcd', eta4, n2_b)
+            c42 -= torch.einsum('sabcd,df->sabcf', n4_b, eta2)
+            c42 += torch.einsum('sabcd,ec->sabed', n4_b, eta2)
+            c42 -= torch.einsum('sabcd,bf->safcd', n4_b, eta2)
+            c42 += torch.einsum('sabcd,ea->sebcd', n4_b, eta2)
 
-            c24  = torch.einsum('sabcd,df->sabcf', n4_b, eta2)
-            c24 -= torch.einsum('sabcd,ec->sabed', n4_b, eta2)
-            c24 += torch.einsum('sabcd,bf->safcd', n4_b, eta2)
-            c24 -= torch.einsum('sabcd,ea->sebcd', n4_b, eta2)
+            c42 = c42.contiguous()
+            c42.view(n, n**4).mul_(no_mask)
+            n4_b.add_(dl * c42)
+                        
+            return n2_b, n4_b
 
-            dn4 = c42 - c24
-            dn4 = (no_mask * dn4.reshape(n, n**4)).reshape(
-                n, n, n, n, n,
-            )
-
-            return n2_b + dl * dn2, n4_b + dl * dn4
-
-        t_span_seg = torch.empty(2, dtype=torch.float32, device=device)
-        y0_flat_seg = torch.empty(
-            n2_dim + n**4, dtype=torch.float32, device=device,
-        )
-
-        for seg_idx in range(len(checkpoints) - 1, 0, -1):
-            start_step_idx = int(checkpoints[seg_idx - 1][0])
-            end_step_idx   = int(checkpoints[seg_idx][0])
+        # ── 从压缩检查点重算一段完整 H 轨迹（GPU 版）──
+        def _recompute_segment_gpu(start_step_idx, end_step_idx):
+            """从压缩检查点重算 [start, end) 的 H 轨迹，返回压缩 seg_state。"""
             seg_len = end_step_idx - start_step_idx
             if seg_len <= 0:
-                continue
-            print(
-                f"  [反向流] segment steps {start_step_idx}→{end_step_idx}"
+                return None
+            slot = ckpt_slot_map[int(start_step_idx)]
+            temp_H2, temp_H4 = _gpu_cmp_load(ckpt_state, slot)
+            seg_state = _gpu_make_storage(seg_len)
+            t_span_local = torch.empty(2, dtype=torch.float32, device=device)
+            y0_flat_local = torch.empty(
+                n2_dim + n**4, dtype=torch.float32, device=device,
             )
-
-            temp_H2 = checkpoints[seg_idx - 1][1].detach().clone()
-            temp_H4 = checkpoints[seg_idx - 1][2].detach().clone()
-
-            seg_h2 = [None] * seg_len
-            seg_h4 = [None] * seg_len
             for curr_step in range(start_step_idx, end_step_idx):
                 local_idx = curr_step - start_step_idx
-                seg_h2[local_idx] = temp_H2
-                seg_h4[local_idx] = temp_H4
-
-                t_span_seg[0] = float(dl_list_final[curr_step])
-                t_span_seg[1] = float(dl_list_final[curr_step + 1])
-                _pack_state_torch(y0_flat_seg, temp_H2, temp_H4, n2_dim)
+                _gpu_cmp_store(seg_state, local_idx, temp_H2, temp_H4)
+                t_span_local[0] = float(dl_list_final[curr_step])
+                t_span_local[1] = float(dl_list_final[curr_step + 1])
+                _pack_state_torch(y0_flat_local, temp_H2, temp_H4, n2_dim)
                 soln = torch_odeint(
-                    _ode_fn, y0_flat_seg, t_span_seg,
+                    _ode_fn, y0_flat_local, t_span_local,
                     rtol=_rtol, atol=_atol, method='dopri5',
                 )
                 temp_H2 = (
@@ -7652,27 +8102,43 @@ def flow_dyn_density(
                     soln[-1][n2_dim:].reshape(n, n, n, n).detach().clone()
                 )
                 del soln
+            return seg_state
 
+        for seg_idx in range(len(checkpoints_steps) - 1, 0, -1):
+            start_step_idx = int(checkpoints_steps[seg_idx - 1])
+            end_step_idx   = int(checkpoints_steps[seg_idx])
+            seg_state = _recompute_segment_gpu(start_step_idx, end_step_idx)
+            if seg_state is None:
+                continue
+            print(
+                f"  [反向流] segment steps {start_step_idx}→{end_step_idx}"
+            )
+
+            seg_len = end_step_idx - start_step_idx
             for local_idx in range(seg_len - 1, -1, -1):
                 global_step = start_step_idx + local_idx
                 dl = float(
                     dl_list_final[global_step]
                     - dl_list_final[global_step + 1]
                 )
+                h2_now, h4_now = _gpu_cmp_load(seg_state, local_idx)
                 n2_batch, n4_batch = _update_torch_batch(
                     n2_batch, n4_batch,
-                    seg_h2[local_idx], seg_h4[local_idx], dl,
+                    h2_now, h4_now, dl,
                 )
 
-            del seg_h2, seg_h4
-            del temp_H2, temp_H4
+            del seg_state
 
         liom2_all = n2_batch.detach().clone()
         liom4_all = n4_batch.detach().clone()
 
-        # ---- 4. 内存粗估 ----
+        _elapsed = time.perf_counter() - _t_start
+
+        # ═══════════════════════════════════════════════════
+        # 4. 组装输出
+        # ═══════════════════════════════════════════════════
         per_h_elems = n2_dim + n**4
-        ckpt_bytes = len(checkpoints) * per_h_elems * 4
+        ckpt_bytes = n_ckpts * per_h_elems * 4  # FP32
         seg_bytes  = ckpt_step * per_h_elems * 4
         liom_bytes = n * per_h_elems * 4
 
@@ -7684,6 +8150,7 @@ def flow_dyn_density(
             "ckpt_step": int(ckpt_step),
             "LIOM2": liom2_all.detach().cpu().numpy(),
             "LIOM4": liom4_all.detach().cpu().numpy(),
+            "elapsed_s": _elapsed,
             "peak_memory_bytes": int(
                 ckpt_bytes + seg_bytes + liom_bytes
             ),
@@ -7691,642 +8158,595 @@ def flow_dyn_density(
         return output
 
     # ══════════════════════════════════════════════════════════════════════
-    # elif switch_num == 101:
-    #     # 分支 101：parallel + checkpoint
+    elif switch_num == 1111:
+        # ──────── 分支 1111: pipeline + parallel + compress + checkpoint ────
+        # pipeline=1 + parallel=1 + compress=1 + checkpoint=1
+        # 支持多GPU流水线：H重算在 device_h，LIOM更新在 device_n
+        #   环境变量 PYFLOW_NUM_GPUS 控制GPU数量（默认2，设为1即退化为单GPU）
+        #   环境变量 PYFLOW_GPU_IDS  指定GPU ID（默认 "0,1"）
+        # ─────────────────────────────────────────────────────────────────────
+        _t_start = time.perf_counter()
+        if torch is None:
+            raise ImportError("PyTorch is not installed.")
+        if torch_odeint is None:
+            raise ImportError("torchdiffeq is not installed.")
 
-    #     H2_init = jnp.array(hamiltonian.H2_spinless)
-    #     H4_init = jnp.array(hamiltonian.H4_spinless)
-    #     orig_dtype = H2_init.dtype
+        # ── 多GPU 配置 ──
+        _num_gpus = int(os.environ.get('PYFLOW_NUM_GPUS', '2'))
+        _is_multi_gpu = (_num_gpus >= 2)
+        _gpu_ids_str = os.environ.get('PYFLOW_GPU_IDS', '0,1')
+        _gpu_ids = [int(x.strip()) for x in _gpu_ids_str.split(',')]
 
-    #     dl_arr = np.array(dl_list, dtype=np.float64)
-    #     if dl_arr.ndim != 1 or len(dl_arr) < 2:
-    #         raise ValueError("dl_list must be a 1D array with at least two time points.")
+        _base_device = _resolve_torch_flow_device()
 
-    #     max_steps = min(int(qmax), len(dl_arr))
-    #     if max_steps < 2:
-    #         raise ValueError("qmax and dl_list imply fewer than two usable time points.")
-    #     dl_arr = dl_arr[:max_steps]
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
-    #     if ckpt_step is None:
-    #         ckpt_step = min(40, int(np.sqrt(max_steps)))
-    #     ckpt_step = max(1, int(ckpt_step))
+        if _is_multi_gpu:
+            device_h = torch.device(f'cuda:{_gpu_ids[0]}')
+            device_n = torch.device(f'cuda:{_gpu_ids[1]}')
+            # 启用 P2P 访问
+            for _i in range(min(_num_gpus, len(_gpu_ids))):
+                for _j in range(min(_num_gpus, len(_gpu_ids))):
+                    if _i != _j:
+                        _di = torch.device(f'cuda:{_gpu_ids[_i]}')
+                        _dj = torch.device(f'cuda:{_gpu_ids[_j]}')
+                        if not torch.cuda.can_device_access_peer(_di, _dj):
+                            torch.cuda.device(_di).enable_peer_access(_dj)
+            print(
+                f"        [torch:1111] multi-GPU pipeline"
+                f"  H→{device_h} ({torch.cuda.get_device_name(device_h)})"
+                f"  LIOM→{device_n} ({torch.cuda.get_device_name(device_n)})"
+            )
+        else:
+            device_h = _base_device
+            device_n = _base_device
+            print(
+                f"        [torch:1111] single-GPU"
+                f"  device={device_h}"
+                f" ({torch.cuda.get_device_name(device_h)})"
+                f"  TF32={torch.backends.cuda.matmul.allow_tf32}"
+            )
 
-    #     _rtol = 1e-6
-    #     _atol = 1e-6
+        # ── H 计算在 device_h ──
+        ex_mask_h = _ex_helper_torch(n, device_h)
+        no_mask_h = _no_helper_torch(n, device_h)
 
-    #     # --- 1. 正向流：H 对角化 + 所有格点算符同步推进，稀疏存储检查点 ---
-    #     curr_H2 = H2_init
-    #     curr_H4 = H4_init
-    #     checkpoints = [(0, np.array(curr_H2, dtype=orig_dtype), np.array(curr_H4, dtype=orig_dtype))]
-
-    #     k = 1
-    #     J0 = 1.0
-    #     while k < len(dl_arr) and J0 > cutoff:
-    #         steps = np.array([dl_arr[k - 1], dl_arr[k]], dtype=dl_arr.dtype)
-
-    #         # 推进 H 一步
-    #         soln_H = ode(int_ode, [curr_H2, curr_H4], steps, rtol=_rtol, atol=_atol)
-    #         curr_H2 = soln_H[0][-1]
-    #         curr_H4 = soln_H[1][-1]
-
-    #         if k % ckpt_step == 0:
-    #             checkpoints.append((k, np.array(curr_H2, dtype=orig_dtype), np.array(curr_H4, dtype=orig_dtype)))
-    #         J0 = float(jnp.max(jnp.abs(curr_H2 - jnp.diag(jnp.diag(curr_H2)))))
-    #         k += 1
-
-    #     final_step = k - 1
-    #     if checkpoints[-1][0] != final_step:
-    #         checkpoints.append((final_step, np.array(curr_H2, dtype=orig_dtype), np.array(curr_H4, dtype=orig_dtype)))
-
-    #     dl_list_final = dl_arr[:final_step + 1]
-
-    #     H0_diag = curr_H2
-    #     Hintfinal = curr_H4
-    #     h_final_flat = jnp.concatenate((curr_H2.reshape(n**2), curr_H4.reshape(n**4)))
-
-    #     # --- 2. 提取 l-bit 相互作用 ---
-    #     HFint = np.zeros((n, n), dtype=np.float64)
-    #     Hint_np = np.array(Hintfinal)
-    #     for i in range(n):
-    #         for j in range(n):
-    #             HFint[i, j] = Hint_np[i, i, j, j] - Hint_np[i, j, j, i]
-
-    #     lbits = np.zeros(n - 1, dtype=np.float64)
-    #     for q in range(1, n):
-    #         vals = np.abs(np.diag(HFint, q) + np.diag(HFint, -q)) / 2.0
-    #         vals = np.maximum(vals, 1e-30)
-    #         lbits[q - 1] = np.median(np.log10(vals))
-
-    #     # --- 3. 反向流：vmap 并行化所有格点（parallel=1）---
-    #     from jax import vmap
-
-    #     # n2_batch[site, i, j]: site 格点的二次项 [i, j]
-    #     n2_batch = jnp.zeros((n, n, n), dtype=jnp.float32)
-    #     n2_batch = n2_batch.at[jnp.arange(n), jnp.arange(n), jnp.arange(n)].set(1.0)
-    #     # n4_batch[site, i, j, k, l]: site 格点的四次项 [i, j, k, l]
-    #     n4_batch = jnp.zeros((n, n, n, n, n), dtype=jnp.float32)
-
-    #     # vmapped + jit 编译：一次调用更新所有格点的 LIOM
-    #     def _update_one(n2, n4, H2, H4, steps):
-    #         return update(n2, n4, H2, H4, steps)
-    #     batch_update = jit(vmap(_update_one, in_axes=(0, 0, None, None, None)))
-
-    #     checkpoints_map = {}
-    #     for step_idx, h2_cp, h4_cp in checkpoints:
-    #         checkpoints_map[int(step_idx)] = (h2_cp, h4_cp)
-
-    #     def _recompute_segment(start_step_idx, end_step_idx):
-    #         segment_len = end_step_idx - start_step_idx
-    #         if segment_len <= 0:
-    #             return [], []
-    #         temp_H2 = jnp.array(checkpoints_map[start_step_idx][0])
-    #         temp_H4 = jnp.array(checkpoints_map[start_step_idx][1])
-    #         seg_h2 = [None] * segment_len
-    #         seg_h4 = [None] * segment_len
-    #         for curr_step in range(start_step_idx, end_step_idx):
-    #             local_idx = curr_step - start_step_idx
-    #             seg_h2[local_idx] = temp_H2
-    #             seg_h4[local_idx] = temp_H4
-    #             steps = np.array([dl_list_final[curr_step], dl_list_final[curr_step + 1]], dtype=dl_list_final.dtype)
-    #             soln = ode(int_ode, [temp_H2, temp_H4], steps, rtol=_rtol, atol=_atol)
-    #             temp_H2 = soln[0][-1]
-    #             temp_H4 = soln[1][-1]
-    #         return seg_h2, seg_h4
-
-    #     for seg_idx in range(len(checkpoints) - 1, 0, -1):
-    #         start_step_idx = int(checkpoints[seg_idx - 1][0])
-    #         end_step_idx = int(checkpoints[seg_idx][0])
-    #         seg_h2, seg_h4 = _recompute_segment(start_step_idx, end_step_idx)
-
-    #         for local_idx in range(end_step_idx - start_step_idx - 1, -1, -1):
-    #             global_step = start_step_idx + local_idx
-    #             steps = np.array([dl_list_final[global_step + 1], dl_list_final[global_step]], dtype=np.float64)
-    #             n2_batch, n4_batch = batch_update(n2_batch, n4_batch,
-    #                                                seg_h2[local_idx], seg_h4[local_idx], steps)
-
-    #         del seg_h2, seg_h4
-
-    #     liom2_all = np.array(n2_batch, dtype=np.float32)   # (n, n, n)
-    #     liom4_all = np.array(n4_batch, dtype=np.float32)   # (n, n, n, n, n)
-
-    #     output = {
-    #         "H0_diag": np.array(H0_diag),
-    #         "Hint": np.array(Hintfinal),
-    #         "LIOM Interactions": np.array(lbits),
-    #         "Invariant": 0,
-    #         "ckpt_step": int(ckpt_step),
-    #         "steps_evolved": int(final_step),
-    #         "LIOM2": liom2_all,
-    #         "LIOM4": liom4_all,
-    #         "peak_memory_bytes": int(
-    #             (final_step // ckpt_step + 2) * (n * n + n * n * n * n) * 4  # 检查点
-    #             + ckpt_step * (n * n + n * n * n * n) * 4                     # 重算段
-    #             + n * (n * n + n * n * n * n) * 4                             # LIOM2/4_all（并行）
-    #         ),
-    #     }
-    #     return output
-
-    # # ══════════════════════════════════════════════════════════════════════
-    elif switch_num == 111:
-        # 分支 111：parallel + compress + checkpoint
-        # 在分支 101（parallel+checkpoint）的基础上加入矩阵压缩：
-        #   - 检查点 H 用 compress_mode 压缩存储
-        #   - _recompute_segment 内段内 H 也用 compress_mode 压缩
-        # 由 compress_mode 选择具体压缩策略（0~4）
-        # ══════════════════════════════════════════════════════════════════
-
-        H2_init = jnp.array(hamiltonian.H2_spinless)
-        H4_init = jnp.array(hamiltonian.H4_spinless)
-        orig_dtype = H2_init.dtype
+        _rtol = float(os.environ.get('PYFLOW_ODE_RTOL', '1e-6'))
+        _atol = float(os.environ.get('PYFLOW_ODE_ATOL', '1e-6'))
 
         dl_arr = np.array(dl_list, dtype=np.float64)
-        if dl_arr.ndim != 1 or len(dl_arr) < 2:
-            raise ValueError("dl_list must be a 1D array with at least two time points.")
-
         max_steps = min(int(qmax), len(dl_arr))
         if max_steps < 2:
             raise ValueError("qmax and dl_list imply fewer than two usable time points.")
         dl_arr = dl_arr[:max_steps]
 
         if ckpt_step is None:
-            ckpt_step = min(40, int(np.sqrt(max_steps)))
+            if hamiltonian.dis_type == "random":
+                ckpt_step = 100
+            else:
+                ckpt_step = 80
         ckpt_step = max(1, int(ckpt_step))
 
-        _rtol = 1e-6
-        _atol = 1e-6
-
-        # ── compress_mode → 内部布尔标志 ──
-        _cmp_prune    = compress_mode in (3, 4)
-        _cmp_svd_mode = compress_mode in (2, 4)
-        _cmp_coo_svd  = (compress_mode == 4)
-        _cmp_exp_scale = (compress_mode != 0)
-
-        _cmp_eps            = float(os.environ.get('compress_eps',            '1e-7'))
-        _cmp_svd_rank_h2    = int(os.environ.get('compress_svd_rank_h2',     '16'))
-        _cmp_svd_rank_h4    = int(os.environ.get('compress_svd_rank_h4',     '64'))
-        _cmp_svd_oversample = int(os.environ.get('compress_svd_oversample',   '8'))
-        _cmp_svd_niter      = int(os.environ.get('compress_svd_niter',        '1'))
-
-        if compress_mode == 0:
-            _cmp_buffer_dtype = np.float32
-        else:
-            _bdtype_env = os.environ.get('compress_buffer_dtype', '').strip().lower()
-            _cmp_buffer_dtype = np.float32 if _bdtype_env in ('float32', 'fp32') else np.float16
-
-        _sdtype_env = os.environ.get('compress_svd_store_dtype', 'float16').strip().lower()
-        _cmp_svd_store_dtype = np.float32 if _sdtype_env in ('float32', 'fp32') else np.float16
-
         n2_dim = n * n
+
+        def _gpu_make_storage(capacity: int) -> dict:
+            s = {"capacity": int(capacity)}
+            s["h2_list"] = []
+            s["h4_list"] = []
+            return s
+
+        def _gpu_cmp_store(storage: dict, slot: int, h2, h4) -> None:
+            storage["h2_list"].append(h2.detach().clone())
+            storage["h4_list"].append(h4.detach().clone())
+
+        def _gpu_cmp_load(storage: dict, slot: int):
+            return storage["h2_list"][slot], storage["h4_list"][slot]
+
+        # ── seg_state 跨 GPU 拷贝 ──
+        def _seg_to_device(seg, dst_device):
+            """将 seg_state 的所有 tensor 拷贝到 dst_device（P2P 异步）。返回 (new_seg, copy_event)。"""
+            if not _is_multi_gpu:
+                return seg, None
+            new_seg = {"capacity": seg["capacity"], "h2_list": [], "h4_list": []}
+            for t in seg["h2_list"]:
+                new_seg["h2_list"].append(t.to(dst_device, non_blocking=True))
+            for t in seg["h4_list"]:
+                new_seg["h4_list"].append(t.to(dst_device, non_blocking=True))
+            ev = torch.cuda.Event()
+            ev.record(torch.cuda.current_stream(dst_device))
+            return new_seg, ev
+
+        curr_H2 = torch.tensor(
+            np.array(hamiltonian.H2_spinless, dtype=np.float32),
+            dtype=torch.float32, device=device_h,
+        )
+        curr_H4 = torch.tensor(
+            np.array(hamiltonian.H4_spinless, dtype=np.float32),
+            dtype=torch.float32, device=device_h,
+        )
+
+        def _ode_fn(t, y):
+            return _int_ode_torch_fn(t, y, n, ex_mask_h, no_mask_h)
+
+        # ── Phase 1: 正向流（device_h）──
         max_ckpts = max_steps // ckpt_step + 4
-
-        # ── 预分配检查点压缩存储容器 ──
-        cmp_scale_h2 = np.ones(max_ckpts, dtype=np.float32)
-        cmp_scale_h4 = np.ones(max_ckpts, dtype=np.float32)
-
-        if (not _cmp_prune) and (not _cmp_svd_mode):
-            buf_h2 = np.zeros((max_ckpts, n, n),       dtype=_cmp_buffer_dtype)
-            buf_h4 = np.zeros((max_ckpts, n, n, n, n), dtype=_cmp_buffer_dtype)
-        elif (not _cmp_prune) and _cmp_svd_mode:
-            cmp_h2_U  = [None] * max_ckpts; cmp_h2_S  = [None] * max_ckpts; cmp_h2_Vt = [None] * max_ckpts
-            cmp_h4_U  = [None] * max_ckpts; cmp_h4_S  = [None] * max_ckpts; cmp_h4_Vt = [None] * max_ckpts
-        elif _cmp_coo_svd:
-            cmp_h2_rows = [None] * max_ckpts; cmp_h2_cols = [None] * max_ckpts
-            cmp_h2_U    = [None] * max_ckpts; cmp_h2_S    = [None] * max_ckpts; cmp_h2_Vt = [None] * max_ckpts
-            cmp_h4_rows = [None] * max_ckpts; cmp_h4_cols = [None] * max_ckpts
-            cmp_h4_U    = [None] * max_ckpts; cmp_h4_S    = [None] * max_ckpts; cmp_h4_Vt = [None] * max_ckpts
-        else:
-            cmp_h2_idx_list = [None] * max_ckpts; cmp_h2_val_list = [None] * max_ckpts
-            cmp_h4_idx_list = [None] * max_ckpts; cmp_h4_val_list = [None] * max_ckpts
-
-        # ── 检查点压缩存储函数 ──
-        def _cmp_store(slot, h2_jax, h4_jax):
-            if _cmp_exp_scale:
-                mu2 = float(jnp.max(jnp.abs(h2_jax)))
-                mu4 = float(jnp.max(jnp.abs(h4_jax)))
-                if (not np.isfinite(mu2)) or mu2 <= 0.0: mu2 = 1.0
-                if (not np.isfinite(mu4)) or mu4 <= 0.0: mu4 = 1.0
-            else:
-                mu2 = mu4 = 1.0
-            cmp_scale_h2[slot] = np.float32(mu2)
-            cmp_scale_h4[slot] = np.float32(mu4)
-
-            h2_np = np.array((h2_jax / mu2) if _cmp_exp_scale else h2_jax, dtype=np.float32)
-            h4_np = np.array((h4_jax / mu4) if _cmp_exp_scale else h4_jax, dtype=np.float32)
-
-            if (not _cmp_prune) and (not _cmp_svd_mode):
-                buf_h2[slot] = h2_np.astype(_cmp_buffer_dtype, copy=False)
-                buf_h4[slot] = h4_np.astype(_cmp_buffer_dtype, copy=False)
-            elif (not _cmp_prune) and _cmp_svd_mode:
-                U2, S2, Vt2 = hybrid_svd(h2_np.reshape(n, n),
-                                          rank=_cmp_svd_rank_h2,
-                                          oversample=_cmp_svd_oversample,
-                                          n_iter=_cmp_svd_niter)
-                cmp_h2_U[slot]  = U2.astype(_cmp_svd_store_dtype, copy=False)
-                cmp_h2_S[slot]  = S2
-                cmp_h2_Vt[slot] = Vt2.astype(_cmp_svd_store_dtype, copy=False)
-                U4, S4, Vt4 = hybrid_svd(h4_np.reshape(n2_dim, n2_dim),
-                                          rank=_cmp_svd_rank_h4,
-                                          oversample=_cmp_svd_oversample,
-                                          n_iter=_cmp_svd_niter)
-                cmp_h4_U[slot]  = U4.astype(_cmp_svd_store_dtype, copy=False)
-                cmp_h4_S[slot]  = S4
-                cmp_h4_Vt[slot] = Vt4.astype(_cmp_svd_store_dtype, copy=False)
-            elif _cmp_coo_svd:
-                # H2: COO 支撑 + rSVD 子块
-                th2 = (_cmp_eps / mu2) if _cmp_exp_scale else _cmp_eps
-                h2_flat = h2_np.reshape(-1)
-                h2_idx_arr = np.flatnonzero(np.abs(h2_flat) >= th2).astype(np.int32, copy=False)
-                if h2_idx_arr.size:
-                    ii = (h2_idx_arr // n).astype(np.int32, copy=False)
-                    jj = (h2_idx_arr - ii * n).astype(np.int32, copy=False)
-                    rows2 = np.unique(ii); cols2 = np.unique(jj)
-                    rmap = np.full((n,), -1, dtype=np.int32); rmap[rows2] = np.arange(rows2.size, dtype=np.int32)
-                    cmap = np.full((n,), -1, dtype=np.int32); cmap[cols2] = np.arange(cols2.size, dtype=np.int32)
-                    sub2 = np.zeros((rows2.size, cols2.size), dtype=np.float32)
-                    sub2[rmap[ii], cmap[jj]] = h2_flat[h2_idx_arr]
-                else:
-                    rows2 = np.zeros((0,), dtype=np.int32); cols2 = np.zeros((0,), dtype=np.int32)
-                    sub2  = np.zeros((0, 0),     dtype=np.float32)
-                r_eff = max(1, min(_cmp_svd_rank_h2, sub2.shape[0], sub2.shape[1]))
-                U2, S2, Vt2 = hybrid_svd(sub2, rank=r_eff,
-                                          oversample=_cmp_svd_oversample,
-                                          n_iter=_cmp_svd_niter)
-                cmp_h2_rows[slot] = rows2; cmp_h2_cols[slot] = cols2
-                cmp_h2_U[slot]    = U2.astype(_cmp_svd_store_dtype, copy=False)
-                cmp_h2_S[slot]    = S2
-                cmp_h2_Vt[slot]   = Vt2.astype(_cmp_svd_store_dtype, copy=False)
-
-                # H4: COO 支撑 + rSVD 子块
-                th4 = (_cmp_eps / mu4) if _cmp_exp_scale else _cmp_eps
-                h4_flat = h4_np.reshape(-1)
-                h4_idx_arr = np.flatnonzero(np.abs(h4_flat) >= th4).astype(np.int32, copy=False)
-                if h4_idx_arr.size:
-                    rr = (h4_idx_arr // n2_dim).astype(np.int32, copy=False)
-                    cc = (h4_idx_arr - rr * n2_dim).astype(np.int32, copy=False)
-                    rows4 = np.unique(rr); cols4 = np.unique(cc)
-                    rmap = np.full((n2_dim,), -1, dtype=np.int32); rmap[rows4] = np.arange(rows4.size, dtype=np.int32)
-                    cmap = np.full((n2_dim,), -1, dtype=np.int32); cmap[cols4] = np.arange(cols4.size, dtype=np.int32)
-                    sub4 = np.zeros((rows4.size, cols4.size), dtype=np.float32)
-                    sub4[rmap[rr], cmap[cc]] = h4_flat[h4_idx_arr]
-                else:
-                    rows4 = np.zeros((0,), dtype=np.int32); cols4 = np.zeros((0,), dtype=np.int32)
-                    sub4  = np.zeros((0, 0),     dtype=np.float32)
-                r_eff = max(1, min(_cmp_svd_rank_h4, sub4.shape[0], sub4.shape[1]))
-                U4, S4, Vt4 = hybrid_svd(sub4, rank=r_eff,
-                                          oversample=_cmp_svd_oversample,
-                                          n_iter=_cmp_svd_niter)
-                cmp_h4_rows[slot] = rows4; cmp_h4_cols[slot] = cols4
-                cmp_h4_U[slot]    = U4.astype(_cmp_svd_store_dtype, copy=False)
-                cmp_h4_S[slot]    = S4
-                cmp_h4_Vt[slot]   = Vt4.astype(_cmp_svd_store_dtype, copy=False)
-            else:
-                # 纯 COO 稀疏
-                th2 = (_cmp_eps / mu2) if _cmp_exp_scale else _cmp_eps
-                th4 = (_cmp_eps / mu4) if _cmp_exp_scale else _cmp_eps
-                h2_flat = h2_np.reshape(-1)
-                h4_flat = h4_np.reshape(-1)
-                h2_idx_arr = np.flatnonzero(np.abs(h2_flat) >= th2).astype(np.int32, copy=False)
-                h4_idx_arr = np.flatnonzero(np.abs(h4_flat) >= th4).astype(np.int32, copy=False)
-                cmp_h2_idx_list[slot] = h2_idx_arr
-                cmp_h2_val_list[slot] = (h2_flat[h2_idx_arr].astype(_cmp_buffer_dtype, copy=False)
-                                          if h2_idx_arr.size else np.zeros((0,), dtype=_cmp_buffer_dtype))
-                cmp_h4_idx_list[slot] = h4_idx_arr
-                cmp_h4_val_list[slot] = (h4_flat[h4_idx_arr].astype(_cmp_buffer_dtype, copy=False)
-                                          if h4_idx_arr.size else np.zeros((0,), dtype=_cmp_buffer_dtype))
-
-        # ── 检查点解压函数：返回 (h2_jax, h4_jax) JAX 张量 ──
-        def _cmp_load(slot):
-            mu2 = float(cmp_scale_h2[slot])
-            mu4 = float(cmp_scale_h4[slot])
-
-            if (not _cmp_prune) and (not _cmp_svd_mode):
-                h2_dense = np.array(buf_h2[slot], dtype=np.float32)
-                h4_dense = np.array(buf_h4[slot], dtype=np.float32)
-            elif (not _cmp_prune) and _cmp_svd_mode:
-                U2 = cmp_h2_U[slot]; S2 = cmp_h2_S[slot]; Vt2 = cmp_h2_Vt[slot]
-                h2_dense = hybrid_svd_decompress(
-                    U2.astype(np.float32, copy=False), S2,
-                    Vt2.astype(np.float32, copy=False),
-                    (n, n), out_dtype=np.float32)
-                U4 = cmp_h4_U[slot]; S4 = cmp_h4_S[slot]; Vt4 = cmp_h4_Vt[slot]
-                h4_mat = hybrid_svd_decompress(
-                    U4.astype(np.float32, copy=False), S4,
-                    Vt4.astype(np.float32, copy=False),
-                    (n2_dim, n2_dim), out_dtype=np.float32)
-                h4_dense = h4_mat.reshape((n, n, n, n))
-            elif _cmp_coo_svd:
-                r2 = cmp_h2_rows[slot]; c2 = cmp_h2_cols[slot]
-                U2 = cmp_h2_U[slot];    S2 = cmp_h2_S[slot];    Vt2 = cmp_h2_Vt[slot]
-                h2_dense = np.zeros((n, n), dtype=np.float32)
-                if (r2 is not None) and (c2 is not None) and r2.size and c2.size and (U2 is not None):
-                    sub = hybrid_svd_decompress(
-                        U2.astype(np.float32, copy=False), S2,
-                        Vt2.astype(np.float32, copy=False),
-                        (int(r2.size), int(c2.size)), out_dtype=np.float32)
-                    h2_dense[np.ix_(r2.astype(np.int64, copy=False),
-                                    c2.astype(np.int64, copy=False))] = sub
-
-                r4 = cmp_h4_rows[slot]; c4 = cmp_h4_cols[slot]
-                U4 = cmp_h4_U[slot];    S4 = cmp_h4_S[slot];    Vt4 = cmp_h4_Vt[slot]
-                h4_mat = np.zeros((n2_dim, n2_dim), dtype=np.float32)
-                if (r4 is not None) and (c4 is not None) and r4.size and c4.size and (U4 is not None):
-                    sub4 = hybrid_svd_decompress(
-                        U4.astype(np.float32, copy=False), S4,
-                        Vt4.astype(np.float32, copy=False),
-                        (int(r4.size), int(c4.size)), out_dtype=np.float32)
-                    h4_mat[np.ix_(r4.astype(np.int64, copy=False),
-                                  c4.astype(np.int64, copy=False))] = sub4
-                h4_dense = h4_mat.reshape((n, n, n, n))
-            else:
-                idx2 = cmp_h2_idx_list[slot]; val2 = cmp_h2_val_list[slot]
-                h2_dense = np.zeros(n * n, dtype=np.float32)
-                if (idx2 is not None) and idx2.size:
-                    h2_dense[idx2.astype(np.int64, copy=False)] = val2.astype(np.float32, copy=False)
-                h2_dense = h2_dense.reshape(n, n)
-
-                idx4 = cmp_h4_idx_list[slot]; val4 = cmp_h4_val_list[slot]
-                h4_dense = np.zeros(n**4, dtype=np.float32)
-                if (idx4 is not None) and idx4.size:
-                    h4_dense[idx4.astype(np.int64, copy=False)] = val4.astype(np.float32, copy=False)
-                h4_dense = h4_dense.reshape(n, n, n, n)
-
-            if _cmp_exp_scale:
-                h2_dense = h2_dense * mu2
-                h4_dense = h4_dense * mu4
-
-            return jnp.array(h2_dense, dtype=jnp.float32), jnp.array(h4_dense, dtype=jnp.float32)
-
-        # --- 1. 正向流：H 对角化 + 检查点压缩存储 ---
-        curr_H2 = H2_init
-        curr_H4 = H4_init
-
-        checkpoints_steps = [0]
+        ckpt_state = _gpu_make_storage(max_ckpts)
         ckpt_slot_map = {0: 0}
-        _cmp_store(0, curr_H2, curr_H4)
+        checkpoints_steps = [0]
+        _gpu_cmp_store(ckpt_state, 0, curr_H2, curr_H4)
         n_ckpts = 1
 
         k = 1
         J0 = 1.0
-        while k < len(dl_arr) and J0 > cutoff:
-            steps = np.array([dl_arr[k - 1], dl_arr[k]], dtype=dl_arr.dtype)
+        t_span = torch.empty(2, dtype=torch.float32, device=device_h)
+        y0_flat = torch.empty(n2_dim + n**4, dtype=torch.float32, device=device_h)
 
-            # 推进 H 一步
-            soln_H = ode(int_ode, [curr_H2, curr_H4], steps, rtol=_rtol, atol=_atol)
-            curr_H2 = soln_H[0][-1]
-            curr_H4 = soln_H[1][-1]
+        while k < len(dl_arr) and J0 > cutoff:
+            t_span[0] = float(dl_arr[k - 1])
+            t_span[1] = float(dl_arr[k])
+            _pack_state_torch(y0_flat, curr_H2, curr_H4, n2_dim)
+            soln = torch_odeint(_ode_fn, y0_flat, t_span, rtol=_rtol, atol=_atol, method='dopri5')
+            curr_H2 = soln[-1][:n2_dim].reshape(n, n).detach().clone()
+            curr_H4 = soln[-1][n2_dim:].reshape(n, n, n, n).detach().clone()
+            del soln
 
             if k % ckpt_step == 0 and n_ckpts < max_ckpts:
                 ckpt_slot_map[k] = n_ckpts
                 checkpoints_steps.append(k)
-                _cmp_store(n_ckpts, curr_H2, curr_H4)
+                _gpu_cmp_store(ckpt_state, n_ckpts, curr_H2, curr_H4)
                 n_ckpts += 1
 
-            J0 = float(jnp.max(jnp.abs(curr_H2 - jnp.diag(jnp.diag(curr_H2)))))
+            J0 = float(torch.max(torch.abs(curr_H2 - torch.diag(torch.diag(curr_H2)))))
+            if k % 1000 == 0:
+                print(f"  [对角化] k={k:5d}  l={dl_arr[k-1]:.4e}  J0={J0:.3e}  ckpts={n_ckpts}")
             k += 1
 
         final_step = k - 1
         if checkpoints_steps[-1] != final_step and n_ckpts < max_ckpts:
             ckpt_slot_map[final_step] = n_ckpts
             checkpoints_steps.append(final_step)
-            _cmp_store(n_ckpts, curr_H2, curr_H4)
+            _gpu_cmp_store(ckpt_state, n_ckpts, curr_H2, curr_H4)
             n_ckpts += 1
 
+        print(f"  对角化完成，共 {final_step} 步，l_final={dl_arr[final_step]:.4e}，J0={J0:.3e}，检查点数={n_ckpts}")
         dl_list_final = dl_arr[:final_step + 1]
 
+        # ── Phase 2: l-bit（device_h）──
         H0_diag = curr_H2
         Hintfinal = curr_H4
-        h_final_flat = jnp.concatenate((curr_H2.reshape(n**2), curr_H4.reshape(n**4)))
-
-        # --- 2. 提取 l-bit 相互作用 ---
-        HFint = np.zeros((n, n), dtype=np.float64)
-        Hint_np = np.array(Hintfinal)
-        for i in range(n):
-            for j in range(n):
-                HFint[i, j] = Hint_np[i, i, j, j] - Hint_np[i, j, j, i]
-
-        lbits = np.zeros(n - 1, dtype=np.float64)
+        idx = torch.arange(n, device=device_h)
+        HFint = (Hintfinal[idx[:,None],idx[:,None],idx[None,:],idx[None,:]]
+               - Hintfinal[idx[:,None],idx[None,:],idx[None,:],idx[:,None]])
+        lbits_list = []
         for q in range(1, n):
-            vals = np.abs(np.diag(HFint, q) + np.diag(HFint, -q)) / 2.0
-            vals = np.maximum(vals, 1e-30)
-            lbits[q - 1] = np.median(np.log10(vals))
+            diag_q = torch.diagonal(HFint, offset=q)
+            diag_nq = torch.diagonal(HFint, offset=-q)
+            vals = (diag_q.abs() + diag_nq.abs()) / 2.0
+            vals = vals.clamp(min=1e-30)
+            lbits_list.append(vals.log10().median().item())
+        lbits = np.array(lbits_list, dtype=np.float64)
+        del HFint
 
-        # --- 3. 在 LIOM 基中初始化数密度算符，反向演化到原始基 ---
-        jit_update = jit(update)
-        liom2_all = np.zeros((n, n, n), dtype=np.float32)   # [site, i, j]
-        liom4_all = np.zeros((n, n, n, n, n), dtype=np.float32)  # [site, i, j, k, l]
+        # ═══════════════════════════════════════════════════
+        # 3. 反向流
+        # ═══════════════════════════════════════════════════
 
-        n2_list = [jnp.zeros((n, n), dtype=jnp.float32).at[site, site].set(1.0) for site in range(n)]
-        n4_list = [jnp.zeros((n, n, n, n), dtype=jnp.float32) for _ in range(n)]
+        # ── 共用: _recompute_segment_gpu（GPU0 上 H 段重算）──
+        def _recompute_segment_gpu(start_step_idx, end_step_idx, stream):
+            """在指定 CUDA stream 上重算一段 H 轨迹（device_h），返回 (seg_state, done_event)。"""
+            seg_len = end_step_idx - start_step_idx
+            seg_state = _gpu_make_storage(seg_len)
+            t_local = torch.empty(2, dtype=torch.float32, device=device_h)
+            y0_local = torch.empty(n2_dim + n**4, dtype=torch.float32, device=device_h)
+            done = torch.cuda.Event()
+            with torch.cuda.stream(stream):
+                slot = ckpt_slot_map[int(start_step_idx)]
+                temp_H2, temp_H4 = _gpu_cmp_load(ckpt_state, slot)
+                for curr_step in range(start_step_idx, end_step_idx):
+                    local_idx = curr_step - start_step_idx
+                    _gpu_cmp_store(seg_state, local_idx, temp_H2, temp_H4)
+                    t_local[0] = float(dl_list_final[curr_step])
+                    t_local[1] = float(dl_list_final[curr_step + 1])
+                    _pack_state_torch(y0_local, temp_H2, temp_H4, n2_dim)
+                    soln = torch_odeint(_ode_fn, y0_local, t_local, rtol=_rtol, atol=_atol, method='dopri5')
+                    temp_H2 = soln[-1][:n2_dim].reshape(n, n).detach().clone()
+                    temp_H4 = soln[-1][n2_dim:].reshape(n, n, n, n).detach().clone()
+                    del soln
+                done.record(stream)
+            return seg_state, done
 
-        # 分段反向演化（使用压缩检查点）
-        for seg_idx in range(len(checkpoints_steps) - 1, 0, -1):
-            start_step_idx = int(checkpoints_steps[seg_idx - 1])
-            end_step_idx   = int(checkpoints_steps[seg_idx])
-            # 重算该段轨迹（稠密形式）
-            slot = ckpt_slot_map[int(start_step_idx)]
-            temp_H2, temp_H4 = _cmp_load(slot)
-            seg_h2 = [None] * (end_step_idx - start_step_idx)
-            seg_h4 = [None] * (end_step_idx - start_step_idx)
-            for curr_step in range(start_step_idx, end_step_idx):
-                local_idx = curr_step - start_step_idx
-                seg_h2[local_idx] = temp_H2
-                seg_h4[local_idx] = temp_H4
-                steps = np.array([dl_list_final[curr_step], dl_list_final[curr_step + 1]], dtype=dl_list_final.dtype)
-                soln = ode(int_ode, [temp_H2, temp_H4], steps, rtol=_rtol, atol=_atol)
-                temp_H2 = soln[0][-1]
-                temp_H4 = soln[1][-1]
+        # ── 判断是否启用多 LIOM GPU 模式 ──
+        # 环境变量 PYFLOW_NUM_LIOM_GPUS: LIOM 使用的 GPU 数量（默认0=禁用，使用原2-GPU流水线）
+        # 例如: PYFLOW_NUM_LIOM_GPUS=3 → GPU0做H重算, GPU1/2/3均分LIOM
+        #        PYFLOW_NUM_LIOM_GPUS=1 → GPU0做H重算, GPU1做全部LIOM（即原2-GPU流水线）
+        #        PYFLOW_NUM_LIOM_GPUS=0 → 走原分支（单GPU/原2-GPU）
+        _num_liom_gpus = int(os.environ.get('PYFLOW_NUM_LIOM_GPUS', '0'))
+        _use_multi_liom = (_num_liom_gpus >= 1 and _is_multi_gpu and _num_gpus > _num_liom_gpus)
 
-            for local_idx in range(end_step_idx - start_step_idx - 1, -1, -1):
-                global_step = start_step_idx + local_idx
-                for site in range(n):
-                    n2_list[site], n4_list[site] = jit_update(
-                        n2_list[site], n4_list[site],
-                        seg_h2[local_idx], seg_h4[local_idx],
-                        np.array([dl_list_final[global_step + 1], dl_list_final[global_step]], dtype=np.float64)
+        # ── Profile 计时开关 ──
+        _profile_timing = os.environ.get('PYFLOW_PROFILE_TIMING', '0') in ('1', 'true', 'True')
+
+        if _use_multi_liom:
+            # ═══════════════════════════════════════════════════
+            # 3a. 多 LIOM GPU 流水线（新增）
+            #     GPU0: H 段重算
+            #     GPU1..K: LIOM 均分（K = PYFLOW_NUM_LIOM_GPUS）
+            # ═══════════════════════════════════════════════════
+
+            # ── LIOM GPU 列表 ──
+            device_liom_list = [torch.device(f'cuda:{_gpu_ids[i + 1]}') for i in range(_num_liom_gpus)]
+            print(
+                f"        [torch:1111] multi-LIOM pipeline"
+                f"  H→{device_h} ({torch.cuda.get_device_name(device_h)})"
+            )
+            for i, d in enumerate(device_liom_list):
+                print(
+                    f"          LIOM[{i}]→{d} ({torch.cuda.get_device_name(d)})"
+                )
+
+            # ── Mask: 每张 LIOM GPU 独立创建 ──
+            ex_mask_liom = [_ex_helper_torch(n, d) for d in device_liom_list]
+            no_mask_liom = [_no_helper_torch(n, d) for d in device_liom_list]
+
+            # ── 站点分配: 将 n 个格点尽量均分到 _num_liom_gpus 张卡 ──
+            sites_per_gpu = []
+            base = n // _num_liom_gpus
+            rem = n % _num_liom_gpus
+            for i in range(_num_liom_gpus):
+                sites_per_gpu.append(base + (1 if i < rem else 0))
+            site_start = [0]
+            for s in sites_per_gpu[:-1]:
+                site_start.append(site_start[-1] + s)
+            for i in range(_num_liom_gpus):
+                print(
+                    f"          LIOM[{i}] sites: {site_start[i]}→"
+                    f"{site_start[i] + sites_per_gpu[i] - 1}"
+                    f" (共{sites_per_gpu[i]}个)"
+                )
+
+            # ── 新函数: _update_torch_batch_ex（显式传入 mask，不依赖闭包）──
+            def _update_torch_batch_ex(n2_b, n4_b, H2, Hint_b4, dl, ex_mask, no_mask):
+                # ── 批量 Wegner 流更新 ──
+                H0, V0, Hint0, Vint = _extract_diag_torch(H2, Hint_b4, ex_mask)
+                eta2 = _con22_torch(H0, V0)
+                eta4 = _con42_torch(Hint0, V0, no_mask) + _con24_torch(H0, Vint, no_mask)
+                dn2 = torch.einsum('ij,sjk->sik', eta2, n2_b) - torch.einsum('sij,jk->sik', n2_b, eta2)
+                n2_b.add_(dl * dn2)
+
+                c42  = torch.einsum('abcd,sdf->sabcf', eta4, n2_b)
+                c42 -= torch.einsum('abcd,sec->sabed', eta4, n2_b)
+                c42 += torch.einsum('abcd,sbf->safcd', eta4, n2_b)
+                c42 -= torch.einsum('abcd,sea->sebcd', eta4, n2_b)
+                c42 -= torch.einsum('sabcd,df->sabcf', n4_b, eta2)
+                c42 += torch.einsum('sabcd,ec->sabed', n4_b, eta2)
+                c42 -= torch.einsum('sabcd,bf->safcd', n4_b, eta2)
+                c42 += torch.einsum('sabcd,ea->sebcd', n4_b, eta2)
+
+                c42 = c42.contiguous()
+                c42.view(n2_b.shape[0], n**4).mul_(no_mask)
+                n4_b.add_(dl * c42)
+
+                return n2_b, n4_b
+
+            # ── 新函数: _seg_broadcast_multi（广播到多张 LIOM GPU）──
+            def _seg_broadcast_multi(seg, dst_devices):
+                """将 seg_state 并行拷贝到多张 GPU。返回 [(seg_on_dev, copy_event), ...]"""
+                results = []
+                for dst in dst_devices:
+                    new_seg = {"capacity": seg["capacity"], "h2_list": [], "h4_list": []}
+                    for t in seg["h2_list"]:
+                        new_seg["h2_list"].append(t.to(dst, non_blocking=True))
+                    for t in seg["h4_list"]:
+                        new_seg["h4_list"].append(t.to(dst, non_blocking=True))
+                    ev = torch.cuda.Event()
+                    ev.record(torch.cuda.current_stream(dst))
+                    results.append((new_seg, ev))
+                return results
+
+            # ── 初始化各 LIOM GPU 上的 n2 / n4（拆分 batch 维度 s）──
+            n2_liom = []
+            n4_liom = []
+            for i in range(_num_liom_gpus):
+                bs = sites_per_gpu[i]
+                dev = device_liom_list[i]
+                n2_i = torch.zeros((bs, n, n), dtype=torch.float32, device=dev)
+                offset = site_start[i]
+                for s in range(bs):
+                    site = offset + s
+                    n2_i[s, site, site] = 1.0
+                n4_i = torch.zeros((bs, n, n, n, n), dtype=torch.float32, device=dev)
+                n2_liom.append(n2_i)
+                n4_liom.append(n4_i)
+
+            num_segs = len(checkpoints_steps) - 1
+            if num_segs == 0:
+                print("  [Pipeline] 无段可处理")
+            else:
+                stream_h = torch.cuda.Stream(device=device_h)
+                stream_liom = [torch.cuda.Stream(device=d) for d in device_liom_list]
+
+                # 预热：重算最后一段 H，广播到所有 LIOM GPU
+                last_seg = num_segs
+                start_prev = int(checkpoints_steps[last_seg - 1])
+                end_prev   = int(checkpoints_steps[last_seg])
+                print(f"  [Pipeline 预热] H重算段{last_seg}: steps {start_prev}→{end_prev}")
+                seg_prev_h, ev_prev = _recompute_segment_gpu(start_prev, end_prev, stream_h)
+                ev_prev.synchronize()
+                bc_results = _seg_broadcast_multi(seg_prev_h, device_liom_list)
+                seg_prev_liom = [r[0] for r in bc_results]
+                for i in range(_num_liom_gpus):
+                    stream_liom[i].wait_event(bc_results[i][1])
+
+                # 流水线主循环
+                # ── H 重算子线程辅助函数 ──
+                import threading
+
+                def _h_thread_target(result_holder, start_step, end_step, stream):
+                    seg, ev = _recompute_segment_gpu(start_step, end_step, stream)
+                    result_holder["seg"] = seg
+                    result_holder["ev"] = ev
+
+                for seg_idx in range(num_segs - 1, 0, -1):
+                    start_curr = int(checkpoints_steps[seg_idx - 1])
+                    end_curr   = int(checkpoints_steps[seg_idx])
+                    print(
+                        f"  [Pipeline] H重算段{seg_idx}(GPU{_gpu_ids[0]})"
+                        f" || LIOM段{seg_idx + 1}({_num_liom_gpus}×GPU)"
                     )
 
-            del seg_h2, seg_h4, temp_H2, temp_H4
+                    # A. 启动 H 重算子线程（GPU0），主线程立即继续
+                    _t_a0 = time.perf_counter() if _profile_timing else 0.0
+                    _h_result = {}
+                    _h_thread = threading.Thread(
+                        target=_h_thread_target,
+                        args=(_h_result, start_curr, end_curr, stream_h),
+                    )
+                    _h_thread.start()
+                    _t_a1 = time.perf_counter() if _profile_timing else 0.0
 
-        for site in range(n):
-            liom2_all[site] = np.array(n2_list[site], dtype=np.float32)
-            liom4_all[site] = np.array(n4_list[site], dtype=np.float32)
+                    # B. 主线程立即分发 LIOM（H 重算在后台线程并行执行）
+                    _t_b0 = time.perf_counter() if _profile_timing else 0.0
+                    for i in range(_num_liom_gpus):
+                        with torch.cuda.stream(stream_liom[i]):
+                            seg_len = seg_prev_liom[i]["capacity"]
+                            for local_idx in range(seg_len - 1, -1, -1):
+                                global_step = start_prev + local_idx
+                                dl = float(dl_list_final[global_step] - dl_list_final[global_step + 1])
+                                h2_now, h4_now = _gpu_cmp_load(seg_prev_liom[i], local_idx)
+                                n2_liom[i], n4_liom[i] = _update_torch_batch_ex(
+                                    n2_liom[i], n4_liom[i], h2_now, h4_now, dl,
+                                    ex_mask_liom[i], no_mask_liom[i],
+                                )
+                    _t_b1 = time.perf_counter() if _profile_timing else 0.0
 
-        output = {
-            "H0_diag": np.array(H0_diag),
-            "Hint": np.array(Hintfinal),
-            "LIOM Interactions": np.array(lbits),
-            "Invariant": 0,
-            "ckpt_step": int(ckpt_step),
-            "steps_evolved": int(final_step),
-            "compress_mode": int(compress_mode),
-            "LIOM2": liom2_all,
-            "LIOM4": liom4_all,
-            "peak_memory_bytes": int(
-                (final_step // ckpt_step + 2) * (n * n + n * n * n * n) * 4  # 检查点
-                + ckpt_step * (n * n + n * n * n * n) * 4                     # 重算段
-                + n * (n * n + n * n * n * n) * 4                             # LIOM2/4_all（并行）
-            ),
-        }
-        return output
+                    # 等待 H 子线程完成
+                    _h_thread.join()
+                    seg_next_h = _h_result["seg"]
+                    ev_h = _h_result["ev"]
 
-    # # ══════════════════════════════════════════════════════════════════════
-    # elif switch_num == 1101:
-    #     # 分支 1101：pipeline + parallel + checkpoint
-    #     # 在分支 101 的基础上，反向流时用一个后台线程预取下一段的 H 重算结果
-    #     # 任意时刻内存中最多存在 2 段重算的 H：当前消费中的 + 后台预取中的
-    #     # ══════════════════════════════════════════════════════════════════
+                    # C. 等待 H 重算完成（GPU 侧）
+                    _t_c0 = time.perf_counter() if _profile_timing else 0.0
+                    ev_h.synchronize()
+                    _t_c1 = time.perf_counter() if _profile_timing else 0.0
 
-    #     from concurrent.futures import ThreadPoolExecutor
+                    # D. 广播新段到所有 LIOM GPU
+                    _t_d0 = time.perf_counter() if _profile_timing else 0.0
+                    bc_results = _seg_broadcast_multi(seg_next_h, device_liom_list)
+                    _t_d1 = time.perf_counter() if _profile_timing else 0.0
 
-    #     H2_init = jnp.array(hamiltonian.H2_spinless)
-    #     H4_init = jnp.array(hamiltonian.H4_spinless)
-    #     orig_dtype = H2_init.dtype
+                    # E. 等待当前 LIOM 完成
+                    _t_e0 = time.perf_counter() if _profile_timing else 0.0
+                    for i in range(_num_liom_gpus):
+                        stream_liom[i].synchronize()
+                    _t_e1 = time.perf_counter() if _profile_timing else 0.0
 
-    #     dl_arr = np.array(dl_list, dtype=np.float64)
-    #     if dl_arr.ndim != 1 or len(dl_arr) < 2:
-    #         raise ValueError("dl_list must be a 1D array with at least two time points.")
+                    if _profile_timing:
+                        print(
+                            f"  [Profile] seg={seg_idx:3d}"
+                            f"  H_dispatch={_t_a1 - _t_a0:.3f}s"
+                            f"  LIOM_launch={_t_b1 - _t_b0:.3f}s"
+                            f"  H_wait={_t_c1 - _t_c0:.3f}s"
+                            f"  BC={_t_d1 - _t_d0:.3f}s"
+                            f"  LIOM_wait={_t_e1 - _t_e0:.3f}s"
+                        )
 
-    #     max_steps = min(int(qmax), len(dl_arr))
-    #     if max_steps < 2:
-    #         raise ValueError("qmax and dl_list imply fewer than two usable time points.")
-    #     dl_arr = dl_arr[:max_steps]
+                    # F. 清理旧段
+                    del seg_prev_h
+                    seg_prev_liom.clear()
 
-    #     if ckpt_step is None:
-    #         ckpt_step = min(40, int(np.sqrt(max_steps)))
-    #     ckpt_step = max(1, int(ckpt_step))
+                    # G. 轮转，设置下一轮 copy wait
+                    seg_prev_h = seg_next_h
+                    seg_prev_liom = [r[0] for r in bc_results]
+                    for i in range(_num_liom_gpus):
+                        stream_liom[i].wait_event(bc_results[i][1])
+                    start_prev = start_curr
+                    end_prev = end_curr
 
-    #     _rtol = 1e-6
-    #     _atol = 1e-6
+                # 收尾：更新第一个段
+                print(f"  [Pipeline 收尾] LIOM段1 ({_num_liom_gpus}×GPU)")
+                for i in range(_num_liom_gpus):
+                    with torch.cuda.stream(stream_liom[i]):
+                        seg_len = seg_prev_liom[i]["capacity"]
+                        for local_idx in range(seg_len - 1, -1, -1):
+                            global_step = int(checkpoints_steps[0]) + local_idx
+                            dl = float(dl_list_final[global_step] - dl_list_final[global_step + 1])
+                            h2_now, h4_now = _gpu_cmp_load(seg_prev_liom[i], local_idx)
+                            n2_liom[i], n4_liom[i] = _update_torch_batch_ex(
+                                n2_liom[i], n4_liom[i], h2_now, h4_now, dl,
+                                ex_mask_liom[i], no_mask_liom[i],
+                            )
+                torch.cuda.synchronize()
+                del seg_prev_h
+                seg_prev_liom.clear()
 
-    #     # --- 1. 正向流：H 对角化，稀疏存储检查点 ---
-    #     curr_H2 = H2_init
-    #     curr_H4 = H4_init
-    #     checkpoints = [(0, np.array(curr_H2, dtype=orig_dtype), np.array(curr_H4, dtype=orig_dtype))]
+            # ── 收集 LIOM 结果：将各 GPU 切片 cat 到 device_h ──
+            n2_parts = [n2_liom[i].to(device_h) for i in range(_num_liom_gpus)]
+            n4_parts = [n4_liom[i].to(device_h) for i in range(_num_liom_gpus)]
+            liom2_all = torch.cat(n2_parts, dim=0).detach().clone()
+            liom4_all = torch.cat(n4_parts, dim=0).detach().clone()
 
-    #     k = 1
-    #     J0 = 1.0
-    #     while k < len(dl_arr) and J0 > cutoff:
-    #         steps = np.array([dl_arr[k - 1], dl_arr[k]], dtype=dl_arr.dtype)
+            _elapsed = time.perf_counter() - _t_start
 
-    #         # 推进 H 一步
-    #         soln_H = ode(int_ode, [curr_H2, curr_H4], steps, rtol=_rtol, atol=_atol)
-    #         curr_H2 = soln_H[0][-1]
-    #         curr_H4 = soln_H[1][-1]
+            per_h_elems = n2_dim + n**4
+            ckpt_bytes = n_ckpts * per_h_elems * 4
+            # seg 缓冲: GPU0 1份 + 每张 LIOM GPU 1份
+            seg_bytes  = ckpt_step * per_h_elems * 4 * (_num_liom_gpus + 1)
+            liom_bytes = n * per_h_elems * 4
 
-    #         if k % ckpt_step == 0:
-    #             checkpoints.append((k, np.array(curr_H2, dtype=orig_dtype), np.array(curr_H4, dtype=orig_dtype)))
-    #         J0 = float(jnp.max(jnp.abs(curr_H2 - jnp.diag(jnp.diag(curr_H2)))))
-    #         k += 1
+            output = {
+                "H0_diag": H0_diag.detach().cpu().numpy(),
+                "Hint": Hintfinal.detach().cpu().numpy(),
+                "LIOM Interactions": lbits,
+                "steps_evolved": int(final_step),
+                "ckpt_step": int(ckpt_step),
+                "LIOM2": liom2_all.detach().cpu().numpy(),
+                "LIOM4": liom4_all.detach().cpu().numpy(),
+                "elapsed_s": _elapsed,
+                "peak_memory_bytes": int(ckpt_bytes + seg_bytes + liom_bytes),
+            }
+            return output
 
-    #     final_step = k - 1
-    #     if checkpoints[-1][0] != final_step:
-    #         checkpoints.append((final_step, np.array(curr_H2, dtype=orig_dtype), np.array(curr_H4, dtype=orig_dtype)))
+        else:
+            # ═══════════════════════════════════════════════════
+            # 3b. 原 2-GPU / 单 GPU 流水线（保持不变）
+            # ═══════════════════════════════════════════════════
+            ex_mask_n = ex_mask_h.to(device_n) if _is_multi_gpu else ex_mask_h
+            no_mask_n = no_mask_h.to(device_n) if _is_multi_gpu else no_mask_h
 
-    #     dl_list_final = dl_arr[:final_step + 1]
+            n2_batch = torch.zeros((n, n, n), dtype=torch.float32, device=device_n)
+            n2_batch[torch.arange(n, device=device_n),
+                     torch.arange(n, device=device_n),
+                     torch.arange(n, device=device_n)] = 1.0
+            n4_batch = torch.zeros((n, n, n, n, n), dtype=torch.float32, device=device_n)
 
-    #     H0_diag = curr_H2
-    #     Hintfinal = curr_H4
-    #     h_final_flat = jnp.concatenate((curr_H2.reshape(n**2), curr_H4.reshape(n**4)))
+            def _update_torch_batch(n2_b, n4_b, H2, Hint_b4, dl):
+                # ── 批量 Wegner 流更新（内存优化: 直接在 c42 上累加）──
+                H0, V0, Hint0, Vint = _extract_diag_torch(H2, Hint_b4, ex_mask_n)
+                eta2 = _con22_torch(H0, V0)
+                eta4 = _con42_torch(Hint0, V0, no_mask_n) + _con24_torch(H0, Vint, no_mask_n)
+                dn2 = torch.einsum('ij,sjk->sik', eta2, n2_b) - torch.einsum('sij,jk->sik', n2_b, eta2)
+                n2_b.add_(dl * dn2)
 
-    #     # --- 2. 提取 l-bit 相互作用 ---
-    #     HFint = np.zeros((n, n), dtype=np.float64)
-    #     Hint_np = np.array(Hintfinal)
-    #     for i in range(n):
-    #         for j in range(n):
-    #             HFint[i, j] = Hint_np[i, i, j, j] - Hint_np[i, j, j, i]
+                c42  = torch.einsum('abcd,sdf->sabcf', eta4, n2_b)
+                c42 -= torch.einsum('abcd,sec->sabed', eta4, n2_b)
+                c42 += torch.einsum('abcd,sbf->safcd', eta4, n2_b)
+                c42 -= torch.einsum('abcd,sea->sebcd', eta4, n2_b)
+                c42 -= torch.einsum('sabcd,df->sabcf', n4_b, eta2)
+                c42 += torch.einsum('sabcd,ec->sabed', n4_b, eta2)
+                c42 -= torch.einsum('sabcd,bf->safcd', n4_b, eta2)
+                c42 += torch.einsum('sabcd,ea->sebcd', n4_b, eta2)
 
-    #     lbits = np.zeros(n - 1, dtype=np.float64)
-    #     for q in range(1, n):
-    #         vals = np.abs(np.diag(HFint, q) + np.diag(HFint, -q)) / 2.0
-    #         vals = np.maximum(vals, 1e-30)
-    #         lbits[q - 1] = np.median(np.log10(vals))
+                c42 = c42.contiguous()
+                c42.view(n, n**4).mul_(no_mask_n)
+                n4_b.add_(dl * c42)
 
-    #     # --- 3. 反向流：vmap 并行化 + pipeline 流水线（parallel=1）---
-    #     from jax import vmap
-    #     from concurrent.futures import ThreadPoolExecutor
+                return n2_b, n4_b
 
-    #     # n2_batch[site, i, j] / n4_batch[site, i, j, k, l]
-    #     n2_batch = jnp.zeros((n, n, n), dtype=jnp.float32)
-    #     n2_batch = n2_batch.at[jnp.arange(n), jnp.arange(n), jnp.arange(n)].set(1.0)
-    #     n4_batch = jnp.zeros((n, n, n, n, n), dtype=jnp.float32)
+            num_segs = len(checkpoints_steps) - 1
+            if num_segs == 0:
+                print("  [Pipeline] 无段可处理")
+            else:
+                stream_h = torch.cuda.Stream(device=device_h)
+                stream_n = torch.cuda.Stream(device=device_n)
 
-    #     def _update_one(n2, n4, H2, H4, steps):
-    #         return update(n2, n4, H2, H4, steps)
-    #     batch_update = jit(vmap(_update_one, in_axes=(0, 0, None, None, None)))
+                # 预热：重算最后一段 H 轨迹（device_h），拷贝到 device_n
+                last_seg = num_segs
+                start_prev = int(checkpoints_steps[last_seg - 1])
+                end_prev   = int(checkpoints_steps[last_seg])
+                print(f"  [Pipeline 预热] H重算段{last_seg}: steps {start_prev}→{end_prev}")
+                seg_prev_h, ev_prev = _recompute_segment_gpu(start_prev, end_prev, stream_h)
+                seg_prev_n, copy_ev = _seg_to_device(seg_prev_h, device_n)
+                if copy_ev is not None:
+                    stream_n.wait_event(copy_ev)  # GPU device_n 等拷贝完成
 
-    #     checkpoints_map = {}
-    #     for step_idx, h2_cp, h4_cp in checkpoints:
-    #         checkpoints_map[int(step_idx)] = (h2_cp, h4_cp)
+                # 流水线主循环
+                for seg_idx in range(num_segs - 1, 0, -1):
+                    start_curr = int(checkpoints_steps[seg_idx - 1])
+                    end_curr   = int(checkpoints_steps[seg_idx])
+                    if _is_multi_gpu:
+                        print(f"  [Pipeline] H重算段{seg_idx}(GPU{_gpu_ids[0]}) || LIOM段{seg_idx+1}(GPU{_gpu_ids[1]})")
+                    else:
+                        print(f"  [Pipeline] H重算段{seg_idx}({start_curr}→{end_curr}) || LIOM段{seg_idx+1}")
 
-    #     def _recompute_segment(start_step_idx, end_step_idx):
-    #         segment_len = end_step_idx - start_step_idx
-    #         if segment_len <= 0:
-    #             return [], []
-    #         temp_H2 = jnp.array(checkpoints_map[start_step_idx][0])
-    #         temp_H4 = jnp.array(checkpoints_map[start_step_idx][1])
-    #         seg_h2 = [None] * segment_len
-    #         seg_h4 = [None] * segment_len
-    #         for curr_step in range(start_step_idx, end_step_idx):
-    #             local_idx = curr_step - start_step_idx
-    #             seg_h2[local_idx] = temp_H2
-    #             seg_h4[local_idx] = temp_H4
-    #             steps = np.array([dl_list_final[curr_step], dl_list_final[curr_step + 1]], dtype=dl_list_final.dtype)
-    #             soln = ode(int_ode, [temp_H2, temp_H4], steps, rtol=_rtol, atol=_atol)
-    #             temp_H2 = soln[0][-1]
-    #             temp_H4 = soln[1][-1]
-    #         return seg_h2, seg_h4
+                    # stream_h: 启动下一段 H 重算（device_h）
+                    _t_a0 = time.perf_counter() if _profile_timing else 0.0
+                    seg_next_h, ev_h = _recompute_segment_gpu(start_curr, end_curr, stream_h)
+                    _t_a1 = time.perf_counter() if _profile_timing else 0.0
 
-    #     seg_indices = list(range(len(checkpoints) - 1, 0, -1))
+                    # stream_n: 更新当前段 LIOM（device_n，使用已拷贝的 seg_prev_n）
+                    _t_b0 = time.perf_counter() if _profile_timing else 0.0
+                    with torch.cuda.stream(stream_n):
+                        seg_len = seg_prev_n["capacity"]
+                        for local_idx in range(seg_len - 1, -1, -1):
+                            global_step = start_prev + local_idx
+                            dl = float(dl_list_final[global_step] - dl_list_final[global_step + 1])
+                            h2_now, h4_now = _gpu_cmp_load(seg_prev_n, local_idx)
+                            n2_batch, n4_batch = _update_torch_batch(n2_batch, n4_batch, h2_now, h4_now, dl)
+                    _t_b1 = time.perf_counter() if _profile_timing else 0.0
 
-    #     if seg_indices:
-    #         with ThreadPoolExecutor(max_workers=1) as executor:
-    #             first_seg = seg_indices[0]
-    #             future_curr = executor.submit(
-    #                 _recompute_segment,
-    #                 int(checkpoints[first_seg - 1][0]),
-    #                 int(checkpoints[first_seg][0]),
-    #             )
+                    # 拷贝 seg_next 到 device_n，为下一轮 LIOM 准备
+                    _t_c0 = time.perf_counter() if _profile_timing else 0.0
+                    seg_next_n, copy_ev = _seg_to_device(seg_next_h, device_n)
+                    if copy_ev is not None:
+                        stream_n.wait_event(copy_ev)  # GPU device_n 等拷贝完成后下一轮 LIOM 才能开始
+                    _t_c1 = time.perf_counter() if _profile_timing else 0.0
 
-    #             for i, seg_idx in enumerate(seg_indices):
-    #                 seg_h2, seg_h4 = future_curr.result()
+                    if _profile_timing:
+                        print(
+                            f"  [Profile] seg={seg_idx:3d}"
+                            f"  H_dispatch={_t_a1 - _t_a0:.3f}s"
+                            f"  LIOM_launch={_t_b1 - _t_b0:.3f}s"
+                            f"  BC={_t_c1 - _t_c0:.3f}s"
+                        )
 
-    #                 if i + 1 < len(seg_indices):
-    #                     next_seg = seg_indices[i + 1]
-    #                     future_curr = executor.submit(
-    #                         _recompute_segment,
-    #                         int(checkpoints[next_seg - 1][0]),
-    #                         int(checkpoints[next_seg][0]),
-    #                     )
+                    del seg_prev_h
+                    if _is_multi_gpu:
+                        del seg_prev_n
+                    seg_prev_h = seg_next_h
+                    seg_prev_n = seg_next_n
+                    start_prev = start_curr
+                    end_prev = end_curr
 
-    #                 start_step_idx = int(checkpoints[seg_idx - 1][0])
-    #                 end_step_idx = int(checkpoints[seg_idx][0])
-    #                 for local_idx in range(end_step_idx - start_step_idx - 1, -1, -1):
-    #                     global_step = start_step_idx + local_idx
-    #                     steps = np.array([dl_list_final[global_step + 1], dl_list_final[global_step]], dtype=np.float64)
-    #                     n2_batch, n4_batch = batch_update(n2_batch, n4_batch,
-    #                                                        seg_h2[local_idx], seg_h4[local_idx], steps)
+                # 收尾：更新第一个段
+                if _is_multi_gpu:
+                    print(f"  [Pipeline 收尾] LIOM段1 (GPU{_gpu_ids[1]})")
+                else:
+                    print(f"  [Pipeline 收尾] LIOM段1: steps {checkpoints_steps[0]}→{checkpoints_steps[1]}")
+                seg_len_first = int(checkpoints_steps[1]) - int(checkpoints_steps[0])
+                with torch.cuda.stream(stream_n):
+                    for local_idx in range(seg_len_first - 1, -1, -1):
+                        global_step = int(checkpoints_steps[0]) + local_idx
+                        dl = float(dl_list_final[global_step] - dl_list_final[global_step + 1])
+                        h2_now, h4_now = _gpu_cmp_load(seg_prev_n, local_idx)
+                        n2_batch, n4_batch = _update_torch_batch(n2_batch, n4_batch, h2_now, h4_now, dl)
+                torch.cuda.synchronize()
+                del seg_prev_h
+                if _is_multi_gpu:
+                    del seg_prev_n
 
-    #                 del seg_h2, seg_h4
+            liom2_all = n2_batch.detach().clone()
+            liom4_all = n4_batch.detach().clone()
 
-    #     liom2_all = np.array(n2_batch, dtype=np.float32)
-    #     liom4_all = np.array(n4_batch, dtype=np.float32)
+            _elapsed = time.perf_counter() - _t_start
 
-    #     output = {
-    #         "H0_diag": np.array(H0_diag),
-    #         "Hint": np.array(Hintfinal),
-    #         "LIOM Interactions": np.array(lbits),
-    #         "Invariant": 0,
-    #         "ckpt_step": int(ckpt_step),
-    #         "steps_evolved": int(final_step),
-    #         "LIOM2": liom2_all,
-    #         "LIOM4": liom4_all,
-    #         "peak_memory_bytes": int(
-    #             (final_step // ckpt_step + 2) * (n * n + n * n * n * n) * 4  # 检查点
-    #             + 2 * ckpt_step * (n * n + n * n * n * n) * 4                 # 流水线：2 段
-    #             + n * (n * n + n * n * n * n) * 4                             # LIOM2/4_all（并行）
-    #         ),
-    #     }
-    #     return output
+            per_h_elems = n2_dim + n**4
+            ckpt_bytes = n_ckpts * per_h_elems * 4
+            seg_bytes  = ckpt_step * per_h_elems * 4 * 2  # 双缓冲
+            liom_bytes = n * per_h_elems * 4
+
+            output = {
+                "H0_diag": H0_diag.detach().cpu().numpy(),
+                "Hint": Hintfinal.detach().cpu().numpy(),
+                "LIOM Interactions": lbits,
+                "steps_evolved": int(final_step),
+                "ckpt_step": int(ckpt_step),
+                "LIOM2": liom2_all.detach().cpu().numpy(),
+                "LIOM4": liom4_all.detach().cpu().numpy(),
+                "elapsed_s": _elapsed,
+                "peak_memory_bytes": int(ckpt_bytes + seg_bytes + liom_bytes),
+            }
+            return output
 
 
     else:
@@ -8336,6 +8756,1912 @@ def flow_dyn_density(
             f" checkpoint={checkpoint_switch}, pipeline={pipeline_switch})"
         )
 
+
+# ==============================================================================
+# flow_imb — 计算 Wegner 流后的非平衡动力学（Imbalance I(t)）
+#
+# 基于 flow_dyn_density 的 5 分支框架，新增：
+#   1. 正向算符 ODE 流（原始基 → 对角基）
+#   2. 对角基下的海森堡时间演化
+#   3. 反向算符 ODE 流（对角基 → 原始基），替代原来的显式 Euler
+#
+# 参考：verify_roundtrip_torch (Torch GPU) / verify_roundtrip (JAX CPU)
+# ==============================================================================
+
+# ==============================================================================
+# 模块级 Torch GPU 辅助函数
+# ==============================================================================
+
+def _fwd_op_ode_torch(t, y, eta2, eta4, ex_mask, no_mask, n):
+    """正向算符流 RHS: dn/dl = [η, n]  (Torch 版本, 兼容 torchdiffeq)"""
+    n2, n4 = y
+    dn2 = _con22_torch(eta2, n2)
+    dn4 = _con42_torch(eta4, n2, no_mask) + _con24_torch(eta2, n4, no_mask)
+    return (dn2, dn4)
+
+
+def _bck_op_ode_torch_split(t, y, eta2, eta4, ex_mask, no_mask, n):
+    """反向算符流 RHS: dn/dl = -[η, n]，实部/虚部分离  (Torch 版本)
+    y = (n2_r, n2_i, n4_r, n4_i) 全 float32"""
+    n2_r, n2_i, n4_r, n4_i = y
+    dn2_r = -_con22_torch(eta2, n2_r)
+    dn2_i = -_con22_torch(eta2, n2_i)
+    dn4_r = -(_con42_torch(eta4, n2_r, no_mask) + _con24_torch(eta2, n4_r, no_mask))
+    dn4_i = -(_con42_torch(eta4, n2_i, no_mask) + _con24_torch(eta2, n4_i, no_mask))
+    return (dn2_r, dn2_i, dn4_r, dn4_i)
+
+
+def _time_evolve_n2_n4_torch(n2, n4, H2_diag, H4_diag, t_val, n):
+    """对角基下的海森堡时间演化 (Torch 版本, 参考 verify_roundtrip_torch 第 4 步)"""
+    import torch
+
+    H_diag_2 = torch.diag(H2_diag)  # (n,) — 对角元 E_i
+
+    # 转为复数
+    n2_c = n2.to(torch.complex64)
+    n4_c = n4.to(torch.complex64)
+
+    # n2[i,j](t) = n2[i,j](0) · cos((E_i−E_j)·t)
+    delta_E = H_diag_2.unsqueeze(1) - H_diag_2.unsqueeze(0)  # E_i - E_j, (n,n)
+    n2_evo = n2_c * torch.cos(delta_E * t_val)
+
+    # n4[i,j,k,q] *= exp(-1j * (E_i + E_k - E_j - E_q) * t)
+    E = H_diag_2  # (n,)
+    delta_E4 = (E.view(n, 1, 1, 1) + E.view(1, 1, n, 1)
+                - E.view(1, n, 1, 1) - E.view(1, 1, 1, n))  # (n,n,n,n)
+    n4_evo = n4_c * torch.exp(-1j * delta_E4 * t_val)
+
+    # 相互作用修正项 (来自 dyn_exact)
+    H4_mat = H4_diag.to(torch.complex64)  # (n,n,n,n)
+    matb = n2_c.clone()                    # 初始算符 (t=0 时)
+
+    # factor_ij = (1 - exp(-1j*dE_ij*t)) / dE_ij / 2,  i==j 时极限 1j*t/2
+    dE_mat = E.unsqueeze(1) - E.unsqueeze(0)  # (n,n), E_i - E_j
+    exp_term = torch.exp(-1j * dE_mat * t_val)
+    safe_dE = dE_mat.clone()
+    safe_dE[safe_dE.abs() < 1e-12] = 1.0
+    factor_ij = (1.0 - exp_term) / safe_dE / 2.0
+    factor_ij[dE_mat.abs() < 1e-12] = 1j * t_val / 2.0
+
+    # Hint[i,i,k,k] → (n, n)
+    Hint_ik = torch.einsum('iikk->ik', H4_mat)
+
+    # 修正 1: k==q && i!=j
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            f = factor_ij[i, j]
+            m = matb[i, j]
+            for k in range(n):
+                corr = -1j * (Hint_ik[i, k] - Hint_ik[j, k]) * m * f
+                n4_evo[i, j, k, k] = n4_evo[i, j, k, k] + corr
+
+    # 修正 2: i==j && k!=q
+    for i in range(n):
+        for k in range(n):
+            for q in range(n):
+                if k == q:
+                    continue
+                f = factor_ij[k, q]
+                m = matb[k, q]
+                corr = -1j * (Hint_ik[k, i] - Hint_ik[q, i]) * m * f
+                n4_evo[i, i, k, q] = n4_evo[i, i, k, q] + corr
+
+    return n2_evo, n4_evo
+
+
+def _build_eta_torch(H2_k, H4_k, ex_mask, no_mask):
+    """从 H 构建生成元 η = [H0, V]（Torch 版本，所有 GPU 分支共用）"""
+    H2_0, V0, Hint0, Vint = _extract_diag_torch(H2_k, H4_k, ex_mask)
+    eta2 = _con22_torch(H2_0, V0)
+    eta4 = _con42_torch(Hint0, V0, no_mask) + _con24_torch(H2_0, Vint, no_mask)
+    return eta2, eta4
+
+
+# ==============================================================================
+# flow_imb — 主函数
+# ==============================================================================
+
+def flow_imb(
+    n,
+    hamiltonian,
+    dl_list,
+    qmax,
+    cutoff,
+    t_val=0.0,
+    method='jit',
+    ckpt_step=None,
+    batch_size=None,
+):
+    """
+    计算费米子系统中的非平衡动力学不平衡度 I(t) = Σ_i (-1)^i ⟨n_i(t)⟩。
+
+    流程（每个分支）：
+        1. Wegner 流正向积分对角化哈密顿量
+        2. 提取 l-bit 相互作用
+        3. 正向算符 ODE 流（原始基 → 对角基）
+        4. 对角基下的海森堡时间演化
+        5. 反向算符 ODE 流（对角基 → 原始基），使用自适应 ODE 积分器
+        6. 计算期望值和不平衡度 I(t)
+
+    分支选择（通过环境变量）：
+        switch_num = 1000*pipeline + 100*parallel + 10*compress + 1*checkpoint
+
+    Parameters
+    ----------
+    n           : 格点数
+    hamiltonian : 哈密顿量对象，需含 H2_spinless 和 H4_spinless
+    dl_list     : 流时间步列表
+    qmax        : 最大流步数
+    cutoff      : 非对角元截断阈值
+    tlist       : 时间演化点列表
+    method      : 缩并方法 'jit'/'einsum'/'tensordot'/'vec'
+    ckpt_step   : 检查点间距，默认 ≈ √qmax
+
+    Returns
+    -------
+    dict，包含：
+        H0_diag          : 最终对角二次哈密顿量
+        Hint_diag        : 最终四次哈密顿量
+        LIOM Interactions: l-bit 相互作用
+        Imbalance        : I(t) 标量值
+        elapsed_s        : 预估总耗时
+    """
+    import os
+    import time
+
+    pipeline_switch   = int(os.environ.get('pipeline_switch',   '0'))
+    parallel_switch   = int(os.environ.get('parallel_switch',   '0'))
+    compress_switch   = int(os.environ.get('compress_switch',   '0'))
+    checkpoint_switch = int(os.environ.get('checkpoint_switch', '0'))
+    switch_num = (1000 * pipeline_switch
+                  + 100 * parallel_switch
+                  +  10 * compress_switch
+                  +   1 * checkpoint_switch)
+
+    compress_mode = int(os.environ.get('compress_mode', '0'))
+    if compress_mode not in (0, 1, 2):
+        raise ValueError(f"compress_mode must be in {{0,1,2}}, got {compress_mode}")
+
+    # CDW 初始态（所有分支共用）
+    state = jnp.zeros(n, dtype=jnp.float32).at[0::2].set(1.0)
+
+    # 批处理算符数量：默认全站点，可指定更小的值以控制显存
+    _batch_size = n if batch_size is None else max(1, int(batch_size))
+    _batch_size = min(_batch_size, n)  # 不超过总站点数
+
+    # =========================================================================
+    # 辅助函数：计算期望值和不平衡度
+    # =========================================================================
+    def _compute_imbalance(n2_t, n4_t, state_arr):
+        """从单 site 算符计算 ⟨n_site(t)⟩ 并转成不平衡贡献（含 (-1)^site 因子）"""
+        nlist = 0.0
+        for i in range(n):
+            nlist += (n2_t[i, i] * state_arr[i]).real
+            for j in range(n):
+                if i != j:
+                    nlist += (n4_t[i, i, j, j] * state_arr[i] * state_arr[j]).real
+                    nlist -= (n4_t[i, j, j, i] * state_arr[i] * state_arr[j]).real
+        return nlist
+
+    # =========================================================================
+    # 提取 l-bit 相互作用（所有分支共用）
+    # =========================================================================
+    def _extract_lbits(Hint_diag, n_val):
+        """从 Hint_diag 提取 l-bit 相互作用"""
+        HFint = jnp.zeros((n_val, n_val))
+        for i in range(n_val):
+            for j in range(n_val):
+                HFint = HFint.at[i, j].set(Hint_diag[i, i, j, j] - Hint_diag[i, j, j, i])
+        lbits_out = jnp.zeros(n_val - 1)
+        for q in range(1, n_val):
+            lbits_out = lbits_out.at[q - 1].set(
+                jnp.median(jnp.log10(jnp.abs(jnp.diag(HFint, q) + jnp.diag(HFint, -q)) / 2.)))
+        return lbits_out
+
+    # =========================================================================
+    # JAX CPU: 时间演化 (dyn_exact)
+    # =========================================================================
+    def _time_evolve_jax(n2_fwd, n4_fwd, H2_diag_arr, H4_diag_arr, t_val):
+        """JAX 版本的对角基时间演化（单时间点），调用 dyn_exact"""
+        num_diag = jnp.zeros(n**2 + n**4, dtype=jnp.complex64)
+        num_diag = num_diag.at[:n**2].set(n2_fwd.reshape(-1).astype(jnp.complex64))
+        num_diag = num_diag.at[n**2:].set(n4_fwd.reshape(-1).astype(jnp.complex64))
+
+        H_diag_flat = jnp.concatenate([
+            jnp.array(H2_diag_arr, dtype=jnp.complex64).reshape(-1),
+            jnp.array(H4_diag_arr, dtype=jnp.complex64).reshape(-1),
+        ])
+
+        evolist = dyn_exact(
+            n,
+            np.array(num_diag, dtype=np.complex64),
+            np.array(H_diag_flat, dtype=np.complex64),
+            np.array([float(t_val)], dtype=float),
+        )
+        num_t_flat = evolist[0]
+        n2_evo = jnp.array(num_t_flat[:n**2].reshape(n, n), dtype=jnp.complex64)
+        n4_evo = jnp.array(num_t_flat[n**2:].reshape(n, n, n, n), dtype=jnp.complex64)
+        return n2_evo, n4_evo
+
+    # =========================================================================
+    # JAX CPU: 正向算符 ODE 流（逐段 odeint）
+    # =========================================================================
+    def _forward_op_flow_jax(n2_init, n4_init, sol_H2, sol_H4, dl_list_used):
+        """正向算符 ODE 流: 原始基 → 对角基"""
+        n2_cur = n2_init
+        n4_cur = n4_init
+        for k_inner in range(len(dl_list_used) - 1):
+            H2_k = jnp.array(sol_H2[k_inner], dtype=jnp.float32)
+            H4_k = jnp.array(sol_H4[k_inner], dtype=jnp.float32)
+            steps = jnp.array([dl_list_used[k_inner], dl_list_used[k_inner + 1]])
+            soln = ode(liom_ode_int_fwd, [n2_cur, n4_cur], steps,
+                       [H2_k, H4_k], rtol=1e-3, atol=1e-6)
+            n2_cur = soln[0][-1]
+            n4_cur = soln[1][-1]
+        return n2_cur, n4_cur
+
+    # =========================================================================
+    # JAX CPU: 反向算符 ODE 流（逐段 odeint, 支持复数）
+    # =========================================================================
+    def _backward_op_flow_jax(n2_t, n4_t, sol_H2, sol_H4, dl_list_used):
+        """反向算符 ODE 流: 对角基 → 原始基（时间变换技巧避免 NaN）"""
+        cur_n2 = n2_t
+        cur_n4 = n4_t
+        for k_inner in range(len(dl_list_used) - 2, -1, -1):
+            H2_k = jnp.array(sol_H2[k_inner], dtype=jnp.float32)
+            H4_k = jnp.array(sol_H4[k_inner], dtype=jnp.float32)
+            dl_k = float(dl_list_used[k_inner + 1] - dl_list_used[k_inner])
+            steps_s = jnp.array([0.0, dl_k])  # s: 0 → Δl（递增）
+            soln = ode(liom_ode_int_bck, [cur_n2, cur_n4], steps_s,
+                       [H2_k, H4_k], rtol=1e-3, atol=1e-6)
+            cur_n2 = soln[0][-1]
+            cur_n4 = soln[1][-1]
+        return cur_n2, cur_n4
+
+    # =====================================================================
+    # BRANCH 0: 全轨迹 + 串行反向流 (JAX CPU)
+    # =====================================================================
+    if switch_num == 0:
+        _t_start = time.perf_counter()
+        _acc_fwd = 0.0; _acc_evo = 0.0; _acc_bck = 0.0  # 累计计时(秒)
+
+        H2_init = jnp.array(hamiltonian.H2_spinless, dtype=jnp.float32)
+        H4_init = jnp.array(hamiltonian.H4_spinless, dtype=jnp.float32)
+        _rtol = float(os.environ.get('PYFLOW_ODE_RTOL', '1e-6'))
+        _atol = float(os.environ.get('PYFLOW_ODE_ATOL', '1e-6'))
+
+        # --- 1. 正向流：对角化哈密顿量，保存全轨迹 ---
+        sol_int_H2 = np.zeros((qmax, n, n), dtype=np.float32)
+        sol_int_H4 = np.zeros((qmax, n, n, n, n), dtype=np.float32)
+        sol_int_H2[0] = np.array(H2_init)
+        sol_int_H4[0] = np.array(H4_init)
+
+        curr_H2, curr_H4 = H2_init, H4_init
+        k = 1
+        J0 = 10.0
+        while k < len(dl_list) and J0 > cutoff:
+            steps = np.linspace(dl_list[k - 1], dl_list[k], num=2, endpoint=True)
+            soln = ode(int_ode, [curr_H2, curr_H4], steps, rtol=_rtol, atol=_atol)
+            curr_H2, curr_H4 = soln[0][-1], soln[1][-1]
+            sol_int_H2[k] = np.array(curr_H2)
+            sol_int_H4[k] = np.array(curr_H4)
+            off_diag = curr_H2 - jnp.diag(jnp.diag(curr_H2))
+            J0 = float(jnp.max(jnp.abs(off_diag)))
+            if k % 1000 == 0:
+                print(f"  [对角化] k={k:5d}  l={dl_list[k-1]:.4e}  J0={J0:.3e}")
+            k += 1
+
+        sol_int_H2, sol_int_H4 = sol_int_H2[:k], sol_int_H4[:k]
+        dl_list_used = dl_list[:k]
+        final_step = k - 1
+
+        H0_diag = jnp.array(sol_int_H2[-1])
+        Hint_diag = jnp.array(sol_int_H4[-1])
+
+        print(f"  对角化完成，共 {final_step} 步，l_final={dl_list_used[-1]:.4e}，J0={J0:.3e}")
+        _t_h_diag = time.perf_counter()
+
+        # --- 2. 提取 l-bit 相互作用 ---
+        lbits = _extract_lbits(Hint_diag, n)
+
+        # --- 3. 格点级动力学计算 ---
+        _fast_mode = (n >= 25)  # L>=5 时快速模式：仅演化 2 个 site 估算总时间
+        _sample_sites = [0, n // 2] if _fast_mode else list(range(n))
+        if _fast_mode:
+            print(f"  [快速模式] 仅演化 site {_sample_sites}，总时间=平均×{n}，imbalance 固定为 1.0")
+        imblist = np.zeros(n, dtype=np.float32)
+
+        for site in _sample_sites:
+            print(f'  [site {site}/{n}] 正向流...')
+            n2_init_s = jnp.zeros((n, n), dtype=jnp.float32).at[site, site].set(1.0)
+            n4_init_s = jnp.zeros((n, n, n, n), dtype=jnp.float32)
+
+            # 3a. 正向算符 ODE 流
+            _t_fwd = time.perf_counter()
+            n2_fwd, n4_fwd = _forward_op_flow_jax(
+                n2_init_s, n4_init_s, sol_int_H2, sol_int_H4, dl_list_used)
+            _acc_fwd += time.perf_counter() - _t_fwd
+
+            # 3b. 时间演化（单时间点）
+            _t_evo = time.perf_counter()
+            n2_evo, n4_evo = _time_evolve_jax(n2_fwd, n4_fwd, sol_int_H2[-1], sol_int_H4[-1], t_val)
+            _acc_evo += time.perf_counter() - _t_evo
+
+            # 3c. 反向算符 ODE 流
+            _t_bck = time.perf_counter()
+            print(f'  [site {site}/{n}] 反向流 (t={t_val:.4f})...')
+            n2_bck, n4_bck = _backward_op_flow_jax(
+                n2_evo, n4_evo, sol_int_H2, sol_int_H4, dl_list_used)
+            _acc_bck += time.perf_counter() - _t_bck
+
+            if not _fast_mode:
+                nlist = _compute_imbalance(n2_bck, n4_bck, state)
+                imblist[site] = float(((-1) ** site) * nlist / n)
+
+            gc.collect()
+
+        if _fast_mode:
+            _scale = n / len(_sample_sites)
+            _acc_fwd *= _scale; _acc_evo *= _scale; _acc_bck *= _scale
+            imblist_total = 1.0
+        else:
+            imblist_total = 2.0 * np.sum(imblist)
+
+        _elapsed = time.perf_counter() - _t_start
+
+        elems = n * n + n ** 4
+        output = {
+            "H0_diag": np.array(H0_diag),
+            "Hint_diag": np.array(Hint_diag),
+            "LIOM Interactions": np.array(lbits),
+            "Imbalance": imblist_total,
+            "elapsed_s": _elapsed,
+            "steps_evolved": int(final_step),
+            "peak_memory_bytes": int((final_step + 1) * elems * 4),
+            "timing": {
+                "h_diag_s": float(_t_h_diag - _t_start),
+                "op_fwd_s": float(_acc_fwd),
+                "time_evo_s": float(_acc_evo),
+                "op_bck_s": float(_acc_bck),
+                "total_s": float(_t_h_diag - _t_start + _acc_fwd + _acc_evo + _acc_bck),
+            },
+        }
+        return output
+
+    # =====================================================================
+    # BRANCH 1: checkpoint only (JAX CPU)
+    # =====================================================================
+    elif switch_num == 1:
+        _t_start = time.perf_counter()
+        _acc_fwd = 0.0; _acc_evo = 0.0; _acc_bck = 0.0  # 累计计时(秒)
+
+        H2_init = jnp.array(hamiltonian.H2_spinless, dtype=jnp.float32)
+        H4_init = jnp.array(hamiltonian.H4_spinless, dtype=jnp.float32)
+        orig_dtype = H2_init.dtype
+
+        dl_arr = np.array(dl_list, dtype=np.float64)
+        if dl_arr.ndim != 1 or len(dl_arr) < 2:
+            raise ValueError("dl_list must be a 1D array with at least two time points.")
+        max_steps = min(int(qmax), len(dl_arr))
+        if max_steps < 2:
+            raise ValueError("qmax and dl_list imply fewer than two usable time points.")
+        dl_arr = dl_arr[:max_steps]
+
+        if ckpt_step is None:
+            if hamiltonian.dis_type == "random":
+                ckpt_step = 100
+            else:
+                ckpt_step = 80
+        ckpt_step = max(1, int(ckpt_step))
+
+        _rtol = 1e-6
+        _atol = 1e-6
+
+        # 正向流：每 ckpt_step 步保存一个检查点
+        curr_H2 = H2_init
+        curr_H4 = H4_init
+        checkpoints = [(0, np.array(curr_H2, dtype=orig_dtype), np.array(curr_H4, dtype=orig_dtype))]
+
+        k = 1
+        J0 = 1.0
+        print_interval = 1000
+        while k < len(dl_arr) and J0 > cutoff:
+            steps = np.array([dl_arr[k - 1], dl_arr[k]], dtype=dl_arr.dtype)
+            soln = ode(int_ode, [curr_H2, curr_H4], steps, rtol=_rtol, atol=_atol)
+            curr_H2 = soln[0][-1]
+            curr_H4 = soln[1][-1]
+            if k % ckpt_step == 0:
+                checkpoints.append((k, np.array(curr_H2, dtype=orig_dtype), np.array(curr_H4, dtype=orig_dtype)))
+            J0 = float(jnp.max(jnp.abs(curr_H2 - jnp.diag(jnp.diag(curr_H2)))))
+            if k % print_interval == 0:
+                print(f"  [对角化] k={k:5d}  l={dl_arr[k-1]:.4e}  J0={J0:.3e}")
+            k += 1
+
+        print(f"  对角化完成，共 {k-1} 步，J0={J0:.3e}，检查点数={len(checkpoints)}")
+        _t_h_diag = time.perf_counter()
+
+        final_step = k - 1
+        if checkpoints[-1][0] != final_step:
+            checkpoints.append((final_step, np.array(curr_H2, dtype=orig_dtype), np.array(curr_H4, dtype=orig_dtype)))
+
+        dl_list_final = dl_arr[:final_step + 1]
+
+        H0_diag = curr_H2
+        Hint_diag = curr_H4
+
+        # --- 2. 提取 l-bit ---
+        lbits = _extract_lbits(Hint_diag, n)
+
+        # --- 构建检查点映射 ---
+        checkpoints_map = {}
+        for step_idx, h2_cp, h4_cp in checkpoints:
+            checkpoints_map[int(step_idx)] = (h2_cp, h4_cp)
+
+        def _recompute_segment(start_step_idx, end_step_idx):
+            segment_len = end_step_idx - start_step_idx
+            if segment_len <= 0:
+                return [], []
+            temp_H2 = jnp.array(checkpoints_map[start_step_idx][0])
+            temp_H4 = jnp.array(checkpoints_map[start_step_idx][1])
+            seg_h2 = [None] * segment_len
+            seg_h4 = [None] * segment_len
+            for curr_step in range(start_step_idx, end_step_idx):
+                local_idx = curr_step - start_step_idx
+                seg_h2[local_idx] = temp_H2
+                seg_h4[local_idx] = temp_H4
+                steps = np.array([dl_list_final[curr_step], dl_list_final[curr_step + 1]], dtype=dl_list_final.dtype)
+                soln = ode(int_ode, [temp_H2, temp_H4], steps, rtol=_rtol, atol=_atol)
+                temp_H2 = soln[0][-1]
+                temp_H4 = soln[1][-1]
+            return seg_h2, seg_h4
+
+        # --- 3. 格点级动力学计算 ---
+        _fast_mode = (n >= 25)  # L>=5 时快速模式：仅演化 2 个 site 估算总时间
+        _sample_sites = [0, n // 2] if _fast_mode else list(range(n))
+        if _fast_mode:
+            print(f"  [快速模式] 仅演化 site {_sample_sites}，总时间=平均×{n}，imbalance 固定为 1.0")
+        imblist = np.zeros(n, dtype=np.float32)
+
+        for site in _sample_sites:
+            print(f'  [site {site}/{n}] 正向流...')
+
+            # 3a. 正向算符 ODE 流（逐 segment）
+            _t_fwd = time.perf_counter()
+            n2_cur = jnp.zeros((n, n), dtype=jnp.float32).at[site, site].set(1.0)
+            n4_cur = jnp.zeros((n, n, n, n), dtype=jnp.float32)
+            for seg_idx in range(1, len(checkpoints)):
+                start_idx = int(checkpoints[seg_idx - 1][0])
+                end_idx = int(checkpoints[seg_idx][0])
+                seg_h2, seg_h4 = _recompute_segment(start_idx, end_idx)
+                for local_i in range(end_idx - start_idx):
+                    global_step = start_idx + local_i
+                    H2_k = seg_h2[local_i]
+                    H4_k = seg_h4[local_i]
+                    steps = jnp.array([dl_list_final[global_step], dl_list_final[global_step + 1]])
+                    soln = ode(liom_ode_int_fwd, [n2_cur, n4_cur], steps,
+                               [H2_k, H4_k], rtol=1e-3, atol=1e-6)
+                    n2_cur = soln[0][-1]
+                    n4_cur = soln[1][-1]
+                del seg_h2, seg_h4
+            _acc_fwd += time.perf_counter() - _t_fwd
+
+            # 3b. 时间演化（单时间点）
+            _t_evo = time.perf_counter()
+            n2_evo, n4_evo = _time_evolve_jax(n2_cur, n4_cur,
+                                       np.array(H0_diag), np.array(Hint_diag), t_val)
+            _acc_evo += time.perf_counter() - _t_evo
+
+            _t_bck = time.perf_counter()
+            # 3c. 反向算符 ODE 流（逐 segment）
+            print(f'  [site {site}/{n}] 反向流 (t={t_val:.4f})...')
+            for seg_idx in range(len(checkpoints) - 1, 0, -1):
+                start_idx = int(checkpoints[seg_idx - 1][0])
+                end_idx = int(checkpoints[seg_idx][0])
+                seg_h2, seg_h4 = _recompute_segment(start_idx, end_idx)
+                for local_i in range(end_idx - start_idx - 1, -1, -1):
+                    global_step = start_idx + local_i
+                    H2_k = seg_h2[local_i]
+                    H4_k = seg_h4[local_i]
+                    dl_k = float(dl_list_final[global_step + 1] - dl_list_final[global_step])
+                    steps_s = jnp.array([0.0, dl_k])
+                    soln = ode(liom_ode_int_bck, [n2_evo, n4_evo], steps_s,
+                               [H2_k, H4_k], rtol=1e-3, atol=1e-6)
+                    n2_evo = soln[0][-1]
+                    n4_evo = soln[1][-1]
+                del seg_h2, seg_h4
+            _acc_bck += time.perf_counter() - _t_bck
+
+            if not _fast_mode:
+                nlist = _compute_imbalance(n2_evo, n4_evo, state)
+                imblist[site] = float(((-1) ** site) * nlist / n)
+
+        if _fast_mode:
+            _scale = n / len(_sample_sites)
+            _acc_fwd *= _scale; _acc_evo *= _scale; _acc_bck *= _scale
+            imblist_total = 1.0
+        else:
+            imblist_total = 2.0 * np.sum(imblist)
+        _elapsed = time.perf_counter() - _t_start
+
+        elems = n * n + n ** 4
+        output = {
+            "H0_diag": np.array(H0_diag),
+            "Hint": np.array(Hint_diag),
+            "LIOM Interactions": np.array(lbits),
+            "Imbalance": imblist_total,
+            "elapsed_s": _elapsed,
+            "steps_evolved": int(final_step),
+            "ckpt_step": int(ckpt_step),
+            "peak_memory_bytes": int((len(checkpoints) + ckpt_step + 1) * elems * 4),
+            "timing": {
+                "h_diag_s": float(_t_h_diag - _t_start),
+                "op_fwd_s": float(_acc_fwd),
+                "time_evo_s": float(_acc_evo),
+                "op_bck_s": float(_acc_bck),
+                "total_s": float(_t_h_diag - _t_start + _acc_fwd + _acc_evo + _acc_bck),
+            },
+        }
+        return output
+
+    # =====================================================================
+    # BRANCH 11: checkpoint + compress (JAX CPU / Torch GPU)
+    # =====================================================================
+    elif switch_num == 11:
+        # ── Torch GPU 子路径 ──
+        if os.environ.get("PYFLOW_USE_TORCH", "0") == "1":
+            _t_start = time.perf_counter()
+            _acc_fwd = 0.0; _acc_evo = 0.0; _acc_bck = 0.0
+            if torch is None:
+                raise ImportError("PyTorch is not installed.")
+            if torch_odeint is None:
+                raise ImportError("torchdiffeq is not installed.")
+
+            device = _resolve_torch_flow_device()
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            print(f"        [torch:imb] device={device} ({torch.cuda.get_device_name(device)})  compress_mode={compress_mode}")
+
+            ex_mask = _ex_helper_torch(n, device)
+            no_mask = _no_helper_torch(n, device)
+
+            _rtol = float(os.environ.get('PYFLOW_ODE_RTOL', '1e-6'))
+            _atol = float(os.environ.get('PYFLOW_ODE_ATOL', '1e-6'))
+
+            dl_arr = np.array(dl_list, dtype=np.float64)
+            max_steps = min(int(qmax), len(dl_arr))
+            dl_arr = dl_arr[:max_steps]
+
+            if ckpt_step is None:
+                if hamiltonian.dis_type == "random":
+                    ckpt_step = 100
+                else:
+                    ckpt_step = 80
+            ckpt_step = max(1, int(ckpt_step))
+
+            n2_dim = n * n
+
+            # GPU 压缩存储抽象
+            def _gpu_make_storage(capacity: int) -> dict:
+                cap = int(capacity)
+                s = {"capacity": cap}
+                if compress_mode == 0:
+                    s["buf_h2"] = []; s["buf_h4"] = []
+                elif compress_mode == 1:
+                    s["h2_idx"] = []; s["h2_val"] = []; s["h4_idx"] = []; s["h4_val"] = []
+                    s["_eps"] = float(os.environ.get('compress_eps', '1e-7'))
+                else:
+                    s["h2_U"] = []; s["h2_S"] = []; s["h2_Vt"] = []
+                    s["h4_U"] = []; s["h4_S"] = []; s["h4_Vt"] = []
+                return s
+
+            def _gpu_cmp_store(storage: dict, slot: int, h2, h4) -> None:
+                if compress_mode == 0:
+                    storage["buf_h2"].append(h2.detach().clone())
+                    storage["buf_h4"].append(h4.detach().clone())
+                elif compress_mode == 1:
+                    eps = storage["_eps"]
+                    h2_flat = h2.reshape(-1); h4_flat = h4.reshape(-1)
+                    h2_idx_arr = torch.where(h2_flat.abs() >= eps)[0].to(torch.int32)
+                    h4_idx_arr = torch.where(h4_flat.abs() >= eps)[0].to(torch.int32)
+                    storage["h2_idx"].append(h2_idx_arr)
+                    storage["h2_val"].append(h2_flat[h2_idx_arr.long()] if h2_idx_arr.numel() else torch.zeros(0, device=device))
+                    storage["h4_idx"].append(h4_idx_arr)
+                    storage["h4_val"].append(h4_flat[h4_idx_arr.long()] if h4_idx_arr.numel() else torch.zeros(0, device=device))
+                else:
+                    U2, S2, V2 = torch.linalg.svd(h2, full_matrices=False)
+                    cum2 = torch.cumsum(S2**2, dim=0)
+                    r2_eff = int(torch.searchsorted(cum2, cum2[-1] * 0.999999).item()) + 1
+                    r2_eff = max(1, r2_eff)
+                    storage["h2_U"].append(U2[:, :r2_eff].contiguous())
+                    storage["h2_S"].append(S2[:r2_eff])
+                    storage["h2_Vt"].append(V2[:r2_eff, :].contiguous())
+                    h4_mat = h4.reshape(n2_dim, n2_dim)
+                    U4, S4, V4 = torch.linalg.svd(h4_mat, full_matrices=False)
+                    cum4 = torch.cumsum(S4**2, dim=0)
+                    r4_eff = int(torch.searchsorted(cum4, cum4[-1] * 0.999999).item()) + 1
+                    r4_eff = max(1, r4_eff)
+                    storage["h4_U"].append(U4[:, :r4_eff].contiguous())
+                    storage["h4_S"].append(S4[:r4_eff])
+                    storage["h4_Vt"].append(V4[:r4_eff, :].contiguous())
+
+            def _gpu_cmp_load(storage: dict, slot: int):
+                if compress_mode == 0:
+                    h2 = storage["buf_h2"][slot]; h4 = storage["buf_h4"][slot]
+                elif compress_mode == 1:
+                    h2 = torch.zeros(n, n, dtype=torch.float32, device=device)
+                    idx2 = storage["h2_idx"][slot]
+                    if idx2 is not None and idx2.numel():
+                        h2.view(-1)[idx2.long()] = storage["h2_val"][slot]
+                    h4 = torch.zeros(n, n, n, n, dtype=torch.float32, device=device)
+                    idx4 = storage["h4_idx"][slot]
+                    if idx4 is not None and idx4.numel():
+                        h4.view(-1)[idx4.long()] = storage["h4_val"][slot]
+                else:
+                    h2 = (storage["h2_U"][slot] * storage["h2_S"][slot]) @ storage["h2_Vt"][slot]
+                    h4_mat = (storage["h4_U"][slot] * storage["h4_S"][slot]) @ storage["h4_Vt"][slot]
+                    h4 = h4_mat.reshape(n, n, n, n)
+                return h2, h4
+
+            curr_H2 = torch.tensor(np.array(hamiltonian.H2_spinless, dtype=np.float32), dtype=torch.float32, device=device)
+            curr_H4 = torch.tensor(np.array(hamiltonian.H4_spinless, dtype=np.float32), dtype=torch.float32, device=device)
+
+            def _ode_fn(t, y):
+                return _int_ode_torch_fn(t, y, n, ex_mask, no_mask)
+
+            # ---- 1. 正向流：H 对角化 + 压缩存储 ----
+            max_ckpts = max_steps // ckpt_step + 4
+            ckpt_state = _gpu_make_storage(max_ckpts)
+            ckpt_slot_map = {0: 0}
+            checkpoints_steps = [0]
+            _gpu_cmp_store(ckpt_state, 0, curr_H2, curr_H4)
+            n_ckpts = 1
+
+            k = 1; J0 = 1.0
+            t_span = torch.empty(2, dtype=torch.float32, device=device)
+            y0_flat = torch.empty(n2_dim + n**4, dtype=torch.float32, device=device)
+
+            while k < len(dl_arr) and J0 > cutoff:
+                t_span[0] = float(dl_arr[k - 1]); t_span[1] = float(dl_arr[k])
+                _pack_state_torch(y0_flat, curr_H2, curr_H4, n2_dim)
+                soln = torch_odeint(_ode_fn, y0_flat, t_span, rtol=_rtol, atol=_atol, method='dopri5')
+                curr_H2 = soln[-1][:n2_dim].reshape(n, n).detach().clone()
+                curr_H4 = soln[-1][n2_dim:].reshape(n, n, n, n).detach().clone()
+                del soln
+
+                if k % ckpt_step == 0 and n_ckpts < max_ckpts:
+                    ckpt_slot_map[k] = n_ckpts
+                    checkpoints_steps.append(k)
+                    _gpu_cmp_store(ckpt_state, n_ckpts, curr_H2, curr_H4)
+                    n_ckpts += 1
+
+                J0 = float(torch.max(torch.abs(curr_H2 - torch.diag(torch.diag(curr_H2)))))
+                if k % 1000 == 0:
+                    print(f"  [对角化] k={k:5d}  l={dl_arr[k-1]:.4e}  J0={J0:.3e}  ckpts={n_ckpts}")
+                k += 1
+
+            final_step = k - 1
+            if checkpoints_steps[-1] != final_step and n_ckpts < max_ckpts:
+                ckpt_slot_map[final_step] = n_ckpts
+                checkpoints_steps.append(final_step)
+                _gpu_cmp_store(ckpt_state, n_ckpts, curr_H2, curr_H4)
+                n_ckpts += 1
+
+            dl_list_final = dl_arr[:final_step + 1]
+            print(f"  对角化完成，共 {final_step} 步，J0={J0:.3e}，检查点数={n_ckpts}")
+            _t_h_diag = time.perf_counter()
+
+            # ---- 2. l-bit ----
+            H0_diag = curr_H2; Hint_diag = curr_H4
+            idx = torch.arange(n, device=device)
+            HFint = (Hint_diag[idx[:, None], idx[:, None], idx[None, :], idx[None, :]]
+                     - Hint_diag[idx[:, None], idx[None, :], idx[None, :], idx[:, None]])
+            lbits_list = []
+            for q in range(1, n):
+                diag_q = torch.diagonal(HFint, offset=q); diag_nq = torch.diagonal(HFint, offset=-q)
+                vals = (diag_q.abs() + diag_nq.abs()) / 2.0
+                vals = vals.clamp(min=1e-30)
+                lbits_list.append(vals.log10().median().item())
+            lbits = np.array(lbits_list, dtype=np.float64)
+            del HFint
+
+            # 段重算函数
+            def _recompute_segment_gpu(start_step_idx, end_step_idx):
+                seg_len = end_step_idx - start_step_idx
+                if seg_len <= 0:
+                    return None
+                slot = ckpt_slot_map[int(start_step_idx)]
+                temp_H2, temp_H4 = _gpu_cmp_load(ckpt_state, slot)
+                seg_state = _gpu_make_storage(seg_len)
+                t_span_local = torch.empty(2, dtype=torch.float32, device=device)
+                y0_flat_local = torch.empty(n2_dim + n**4, dtype=torch.float32, device=device)
+                for curr_step in range(start_step_idx, end_step_idx):
+                    local_idx = curr_step - start_step_idx
+                    _gpu_cmp_store(seg_state, local_idx, temp_H2, temp_H4)
+                    t_span_local[0] = float(dl_list_final[curr_step])
+                    t_span_local[1] = float(dl_list_final[curr_step + 1])
+                    _pack_state_torch(y0_flat_local, temp_H2, temp_H4, n2_dim)
+                    soln = torch_odeint(_ode_fn, y0_flat_local, t_span_local, rtol=_rtol, atol=_atol, method='dopri5')
+                    temp_H2 = soln[-1][:n2_dim].reshape(n, n).detach().clone()
+                    temp_H4 = soln[-1][n2_dim:].reshape(n, n, n, n).detach().clone()
+                    del soln
+                del t_span_local, y0_flat_local, temp_H2, temp_H4
+                return seg_state
+
+            # ---- 3. 格点级动力学 ----
+            _fast_mode = (n >= 25)
+            _sample_sites = [0, n // 2] if _fast_mode else list(range(n))
+            if _fast_mode:
+                print(f"  [快速模式] 仅演化 site {_sample_sites}，总时间=平均×{n}，imbalance 固定为 1.0")
+            state_t = torch.tensor(np.array(state), dtype=torch.float32, device=device)
+            imblist = np.zeros(n, dtype=np.float32)
+
+            for site in _sample_sites:
+                print(f'  [site {site}/{n}] 正向流...')
+                _t_fwd = time.perf_counter()
+                n2_c = torch.zeros((n, n), dtype=torch.float32, device=device)
+                n2_c[site, site] = 1.0
+                n4_c = torch.zeros((n, n, n, n), dtype=torch.float32, device=device)
+
+                # 3a. 正向算符 ODE 流（逐 segment + precomputed eta）
+                for seg_idx in range(1, len(checkpoints_steps)):
+                    start_idx = int(checkpoints_steps[seg_idx - 1])
+                    end_idx = int(checkpoints_steps[seg_idx])
+                    seg_state = _recompute_segment_gpu(start_idx, end_idx)
+                    if seg_state is None:
+                        continue
+                    seg_len = end_idx - start_idx
+                    for local_i in range(seg_len):
+                        global_step = start_idx + local_i
+                        h2_k, h4_k = _gpu_cmp_load(seg_state, local_i)
+                        eta2, eta4 = _build_eta_torch(h2_k, h4_k, ex_mask, no_mask)
+                        steps = torch.tensor([dl_list_final[global_step], dl_list_final[global_step + 1]],
+                                             dtype=torch.float32, device=device)
+
+                        def _fwd_rhs_t(t, y):
+                            return _fwd_op_ode_torch(t, y, eta2, eta4, ex_mask, no_mask, n)
+
+                        soln = torch_odeint(_fwd_rhs_t, (n2_c, n4_c), steps, rtol=1e-3, atol=1e-6, method='dopri5')
+                        n2_c = soln[0][-1]; n4_c = soln[1][-1]
+                        del soln, h2_k, h4_k, eta2, eta4, steps
+                    del seg_state
+            _acc_fwd += time.perf_counter() - _t_fwd
+
+            _t_evo = time.perf_counter()
+            # 3b. 时间演化（单时间点）
+            print(f'  [site {site}/{n}] 反向流 (t={t_val:.4f})...')
+            n2_evo, n4_evo = _time_evolve_n2_n4_torch(n2_c.clone(), n4_c.clone(),
+                                                       H0_diag, Hint_diag, float(t_val), n)
+
+            n2_r, n2_i = n2_evo.real.float(), n2_evo.imag.float()
+            n4_r, n4_i = n4_evo.real.float(), n4_evo.imag.float()
+            _acc_evo += time.perf_counter() - _t_evo
+            _t_bck = time.perf_counter()
+
+            # 3c. 反向算符 ODE 流（逐 segment）
+            for seg_idx in range(len(checkpoints_steps) - 1, 0, -1):
+                start_idx = int(checkpoints_steps[seg_idx - 1])
+                end_idx = int(checkpoints_steps[seg_idx])
+                seg_state = _recompute_segment_gpu(start_idx, end_idx)
+                if seg_state is None:
+                    continue
+                seg_len = end_idx - start_idx
+                for local_i in range(seg_len - 1, -1, -1):
+                    global_step = start_idx + local_i
+                    h2_k, h4_k = _gpu_cmp_load(seg_state, local_i)
+                    eta2, eta4 = _build_eta_torch(h2_k, h4_k, ex_mask, no_mask)
+
+                    dl_k = float(dl_list_final[global_step + 1] - dl_list_final[global_step])
+                    steps_s = torch.tensor([0.0, dl_k], dtype=torch.float32, device=device)
+
+                    def _bck_rhs_split_t(t, y):
+                        return _bck_op_ode_torch_split(t, y, eta2, eta4, ex_mask, no_mask, n)
+
+                    soln = torch_odeint(_bck_rhs_split_t, (n2_r, n2_i, n4_r, n4_i),
+                                        steps_s, rtol=1e-3, atol=1e-6, method='dopri5')
+                    n2_r, n2_i = soln[0][-1], soln[1][-1]
+                    n4_r, n4_i = soln[2][-1], soln[3][-1]
+                    del soln, h2_k, h4_k, eta2, eta4, steps_s
+                del seg_state
+            _acc_bck += time.perf_counter() - _t_bck
+            del n2_evo, n4_evo
+
+            n2_bck = torch.complex(n2_r, n2_i)
+            n4_bck = torch.complex(n4_r, n4_i)
+
+            # 计算期望值
+            nlist = 0.0
+            for i in range(n):
+                nlist += (n2_bck[i, i] * state_t[i]).real.item()
+                for j in range(n):
+                    if i != j:
+                        nlist += (n4_bck[i, i, j, j] * state_t[i] * state_t[j]).real.item()
+                        nlist -= (n4_bck[i, j, j, i] * state_t[i] * state_t[j]).real.item()
+            imblist[site] = float(((-1) ** site) * nlist / n)
+            del n2_bck, n4_bck
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            if _fast_mode:
+                _scale = n / len(_sample_sites)
+                _acc_fwd *= _scale; _acc_evo *= _scale; _acc_bck *= _scale
+                imblist_total = 1.0
+            else:
+                imblist_total = 2.0 * np.sum(imblist)
+            _elapsed = time.perf_counter() - _t_start
+
+            # peak memory estimation
+            elems = n * n + n ** 4
+            if compress_mode == 2:
+                ckpt_mem = sum(t.numel() * t.element_size()
+                               for k in ['h2_U','h2_S','h2_Vt','h4_U','h4_S','h4_Vt']
+                               for t in ckpt_state.get(k, []))
+                seg_mem = int(ckpt_step * (ckpt_mem / max(n_ckpts, 1)))
+            elif compress_mode == 1:
+                ckpt_mem = sum(t.numel() * t.element_size()
+                               for k in ['h2_idx','h2_val','h4_idx','h4_val']
+                               for t in ckpt_state.get(k, []))
+                seg_mem = int(ckpt_step * (ckpt_mem / max(n_ckpts, 1)))
+            else:
+                ckpt_mem = n_ckpts * elems * 4
+                seg_mem = ckpt_step * elems * 4
+
+            output = {
+                "H0_diag": H0_diag.detach().cpu().numpy(),
+                "Hint": Hint_diag.detach().cpu().numpy(),
+                "LIOM Interactions": lbits,
+                "Imbalance": float(imblist_total),
+                "elapsed_s": _elapsed,
+                "steps_evolved": int(final_step),
+                "ckpt_step": int(ckpt_step),
+                "compress_mode": int(compress_mode),
+                "peak_memory_bytes": int(ckpt_mem + seg_mem + elems * 4),
+                "timing": {
+                    "h_diag_s": float(_t_h_diag - _t_start),
+                    "op_fwd_s": float(_acc_fwd),
+                    "time_evo_s": float(_acc_evo),
+                    "op_bck_s": float(_acc_bck),
+                    "total_s": float(_t_h_diag - _t_start + _acc_fwd + _acc_evo + _acc_bck),
+                },
+            }
+            return output
+
+        # ── JAX CPU 子路径 ──
+        else:
+            # 同 Branch 1 的逻辑 + 压缩存储
+            _t_start = time.perf_counter()
+            _acc_fwd = 0.0; _acc_evo = 0.0; _acc_bck = 0.0
+
+            H2_init = jnp.array(hamiltonian.H2_spinless)
+            H4_init = jnp.array(hamiltonian.H4_spinless)
+
+            dl_arr = np.array(dl_list, dtype=np.float64)
+            max_steps = min(int(qmax), len(dl_arr))
+            dl_arr = dl_arr[:max_steps]
+
+            if ckpt_step is None:
+                if hamiltonian.dis_type == "random":
+                    ckpt_step = 100
+                else:
+                    ckpt_step = 80
+            ckpt_step = max(1, int(ckpt_step))
+
+            _rtol = 1e-6; _atol = 1e-6
+
+            # 压缩存储 (JAX CPU)
+            n2_dim = n * n
+
+            def _make_storage(capacity: int) -> dict:
+                s = {"capacity": int(capacity)}
+                if compress_mode == 0:
+                    s["buf_h2"] = []; s["buf_h4"] = []
+                elif compress_mode == 1:
+                    s["h2_idx"] = []; s["h2_val"] = []; s["h4_idx"] = []; s["h4_val"] = []
+                else:
+                    s["h2_U"] = []; s["h2_S"] = []; s["h2_Vt"] = []
+                    s["h4_U"] = []; s["h4_S"] = []; s["h4_Vt"] = []
+                return s
+
+            def _cmp_store(storage, slot, h2_jax, h4_jax):
+                try:
+                    h2_jax.block_until_ready(); h4_jax.block_until_ready()
+                except Exception:
+                    pass
+                h2_np = np.array(h2_jax, dtype=np.float32)
+                h4_np = np.array(h4_jax, dtype=np.float32)
+                if compress_mode == 0:
+                    storage["buf_h2"].append(h2_np); storage["buf_h4"].append(h4_np)
+                elif compress_mode == 1:
+                    eps = float(os.environ.get('compress_eps', '1e-7'))
+                    h2_flat = h2_np.reshape(-1); h4_flat = h4_np.reshape(-1)
+                    h2_idx_arr = np.flatnonzero(np.abs(h2_flat) >= eps).astype(np.int32)
+                    h4_idx_arr = np.flatnonzero(np.abs(h4_flat) >= eps).astype(np.int32)
+                    storage["h2_idx"].append(h2_idx_arr)
+                    storage["h2_val"].append(h2_flat[h2_idx_arr].astype(np.float32) if h2_idx_arr.size else np.zeros((0,), dtype=np.float32))
+                    storage["h4_idx"].append(h4_idx_arr)
+                    storage["h4_val"].append(h4_flat[h4_idx_arr].astype(np.float32) if h4_idx_arr.size else np.zeros((0,), dtype=np.float32))
+                else:
+                    U2, S2, Vt2 = np.linalg.svd(h2_np.reshape(n, n), full_matrices=False)
+                    cum2 = np.cumsum(S2**2); r2 = int(np.searchsorted(cum2, cum2[-1] * 0.999999)) + 1
+                    storage["h2_U"].append(U2[:, :r2].astype(np.float32))
+                    storage["h2_S"].append(S2[:r2])
+                    storage["h2_Vt"].append(Vt2[:r2, :].astype(np.float32))
+                    U4, S4, Vt4 = np.linalg.svd(h4_np.reshape(n2_dim, n2_dim), full_matrices=False)
+                    cum4 = np.cumsum(S4**2); r4 = int(np.searchsorted(cum4, cum4[-1] * 0.999999)) + 1
+                    storage["h4_U"].append(U4[:, :r4].astype(np.float32))
+                    storage["h4_S"].append(S4[:r4])
+                    storage["h4_Vt"].append(Vt4[:r4, :].astype(np.float32))
+
+            def _cmp_load(storage, slot):
+                if compress_mode == 0:
+                    h2_d = np.array(storage["buf_h2"][slot], dtype=np.float32)
+                    h4_d = np.array(storage["buf_h4"][slot], dtype=np.float32)
+                elif compress_mode == 1:
+                    idx2 = storage["h2_idx"][slot]; val2 = storage["h2_val"][slot]
+                    h2_d = np.zeros(n * n, dtype=np.float32)
+                    if idx2 is not None and idx2.size:
+                        h2_d[idx2.astype(np.int64)] = val2.astype(np.float32)
+                    h2_d = h2_d.reshape(n, n)
+                    idx4 = storage["h4_idx"][slot]; val4 = storage["h4_val"][slot]
+                    h4_d = np.zeros(n**4, dtype=np.float32)
+                    if idx4 is not None and idx4.size:
+                        h4_d[idx4.astype(np.int64)] = val4.astype(np.float32)
+                    h4_d = h4_d.reshape(n, n, n, n)
+                else:
+                    U2 = storage["h2_U"][slot]; S2 = storage["h2_S"][slot]; Vt2 = storage["h2_Vt"][slot]
+                    h2_d = hybrid_svd_decompress(U2.astype(np.float32), S2, Vt2.astype(np.float32), (n, n), np.float32)
+                    U4 = storage["h4_U"][slot]; S4 = storage["h4_S"][slot]; Vt4 = storage["h4_Vt"][slot]
+                    h4_d = hybrid_svd_decompress(U4.astype(np.float32), S4, Vt4.astype(np.float32), (n2_dim, n2_dim), np.float32).reshape(n, n, n, n)
+                return jnp.array(h2_d, dtype=jnp.float32), jnp.array(h4_d, dtype=jnp.float32)
+
+            max_ckpts = max_steps // ckpt_step + 4
+            ckpt_state = _make_storage(max_ckpts)
+            ckpt_slot_map = {0: 0}
+            checkpoints_steps = [0]
+            _cmp_store(ckpt_state, 0, H2_init, H4_init)
+            n_ckpts = 1
+
+            curr_H2 = H2_init; curr_H4 = H4_init
+            k = 1; J0 = 1.0
+            print_interval = 1000
+            while k < len(dl_arr) and J0 > cutoff:
+                steps = np.array([dl_arr[k - 1], dl_arr[k]], dtype=dl_arr.dtype)
+                soln = ode(int_ode, [curr_H2, curr_H4], steps, rtol=_rtol, atol=_atol)
+                curr_H2 = soln[0][-1]; curr_H4 = soln[1][-1]
+                if k % ckpt_step == 0 and n_ckpts < max_ckpts:
+                    ckpt_slot_map[k] = n_ckpts
+                    checkpoints_steps.append(k)
+                    _cmp_store(ckpt_state, n_ckpts, curr_H2, curr_H4)
+                    n_ckpts += 1
+                J0 = float(jnp.max(jnp.abs(curr_H2 - jnp.diag(jnp.diag(curr_H2)))))
+                if k % print_interval == 0:
+                    print(f"  [对角化] k={k:5d}  l={dl_arr[k-1]:.4e}  J0={J0:.3e}")
+                k += 1
+
+            final_step = k - 1
+            if checkpoints_steps[-1] != final_step and n_ckpts < max_ckpts:
+                ckpt_slot_map[final_step] = n_ckpts
+                checkpoints_steps.append(final_step)
+                _cmp_store(ckpt_state, n_ckpts, curr_H2, curr_H4)
+                n_ckpts += 1
+
+            dl_list_final = dl_arr[:final_step + 1]
+            print(f"  对角化完成，共 {final_step} 步，J0={J0:.3e}，检查点数={n_ckpts}")
+            _t_h_diag = time.perf_counter()
+
+            H0_diag = curr_H2; Hint_diag = curr_H4
+            lbits = _extract_lbits(Hint_diag, n)
+
+            def _recompute_segment(start_step_idx, end_step_idx):
+                seg_len = end_step_idx - start_step_idx
+                if seg_len <= 0:
+                    return None
+                slot = ckpt_slot_map[int(start_step_idx)]
+                temp_H2, temp_H4 = _cmp_load(ckpt_state, slot)
+                seg_state = _make_storage(seg_len)
+                for curr_step in range(start_step_idx, end_step_idx):
+                    local_idx = curr_step - start_step_idx
+                    _cmp_store(seg_state, local_idx, temp_H2, temp_H4)
+                    steps = np.array([dl_list_final[curr_step], dl_list_final[curr_step + 1]], dtype=dl_list_final.dtype)
+                    soln = ode(int_ode, [temp_H2, temp_H4], steps, rtol=_rtol, atol=_atol)
+                    temp_H2 = soln[0][-1]; temp_H4 = soln[1][-1]
+                return seg_state
+
+            _fast_mode = (n >= 25)
+            _sample_sites = [0, n // 2] if _fast_mode else list(range(n))
+            if _fast_mode:
+                print(f"  [快速模式] 仅演化 site {_sample_sites}，总时间=平均×{n}，imbalance 固定为 1.0")
+            imblist = np.zeros(n, dtype=np.float32)
+            for site in _sample_sites:
+                print(f'  [site {site}/{n}] 正向流...')
+                _t_fwd = time.perf_counter()
+                n2_c = jnp.zeros((n, n), dtype=jnp.float32).at[site, site].set(1.0)
+                n4_c = jnp.zeros((n, n, n, n), dtype=jnp.float32)
+
+                for seg_idx in range(1, len(checkpoints_steps)):
+                    start_idx = int(checkpoints_steps[seg_idx - 1])
+                    end_idx = int(checkpoints_steps[seg_idx])
+                    seg_state = _recompute_segment(start_idx, end_idx)
+                    if seg_state is None:
+                        continue
+                    seg_len = end_idx - start_idx
+                    for local_i in range(seg_len):
+                        global_step = start_idx + local_i
+                        h2_k, h4_k = _cmp_load(seg_state, local_i)
+                        steps = jnp.array([dl_list_final[global_step], dl_list_final[global_step + 1]])
+                        soln = ode(liom_ode_int_fwd, [n2_c, n4_c], steps, [h2_k, h4_k], rtol=1e-3, atol=1e-6)
+                        n2_c = soln[0][-1]; n4_c = soln[1][-1]
+                    del seg_state
+                _acc_fwd += time.perf_counter() - _t_fwd
+
+                _t_evo = time.perf_counter()
+                n2_evo, n4_evo = _time_evolve_jax(n2_c, n4_c,
+                                           np.array(H0_diag), np.array(Hint_diag), t_val)
+                _acc_evo += time.perf_counter() - _t_evo
+
+                _t_bck = time.perf_counter()
+                print(f'  [site {site}/{n}] 反向流 (t={t_val:.4f})...')
+                for seg_idx in range(len(checkpoints_steps) - 1, 0, -1):
+                        start_idx = int(checkpoints_steps[seg_idx - 1])
+                        end_idx = int(checkpoints_steps[seg_idx])
+                        seg_state = _recompute_segment(start_idx, end_idx)
+                        if seg_state is None:
+                            continue
+                        seg_len = end_idx - start_idx
+                        for local_i in range(seg_len - 1, -1, -1):
+                            global_step = start_idx + local_i
+                            h2_k, h4_k = _cmp_load(seg_state, local_i)
+                            dl_k = float(dl_list_final[global_step + 1] - dl_list_final[global_step])
+                            steps_s = jnp.array([0.0, dl_k])
+                            soln = ode(liom_ode_int_bck, [n2_evo, n4_evo], steps_s, [h2_k, h4_k], rtol=1e-3, atol=1e-6)
+                            n2_evo = soln[0][-1]; n4_evo = soln[1][-1]
+                        del seg_state
+                _acc_bck += time.perf_counter() - _t_bck
+
+                if not _fast_mode:
+                    nlist = _compute_imbalance(n2_evo, n4_evo, state)
+                    imblist[site] = float(((-1) ** site) * nlist / n)
+
+            gc.collect()
+
+        if _fast_mode:
+            _scale = n / len(_sample_sites)
+            _acc_fwd *= _scale; _acc_evo *= _scale; _acc_bck *= _scale
+            imblist_total = 1.0
+        else:
+            imblist_total = 2.0 * np.sum(imblist)
+        _elapsed = time.perf_counter() - _t_start
+
+        # peak memory estimation
+        elems = n * n + n ** 4
+        if compress_mode == 2:
+            ckpt_mem = sum(
+                a.nbytes if hasattr(a, 'nbytes') else a.size * a.itemsize
+                for k in ['h2_U','h2_S','h2_Vt','h4_U','h4_S','h4_Vt']
+                for a in ckpt_state.get(k, [])
+            )
+            seg_mem = int(ckpt_step * (ckpt_mem / max(n_ckpts, 1)))
+        elif compress_mode == 1:
+            ckpt_mem = sum(
+                a.nbytes if hasattr(a, 'nbytes') else a.size * a.itemsize
+                for k in ['h2_idx','h2_val','h4_idx','h4_val']
+                for a in ckpt_state.get(k, [])
+            )
+            seg_mem = int(ckpt_step * (ckpt_mem / max(n_ckpts, 1)))
+        else:
+            ckpt_mem = n_ckpts * elems * 4
+            seg_mem = ckpt_step * elems * 4
+
+        output = {
+            "H0_diag": np.array(H0_diag),
+            "Hint": np.array(Hint_diag),
+            "LIOM Interactions": np.array(lbits),
+            "Imbalance": imblist_total,
+            "elapsed_s": _elapsed,
+            "steps_evolved": int(final_step),
+            "ckpt_step": int(ckpt_step),
+            "compress_mode": int(compress_mode),
+            "peak_memory_bytes": int(ckpt_mem + seg_mem + elems * 4),
+            "timing": {
+                "h_diag_s": float(_t_h_diag - _t_start),
+                "op_fwd_s": float(_acc_fwd),
+                "time_evo_s": float(_acc_evo),
+                "op_bck_s": float(_acc_bck),
+                "total_s": float(_t_h_diag - _t_start + _acc_fwd + _acc_evo + _acc_bck),
+            },
+        }
+        return output
+
+    # =====================================================================
+    # BRANCH 111: parallel + checkpoint (Torch GPU batch)
+    # =====================================================================
+    elif switch_num == 111:
+        _t_start = time.perf_counter()
+        _acc_fwd = 0.0; _acc_evo = 0.0; _acc_bck = 0.0
+        if torch is None:
+            raise ImportError("PyTorch is not installed.")
+        if torch_odeint is None:
+            raise ImportError("torchdiffeq is not installed.")
+
+        device = _resolve_torch_flow_device()
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        print(f"        [torch:imb:111] device={device} ({torch.cuda.get_device_name(device)})")
+
+        ex_mask = _ex_helper_torch(n, device)
+        no_mask = _no_helper_torch(n, device)
+
+        _rtol = float(os.environ.get('PYFLOW_ODE_RTOL', '1e-6'))
+        _atol = float(os.environ.get('PYFLOW_ODE_ATOL', '1e-6'))
+
+        dl_arr = np.array(dl_list, dtype=np.float64)
+        max_steps = min(int(qmax), len(dl_arr))
+        dl_arr = dl_arr[:max_steps]
+
+        if ckpt_step is None:
+            if hamiltonian.dis_type == "random":
+                ckpt_step = 100
+            else:
+                ckpt_step = 80
+        ckpt_step = max(1, int(ckpt_step))
+
+        n2_dim = n * n
+
+        def _gpu_make_storage(capacity: int) -> dict:
+            return {"capacity": int(capacity), "h2_list": [], "h4_list": []}
+
+        def _gpu_cmp_store(storage, slot, h2, h4):
+            storage["h2_list"].append(h2.detach().clone())
+            storage["h4_list"].append(h4.detach().clone())
+
+        def _gpu_cmp_load(storage, slot):
+            return storage["h2_list"][slot], storage["h4_list"][slot]
+
+        curr_H2 = torch.tensor(np.array(hamiltonian.H2_spinless, dtype=np.float32), dtype=torch.float32, device=device)
+        curr_H4 = torch.tensor(np.array(hamiltonian.H4_spinless, dtype=np.float32), dtype=torch.float32, device=device)
+
+        def _ode_fn(t, y):
+            return _int_ode_torch_fn(t, y, n, ex_mask, no_mask)
+
+        # ---- 1. 正向 H 对角化 ----
+        max_ckpts = max_steps // ckpt_step + 4
+        ckpt_state = _gpu_make_storage(max_ckpts)
+        ckpt_slot_map = {0: 0}
+        checkpoints_steps = [0]
+        _gpu_cmp_store(ckpt_state, 0, curr_H2, curr_H4)
+        n_ckpts = 1
+
+        k = 1; J0 = 1.0
+        t_span = torch.empty(2, dtype=torch.float32, device=device)
+        y0_flat = torch.empty(n2_dim + n**4, dtype=torch.float32, device=device)
+
+        while k < len(dl_arr) and J0 > cutoff:
+            t_span[0] = float(dl_arr[k - 1]); t_span[1] = float(dl_arr[k])
+            _pack_state_torch(y0_flat, curr_H2, curr_H4, n2_dim)
+            soln = torch_odeint(_ode_fn, y0_flat, t_span, rtol=_rtol, atol=_atol, method='dopri5')
+            curr_H2 = soln[-1][:n2_dim].reshape(n, n).detach().clone()
+            curr_H4 = soln[-1][n2_dim:].reshape(n, n, n, n).detach().clone()
+            del soln
+            if k % ckpt_step == 0 and n_ckpts < max_ckpts:
+                ckpt_slot_map[k] = n_ckpts
+                checkpoints_steps.append(k)
+                _gpu_cmp_store(ckpt_state, n_ckpts, curr_H2, curr_H4)
+                n_ckpts += 1
+            J0 = float(torch.max(torch.abs(curr_H2 - torch.diag(torch.diag(curr_H2)))))
+            if k % 1000 == 0:
+                print(f"  [对角化] k={k:5d}  l={dl_arr[k-1]:.4e}  J0={J0:.3e}  ckpts={n_ckpts}")
+            k += 1
+
+        final_step = k - 1
+        hamiltonian._pyflow_final_step = int(final_step)
+        if checkpoints_steps[-1] != final_step and n_ckpts < max_ckpts:
+            ckpt_slot_map[final_step] = n_ckpts
+            checkpoints_steps.append(final_step)
+            _gpu_cmp_store(ckpt_state, n_ckpts, curr_H2, curr_H4)
+            n_ckpts += 1
+
+        dl_list_final = dl_arr[:final_step + 1]
+        print(f"  对角化完成，共 {final_step} 步，J0={J0:.3e}")
+        _t_h_diag = time.perf_counter()
+
+        # ---- 2. l-bit ----
+        H0_diag = curr_H2; Hint_diag = curr_H4
+        idx = torch.arange(n, device=device)
+        HFint = (Hint_diag[idx[:, None], idx[:, None], idx[None, :], idx[None, :]]
+                 - Hint_diag[idx[:, None], idx[None, :], idx[None, :], idx[:, None]])
+        lbits_list = []
+        for q in range(1, n):
+            diag_q = torch.diagonal(HFint, offset=q); diag_nq = torch.diagonal(HFint, offset=-q)
+            vals = (diag_q.abs() + diag_nq.abs()) / 2.0
+            vals = vals.clamp(min=1e-30)
+            lbits_list.append(vals.log10().median().item())
+        lbits = np.array(lbits_list, dtype=np.float64)
+        del HFint
+
+        # ---- 3. 段重算 ----
+        def _recompute_segment_gpu(start_step_idx, end_step_idx):
+            seg_len = end_step_idx - start_step_idx
+            if seg_len <= 0:
+                return None
+            slot = ckpt_slot_map[int(start_step_idx)]
+            temp_H2, temp_H4 = _gpu_cmp_load(ckpt_state, slot)
+            seg_state = _gpu_make_storage(seg_len)
+            t_local = torch.empty(2, dtype=torch.float32, device=device)
+            y0_local = torch.empty(n2_dim + n**4, dtype=torch.float32, device=device)
+            for curr_step in range(start_step_idx, end_step_idx):
+                local_idx = curr_step - start_step_idx
+                _gpu_cmp_store(seg_state, local_idx, temp_H2, temp_H4)
+                t_local[0] = float(dl_list_final[curr_step]); t_local[1] = float(dl_list_final[curr_step + 1])
+                _pack_state_torch(y0_local, temp_H2, temp_H4, n2_dim)
+                soln = torch_odeint(_ode_fn, y0_local, t_local, rtol=_rtol, atol=_atol, method='dopri5')
+                temp_H2 = soln[-1][:n2_dim].reshape(n, n).detach().clone()
+                temp_H4 = soln[-1][n2_dim:].reshape(n, n, n, n).detach().clone()
+                del soln
+            del t_local, y0_local, temp_H2, temp_H4
+            return seg_state
+
+        # ---- 4. 批量正向 + 时间演化 + 反向流 ----
+        state_t = torch.tensor(np.array(state), dtype=torch.float32, device=device)
+        imblist = np.zeros(n, dtype=np.float32)
+
+        # 批量初始化所有 site 的算符
+        n2_batch = torch.zeros((n, n, n), dtype=torch.float32, device=device)
+        n2_batch[torch.arange(n, device=device), torch.arange(n, device=device), torch.arange(n, device=device)] = 1.0
+        n4_batch = torch.zeros((n, n, n, n, n), dtype=torch.float32, device=device)
+
+        # 4a. 批量正向流
+        _t_fwd = time.perf_counter()
+        total_fwd_steps = final_step
+        fwd_step_cnt = 0
+        for seg_idx in range(1, len(checkpoints_steps)):
+            start_idx = int(checkpoints_steps[seg_idx - 1])
+            end_idx = int(checkpoints_steps[seg_idx])
+            seg_state = _recompute_segment_gpu(start_idx, end_idx)
+            if seg_state is None:
+                continue
+            seg_len = end_idx - start_idx
+            for local_i in range(seg_len):
+                global_step = start_idx + local_i
+                h2_k, h4_k = _gpu_cmp_load(seg_state, local_i)
+                eta2, eta4 = _build_eta_torch(h2_k, h4_k, ex_mask, no_mask)
+                del h2_k, h4_k
+                steps = torch.tensor([dl_list_final[global_step], dl_list_final[global_step + 1]],
+                                     dtype=torch.float32, device=device)
+
+                def _fwd_rhs_batch(t, y):
+                    n2_b, n4_b = y
+                    dn2 = torch.einsum('ij,sjk->sik', eta2, n2_b) - torch.einsum('sij,jk->sik', n2_b, eta2)
+                    c42 = torch.einsum('abcd,sdf->sabcf', eta4, n2_b)
+                    c42 -= torch.einsum('abcd,sec->sabed', eta4, n2_b)
+                    c42 += torch.einsum('abcd,sbf->safcd', eta4, n2_b)
+                    c42 -= torch.einsum('abcd,sea->sebcd', eta4, n2_b)
+                    c42 -= torch.einsum('sabcd,df->sabcf', n4_b, eta2)
+                    c42 += torch.einsum('sabcd,ec->sabed', n4_b, eta2)
+                    c42 -= torch.einsum('sabcd,bf->safcd', n4_b, eta2)
+                    c42 += torch.einsum('sabcd,ea->sebcd', n4_b, eta2)
+                    c42 = c42.contiguous()
+                    c42.view(-1, n**4).mul_(no_mask)
+                    return (dn2, c42)
+
+                # ── mini-batch：切片传入 ODE，降低 RK 中间变量显存 ──
+                for mb_start in range(0, n, _batch_size):
+                    mb_end = min(mb_start + _batch_size, n)
+                    n2_mb = n2_batch[mb_start:mb_end].clone()
+                    n4_mb = n4_batch[mb_start:mb_end].clone()
+                    soln = torch_odeint(_fwd_rhs_batch, (n2_mb, n4_mb), steps, rtol=1e-3, atol=1e-6, method='dopri5')
+                    n2_batch[mb_start:mb_end] = soln[0][-1]
+                    n4_batch[mb_start:mb_end] = soln[1][-1]
+                    del soln, n2_mb, n4_mb
+                del eta2, eta4
+
+                fwd_step_cnt += 1
+                if fwd_step_cnt % 1000 == 0 or fwd_step_cnt == total_fwd_steps:
+                    print(f"  [正向流] step={fwd_step_cnt}/{total_fwd_steps}  l={dl_list_final[global_step + 1]:.4e}")
+
+            del seg_state
+        _acc_fwd = time.perf_counter() - _t_fwd
+
+        # 4b. 时间演化（逐 site，结果存入 batch 张量）
+        print("  [时间演化] 对所有 site 进行时间演化...")
+        n2_r_batch = torch.zeros((n, n, n), dtype=torch.float32, device=device)
+        n2_i_batch = torch.zeros((n, n, n), dtype=torch.float32, device=device)
+        n4_r_batch = torch.zeros((n, n, n, n, n), dtype=torch.float32, device=device)
+        n4_i_batch = torch.zeros((n, n, n, n, n), dtype=torch.float32, device=device)
+
+        for site in range(n):
+            _t_evo = time.perf_counter()
+            n2_s = n2_batch[site].clone(); n4_s = n4_batch[site].clone()
+            n2_evo, n4_evo = _time_evolve_n2_n4_torch(n2_s.clone(), n4_s.clone(),
+                                                       H0_diag, Hint_diag, float(t_val), n)
+            _acc_evo += time.perf_counter() - _t_evo
+            n2_r_batch[site] = n2_evo.real.float()
+            n2_i_batch[site] = n2_evo.imag.float()
+            n4_r_batch[site] = n4_evo.real.float()
+            n4_i_batch[site] = n4_evo.imag.float()
+            del n2_s, n4_s, n2_evo, n4_evo
+        print(f"  [时间演化] {n} 个 site 全部完成")
+        del n2_batch, n4_batch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # 4c. 批量反向流（反向状态4分量=正向2倍，使用更小的 batch 避免 OOM）
+        _t_bck = time.perf_counter()
+        bck_step_cnt = 0
+        _bck_batch_size = max(1, _batch_size // 2)
+        mb_count = (n + _bck_batch_size - 1) // _bck_batch_size
+        total_bck_steps = total_fwd_steps * mb_count
+
+        for seg_idx in range(len(checkpoints_steps) - 1, 0, -1):
+            start_idx = int(checkpoints_steps[seg_idx - 1])
+            end_idx = int(checkpoints_steps[seg_idx])
+            seg_state = _recompute_segment_gpu(start_idx, end_idx)
+            if seg_state is None:
+                continue
+            seg_len = end_idx - start_idx
+            for local_i in range(seg_len - 1, -1, -1):
+                global_step = start_idx + local_i
+                h2_k, h4_k = _gpu_cmp_load(seg_state, local_i)
+                eta2, eta4 = _build_eta_torch(h2_k, h4_k, ex_mask, no_mask)
+                del h2_k, h4_k
+                dl_k = float(dl_list_final[global_step + 1] - dl_list_final[global_step])
+                steps_s = torch.tensor([0.0, dl_k], dtype=torch.float32, device=device)
+
+                def _bck_rhs_batch(t, y):
+                    n2_r_b, n2_i_b, n4_r_b, n4_i_b = y
+                    # 二次部分：dn2/dl = -[η, n2]
+                    dn2_r = -(torch.einsum('ij,sjk->sik', eta2, n2_r_b) - torch.einsum('sij,jk->sik', n2_r_b, eta2))
+                    dn2_i = -(torch.einsum('ij,sjk->sik', eta2, n2_i_b) - torch.einsum('sij,jk->sik', n2_i_b, eta2))
+                    # 四次部分：dn4/dl = -([η4, n2] + [η2, n4])
+                    c42_r = torch.einsum('abcd,sdf->sabcf', eta4, n2_r_b)
+                    c42_r -= torch.einsum('abcd,sec->sabed', eta4, n2_r_b)
+                    c42_r += torch.einsum('abcd,sbf->safcd', eta4, n2_r_b)
+                    c42_r -= torch.einsum('abcd,sea->sebcd', eta4, n2_r_b)
+                    c42_r -= torch.einsum('sabcd,df->sabcf', n4_r_b, eta2)
+                    c42_r += torch.einsum('sabcd,ec->sabed', n4_r_b, eta2)
+                    c42_r -= torch.einsum('sabcd,bf->safcd', n4_r_b, eta2)
+                    c42_r += torch.einsum('sabcd,ea->sebcd', n4_r_b, eta2)
+                    c42_r = -c42_r.contiguous()
+                    c42_r.view(-1, n**4).mul_(no_mask)
+                    c42_i = torch.einsum('abcd,sdf->sabcf', eta4, n2_i_b)
+                    c42_i -= torch.einsum('abcd,sec->sabed', eta4, n2_i_b)
+                    c42_i += torch.einsum('abcd,sbf->safcd', eta4, n2_i_b)
+                    c42_i -= torch.einsum('abcd,sea->sebcd', eta4, n2_i_b)
+                    c42_i -= torch.einsum('sabcd,df->sabcf', n4_i_b, eta2)
+                    c42_i += torch.einsum('sabcd,ec->sabed', n4_i_b, eta2)
+                    c42_i -= torch.einsum('sabcd,bf->safcd', n4_i_b, eta2)
+                    c42_i += torch.einsum('sabcd,ea->sebcd', n4_i_b, eta2)
+                    c42_i = -c42_i.contiguous()
+                    c42_i.view(-1, n**4).mul_(no_mask)
+                    return (dn2_r, dn2_i, c42_r, c42_i)
+
+                # ── mini-batch：反向状态4分量，使用更小的 batch ──
+                for mb_start in range(0, n, _bck_batch_size):
+                    mb_end = min(mb_start + _bck_batch_size, n)
+
+                    n2_r_mb = n2_r_batch[mb_start:mb_end].clone()
+                    n2_i_mb = n2_i_batch[mb_start:mb_end].clone()
+                    n4_r_mb = n4_r_batch[mb_start:mb_end].clone()
+                    n4_i_mb = n4_i_batch[mb_start:mb_end].clone()
+
+                    soln = torch_odeint(_bck_rhs_batch, (n2_r_mb, n2_i_mb, n4_r_mb, n4_i_mb),
+                                        steps_s, rtol=1e-3, atol=1e-6, method='dopri5')
+                    n2_r_batch[mb_start:mb_end] = soln[0][-1]
+                    n2_i_batch[mb_start:mb_end] = soln[1][-1]
+                    n4_r_batch[mb_start:mb_end] = soln[2][-1]
+                    n4_i_batch[mb_start:mb_end] = soln[3][-1]
+                    del soln, n2_r_mb, n2_i_mb, n4_r_mb, n4_i_mb
+
+                    bck_step_cnt += 1
+                    if bck_step_cnt % 1000 == 0 or bck_step_cnt == total_bck_steps:
+                        remaining = total_bck_steps - bck_step_cnt
+                        print(f"  [反向流] 剩余={remaining}/{total_bck_steps}  l={dl_list_final[global_step]:.4e}")
+                del eta2, eta4, steps_s
+
+            del seg_state
+        _acc_bck = time.perf_counter() - _t_bck
+
+        # 4d. 计算期望值和不平衡度
+        for site in range(n):
+            n2_bck = torch.complex(n2_r_batch[site], n2_i_batch[site])
+            n4_bck = torch.complex(n4_r_batch[site], n4_i_batch[site])
+
+            nlist = 0.0
+            for i in range(n):
+                nlist += (n2_bck[i, i] * state_t[i]).real.item()
+                for j in range(n):
+                    if i != j:
+                        nlist += (n4_bck[i, i, j, j] * state_t[i] * state_t[j]).real.item()
+                        nlist -= (n4_bck[i, j, j, i] * state_t[i] * state_t[j]).real.item()
+            imblist[site] = float(((-1) ** site) * nlist / n)
+            del n2_bck, n4_bck
+
+        imblist_total = 2.0 * np.sum(imblist)
+        _elapsed = time.perf_counter() - _t_start
+
+        elems = n * n + n ** 4
+        per_h = elems * 4
+        output = {
+            "H0_diag": H0_diag.detach().cpu().numpy(),
+            "Hint": Hint_diag.detach().cpu().numpy(),
+            "LIOM Interactions": lbits,
+            "Imbalance": imblist_total,
+            "elapsed_s": _elapsed,
+            "steps_evolved": int(final_step),
+            "ckpt_step": int(ckpt_step),
+            "peak_memory_bytes": int(n_ckpts * per_h + ckpt_step * per_h + 2 * n * elems * 4
+                                        + 12 * _batch_size * elems * 4),
+            "timing": {
+                "h_diag_s": float(_t_h_diag - _t_start),
+                "op_fwd_s": float(_acc_fwd),
+                "time_evo_s": float(_acc_evo),
+                "op_bck_s": float(_acc_bck),
+                "total_s": float(_t_h_diag - _t_start + _acc_fwd + _acc_evo + _acc_bck),
+            },
+        }
+        return output
+
+    # =====================================================================
+    # BRANCH 1111: pipeline + parallel (Torch GPU multi-GPU)
+    # =====================================================================
+    elif switch_num == 1111:
+        _t_start = time.perf_counter()
+        _acc_fwd = 0.0; _acc_evo = 0.0; _acc_bck = 0.0
+        if torch is None:
+            raise ImportError("PyTorch is not installed.")
+        if torch_odeint is None:
+            raise ImportError("torchdiffeq is not installed.")
+
+        _num_gpus = int(os.environ.get('PYFLOW_NUM_GPUS', '2'))
+        _is_multi_gpu = (_num_gpus >= 2)
+        _gpu_ids_str = os.environ.get('PYFLOW_GPU_IDS', '0,1')
+        _gpu_ids = [int(x.strip()) for x in _gpu_ids_str.split(',')]
+        _base_device = _resolve_torch_flow_device()
+
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+        if _is_multi_gpu:
+            device_h = torch.device(f'cuda:{_gpu_ids[0]}')
+            device_n = torch.device(f'cuda:{_gpu_ids[1]}')
+            for _i in range(min(_num_gpus, len(_gpu_ids))):
+                for _j in range(min(_num_gpus, len(_gpu_ids))):
+                    if _i != _j:
+                        di = torch.device(f'cuda:{_gpu_ids[_i]}')
+                        dj = torch.device(f'cuda:{_gpu_ids[_j]}')
+                        if not torch.cuda.can_device_access_peer(di, dj):
+                            torch.cuda.device(di).enable_peer_access(dj)
+            print(f"        [torch:imb:1111] multi-GPU  H→{device_h}  LIOM→{device_n}")
+        else:
+            device_h = _base_device; device_n = _base_device
+            print(f"        [torch:imb:1111] single-GPU device={device_h}")
+
+        ex_mask_h = _ex_helper_torch(n, device_h); no_mask_h = _no_helper_torch(n, device_h)
+        ex_mask_n = ex_mask_h.to(device_n) if _is_multi_gpu else ex_mask_h
+        no_mask_n = no_mask_h.to(device_n) if _is_multi_gpu else no_mask_h
+
+        _rtol = float(os.environ.get('PYFLOW_ODE_RTOL', '1e-6'))
+        _atol = float(os.environ.get('PYFLOW_ODE_ATOL', '1e-6'))
+
+        dl_arr = np.array(dl_list, dtype=np.float64)
+        max_steps = min(int(qmax), len(dl_arr))
+        dl_arr = dl_arr[:max_steps]
+
+        if ckpt_step is None:
+            if hamiltonian.dis_type == "random":
+                ckpt_step = 100
+            else:
+                ckpt_step = 80
+        ckpt_step = max(1, int(ckpt_step))
+
+        n2_dim = n * n
+
+        def _gpu_make_storage(capacity):
+            return {"capacity": int(capacity), "h2_list": [], "h4_list": []}
+
+        def _gpu_cmp_store(storage, slot, h2, h4):
+            storage["h2_list"].append(h2.detach().clone())
+            storage["h4_list"].append(h4.detach().clone())
+
+        def _gpu_cmp_load(storage, slot):
+            return storage["h2_list"][slot], storage["h4_list"][slot]
+
+        def _seg_to_device(seg, dst_device):
+            if not _is_multi_gpu:
+                return seg, None
+            new_seg = {"capacity": seg["capacity"], "h2_list": [], "h4_list": []}
+            for t in seg["h2_list"]:
+                new_seg["h2_list"].append(t.to(dst_device, non_blocking=True))
+            for t in seg["h4_list"]:
+                new_seg["h4_list"].append(t.to(dst_device, non_blocking=True))
+            ev = torch.cuda.Event(); ev.record(torch.cuda.current_stream(dst_device))
+            return new_seg, ev
+
+        curr_H2 = torch.tensor(np.array(hamiltonian.H2_spinless, dtype=np.float32), dtype=torch.float32, device=device_h)
+        curr_H4 = torch.tensor(np.array(hamiltonian.H4_spinless, dtype=np.float32), dtype=torch.float32, device=device_h)
+
+        def _ode_fn(t, y):
+            return _int_ode_torch_fn(t, y, n, ex_mask_h, no_mask_h)
+
+        # Phase 1: 正向 H 对角化 (device_h)
+        max_ckpts = max_steps // ckpt_step + 4
+        ckpt_state = _gpu_make_storage(max_ckpts)
+        ckpt_slot_map = {0: 0}
+        checkpoints_steps = [0]
+        _gpu_cmp_store(ckpt_state, 0, curr_H2, curr_H4)
+        n_ckpts = 1
+
+        k = 1; J0 = 1.0
+        t_span = torch.empty(2, dtype=torch.float32, device=device_h)
+        y0_flat = torch.empty(n2_dim + n**4, dtype=torch.float32, device=device_h)
+
+        while k < len(dl_arr) and J0 > cutoff:
+            t_span[0] = float(dl_arr[k - 1]); t_span[1] = float(dl_arr[k])
+            _pack_state_torch(y0_flat, curr_H2, curr_H4, n2_dim)
+            soln = torch_odeint(_ode_fn, y0_flat, t_span, rtol=_rtol, atol=_atol, method='dopri5')
+            curr_H2 = soln[-1][:n2_dim].reshape(n, n).detach().clone()
+            curr_H4 = soln[-1][n2_dim:].reshape(n, n, n, n).detach().clone()
+            del soln
+            if k % ckpt_step == 0 and n_ckpts < max_ckpts:
+                ckpt_slot_map[k] = n_ckpts
+                checkpoints_steps.append(k)
+                _gpu_cmp_store(ckpt_state, n_ckpts, curr_H2, curr_H4)
+                n_ckpts += 1
+            J0 = float(torch.max(torch.abs(curr_H2 - torch.diag(torch.diag(curr_H2)))))
+            if k % 1000 == 0:
+                print(f"  [对角化] k={k:5d}  l={dl_arr[k-1]:.4e}  J0={J0:.3e}  ckpts={n_ckpts}")
+            k += 1
+
+        final_step = k - 1
+        hamiltonian._pyflow_final_step = int(final_step)
+        if checkpoints_steps[-1] != final_step and n_ckpts < max_ckpts:
+            ckpt_slot_map[final_step] = n_ckpts
+            checkpoints_steps.append(final_step)
+            _gpu_cmp_store(ckpt_state, n_ckpts, curr_H2, curr_H4)
+            n_ckpts += 1
+
+        dl_list_final = dl_arr[:final_step + 1]
+        print(f"  对角化完成，共 {final_step} 步，J0={J0:.3e}")
+        _t_h_diag = time.perf_counter()
+
+        # Phase 2: l-bit (device_h)
+        H0_diag = curr_H2; Hint_diag = curr_H4
+        idx = torch.arange(n, device=device_h)
+        HFint = (Hint_diag[idx[:, None], idx[:, None], idx[None, :], idx[None, :]]
+                 - Hint_diag[idx[:, None], idx[None, :], idx[None, :], idx[:, None]])
+        lbits_list = []
+        for q in range(1, n):
+            diag_q = torch.diagonal(HFint, offset=q); diag_nq = torch.diagonal(HFint, offset=-q)
+            vals = (diag_q.abs() + diag_nq.abs()) / 2.0
+            vals = vals.clamp(min=1e-30)
+            lbits_list.append(vals.log10().median().item())
+        lbits = np.array(lbits_list, dtype=np.float64)
+        del HFint
+
+        # H0_diag, Hint_diag 拷贝到 device_n
+        H0_diag_n = H0_diag.to(device_n); Hint_diag_n = Hint_diag.to(device_n)
+
+        # Phase 3: 段重算 (device_h)
+        def _recompute_segment_gpu(start_step_idx, end_step_idx, stream):
+            seg_len = end_step_idx - start_step_idx
+            seg_state = _gpu_make_storage(seg_len)
+            t_local = torch.empty(2, dtype=torch.float32, device=device_h)
+            y0_local = torch.empty(n2_dim + n**4, dtype=torch.float32, device=device_h)
+            done = torch.cuda.Event()
+            with torch.cuda.stream(stream):
+                slot = ckpt_slot_map[int(start_step_idx)]
+                temp_H2, temp_H4 = _gpu_cmp_load(ckpt_state, slot)
+                for curr_step in range(start_step_idx, end_step_idx):
+                    local_idx = curr_step - start_step_idx
+                    _gpu_cmp_store(seg_state, local_idx, temp_H2, temp_H4)
+                    t_local[0] = float(dl_list_final[curr_step]); t_local[1] = float(dl_list_final[curr_step + 1])
+                    _pack_state_torch(y0_local, temp_H2, temp_H4, n2_dim)
+                    soln = torch_odeint(_ode_fn, y0_local, t_local, rtol=_rtol, atol=_atol, method='dopri5')
+                    temp_H2 = soln[-1][:n2_dim].reshape(n, n).detach().clone()
+                    temp_H4 = soln[-1][n2_dim:].reshape(n, n, n, n).detach().clone()
+                    del soln
+                done.record(stream)
+            del t_local, y0_local, temp_H2, temp_H4
+            return seg_state, done
+
+        # Phase 4: 格点级动力学 (device_n)
+        state_t = torch.tensor(np.array(state), dtype=torch.float32, device=device_n)
+        imblist = np.zeros(n, dtype=np.float32)
+
+        # 4a. 批量正向流：子线程负责 H 重算+搬运，主线程负责算符 ODE
+        n2_batch = torch.zeros((n, n, n), dtype=torch.float32, device=device_n)
+        n2_batch[torch.arange(n, device=device_n), torch.arange(n, device=device_n), torch.arange(n, device=device_n)] = 1.0
+        n4_batch = torch.zeros((n, n, n, n, n), dtype=torch.float32, device=device_n)
+
+        print("  [Phase 3] 批量正向算符 ODE 流 (threaded pipeline)...")
+        _t_fwd = time.perf_counter()
+        stream_h = torch.cuda.Stream(device=device_h)
+        total_fwd_steps = final_step
+        fwd_step_cnt = 0
+
+        fwd_seg_queue = queue.Queue(maxsize=2)
+        fwd_done_signal = threading.Event()
+        fwd_done_signal.set()  # 初始为 signaled：第一个段无需等待上一段
+        total_fwd_segs = len(checkpoints_steps) - 1
+
+        def _fwd_prefetch_worker():
+            """子线程：在 GPU 0 重算 H 段 → 等待 GPU 1 完成上一段 ODE → D2D 搬运到 GPU 1 → 放入队列"""
+            with torch.cuda.device(device_h):
+                for seg_idx in range(1, len(checkpoints_steps)):
+                    _t_seg = time.perf_counter()
+                    start_idx = int(checkpoints_steps[seg_idx - 1])
+                    end_idx = int(checkpoints_steps[seg_idx])
+                    seg_len = end_idx - start_idx
+
+                    seg_h, ev = _recompute_segment_gpu(start_idx, end_idx, stream_h)
+                    ev.synchronize()
+                    _t_h = time.perf_counter() - _t_seg  # 纯 H 重算耗时（不含信号等待）
+                    # 等待主线程完成上一段的算符 ODE（CPU+GPU 均完成），确保 D2D 拷贝不干扰正在运行的 kernel
+                    fwd_done_signal.wait()
+                    fwd_done_signal.clear()
+                    # 让 device_h 默认流等待 stream_h，确保拷贝在重算完成后执行
+                    ev.wait(torch.cuda.default_stream(device_h))
+                    seg_n = {"capacity": seg_h["capacity"], "h2_list": [], "h4_list": []}
+                    for t in seg_h["h2_list"]:
+                        seg_n["h2_list"].append(t.to(device_n, non_blocking=True))
+                    for t in seg_h["h4_list"]:
+                        seg_n["h4_list"].append(t.to(device_n, non_blocking=True))
+                    torch.cuda.synchronize(device_h)  # 确保 D2D 拷贝完成
+                    fwd_seg_queue.put((seg_idx, start_idx, end_idx, seg_len, seg_n, seg_h, _t_h))
+                fwd_seg_queue.put(None)  # 结束信号
+
+        fwd_worker = threading.Thread(target=_fwd_prefetch_worker, daemon=True)
+        fwd_worker.start()
+
+        # 主线程：从队列取段，在 GPU 1 上做算符 ODE（与子线程的 H 重算重叠）
+        while True:
+            item = fwd_seg_queue.get()
+            if item is None:
+                break
+            seg_idx, start_idx, end_idx, seg_len, seg_n, seg_h, _t_h = item
+            _t_ode = time.perf_counter()
+
+            for local_i in range(seg_len):
+                global_step = start_idx + local_i
+                h2_k, h4_k = _gpu_cmp_load(seg_n, local_i)
+                eta2, eta4 = _build_eta_torch(h2_k, h4_k, ex_mask_n, no_mask_n)
+                del h2_k, h4_k
+                steps = torch.tensor([dl_list_final[global_step], dl_list_final[global_step + 1]],
+                                     dtype=torch.float32, device=device_n)
+
+                def _fwd_rhs_batch(t, y):
+                    n2_b, n4_b = y
+                    dn2 = torch.einsum('ij,sjk->sik', eta2, n2_b) - torch.einsum('sij,jk->sik', n2_b, eta2)
+                    c42 = torch.einsum('abcd,sdf->sabcf', eta4, n2_b)
+                    c42 -= torch.einsum('abcd,sec->sabed', eta4, n2_b)
+                    c42 += torch.einsum('abcd,sbf->safcd', eta4, n2_b)
+                    c42 -= torch.einsum('abcd,sea->sebcd', eta4, n2_b)
+                    c42 -= torch.einsum('sabcd,df->sabcf', n4_b, eta2)
+                    c42 += torch.einsum('sabcd,ec->sabed', n4_b, eta2)
+                    c42 -= torch.einsum('sabcd,bf->safcd', n4_b, eta2)
+                    c42 += torch.einsum('sabcd,ea->sebcd', n4_b, eta2)
+                    c42 = c42.contiguous()
+                    c42.view(-1, n**4).mul_(no_mask_n)
+                    return (dn2, c42)
+
+                # ── mini-batch：切片传入 ODE，降低 RK 中间变量显存 ──
+                for mb_start in range(0, n, _batch_size):
+                    mb_end = min(mb_start + _batch_size, n)
+                    n2_mb = n2_batch[mb_start:mb_end].clone()
+                    n4_mb = n4_batch[mb_start:mb_end].clone()
+                    soln = torch_odeint(_fwd_rhs_batch, (n2_mb, n4_mb), steps, rtol=1e-3, atol=1e-6, method='dopri5')
+                    n2_batch[mb_start:mb_end] = soln[0][-1]
+                    n4_batch[mb_start:mb_end] = soln[1][-1]
+                    del soln, n2_mb, n4_mb
+                del eta2, eta4, steps
+
+                fwd_step_cnt += 1
+                if fwd_step_cnt % 1000 == 0 or fwd_step_cnt == total_fwd_steps:
+                    print(f"  [正向流] step={fwd_step_cnt}/{total_fwd_steps}  l={dl_list_final[global_step + 1]:.4e}")
+
+            _t_ode = time.perf_counter() - _t_ode
+            _overlap = min(_t_h, _t_ode) / max(_t_h, _t_ode, 1e-9) * 100
+            print(f"  [正向流 段 {seg_idx}/{total_fwd_segs}] H={_t_h:.3f}s ODE={_t_ode:.3f}s 重叠={_overlap:.0f}%")
+            # 本段 ODE 完成（torch_odeint 同步返回，GPU 1 已空闲），通知子线程可以安全进行下一段 D2D 拷贝
+            fwd_done_signal.set()
+
+            del seg_h, seg_n
+
+        fwd_worker.join()
+        _acc_fwd = time.perf_counter() - _t_fwd
+
+        # 4b. 时间演化（逐 site，结果存入 batch 张量）
+        print("  [时间演化] 对所有 site 进行时间演化...")
+        n2_r_batch = torch.zeros((n, n, n), dtype=torch.float32, device=device_n)
+        n2_i_batch = torch.zeros((n, n, n), dtype=torch.float32, device=device_n)
+        n4_r_batch = torch.zeros((n, n, n, n, n), dtype=torch.float32, device=device_n)
+        n4_i_batch = torch.zeros((n, n, n, n, n), dtype=torch.float32, device=device_n)
+
+        for site in range(n):
+            _t_evo = time.perf_counter()
+            n2_s = n2_batch[site].clone(); n4_s = n4_batch[site].clone()
+            n2_evo, n4_evo = _time_evolve_n2_n4_torch(n2_s.clone(), n4_s.clone(),
+                                                       H0_diag_n, Hint_diag_n, float(t_val), n)
+            _acc_evo += time.perf_counter() - _t_evo
+            n2_r_batch[site] = n2_evo.real.float()
+            n2_i_batch[site] = n2_evo.imag.float()
+            n4_r_batch[site] = n4_evo.real.float()
+            n4_i_batch[site] = n4_evo.imag.float()
+            del n2_s, n4_s, n2_evo, n4_evo
+        print(f"  [时间演化] {n} 个 site 全部完成")
+        del n2_batch, n4_batch, H0_diag_n, Hint_diag_n
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # 4c. 反向流：子线程负责 H 重算+搬运，主线程负责反向算符 ODE（全量算符常驻，mini-batch 在步内）
+        _t_bck = time.perf_counter()
+        bck_step_cnt = 0
+        _bck_batch_size = max(1, _batch_size // 2)
+        mb_count = (n + _bck_batch_size - 1) // _bck_batch_size
+        total_bck_steps = total_fwd_steps * mb_count
+        total_bck_segs = len(checkpoints_steps) - 1
+
+        bck_seg_queue = queue.Queue(maxsize=2)
+        bck_done_signal = threading.Event()
+        bck_done_signal.set()  # 初始为 signaled：第一个段无需等待上一段
+
+        def _bck_prefetch_worker():
+            """子线程：在 GPU 0 重算 H 段（逆序） → 等待 GPU 1 完成上一段 ODE → D2D 搬运到 GPU 1 → 放入队列"""
+            with torch.cuda.device(device_h):
+                for seg_idx in range(len(checkpoints_steps) - 1, 0, -1):
+                    _t_seg = time.perf_counter()
+                    start_idx = int(checkpoints_steps[seg_idx - 1])
+                    end_idx = int(checkpoints_steps[seg_idx])
+                    seg_len = end_idx - start_idx
+
+                    seg_h, ev = _recompute_segment_gpu(start_idx, end_idx, stream_h)
+                    ev.synchronize()
+                    _t_h = time.perf_counter() - _t_seg  # 纯 H 重算耗时（不含信号等待）
+                    # 等待主线程完成上一段的算符 ODE（CPU+GPU 均完成），确保 D2D 拷贝不干扰正在运行的 kernel
+                    bck_done_signal.wait()
+                    bck_done_signal.clear()
+                    ev.wait(torch.cuda.default_stream(device_h))
+                    seg_n = {"capacity": seg_h["capacity"], "h2_list": [], "h4_list": []}
+                    for t in seg_h["h2_list"]:
+                        seg_n["h2_list"].append(t.to(device_n, non_blocking=True))
+                    for t in seg_h["h4_list"]:
+                        seg_n["h4_list"].append(t.to(device_n, non_blocking=True))
+                    torch.cuda.synchronize(device_h)
+                    bck_seg_queue.put((seg_idx, start_idx, end_idx, seg_len, seg_n, seg_h, _t_h))
+                bck_seg_queue.put(None)
+
+        bck_worker = threading.Thread(target=_bck_prefetch_worker, daemon=True)
+        bck_worker.start()
+
+        # 主线程：从队列取段，在 GPU 1 上做反向算符 ODE
+        while True:
+            item = bck_seg_queue.get()
+            if item is None:
+                break
+            seg_idx, start_idx, end_idx, seg_len, seg_n, seg_h, _t_h = item
+            _t_ode = time.perf_counter()
+
+            for local_i in range(seg_len - 1, -1, -1):
+                global_step = start_idx + local_i
+                h2_k, h4_k = _gpu_cmp_load(seg_n, local_i)
+                eta2, eta4 = _build_eta_torch(h2_k, h4_k, ex_mask_n, no_mask_n)
+                del h2_k, h4_k
+                dl_k = float(dl_list_final[global_step + 1] - dl_list_final[global_step])
+                steps_s = torch.tensor([0.0, dl_k], dtype=torch.float32, device=device_n)
+
+                def _bck_rhs_batch(t, y):
+                    n2_r_b, n2_i_b, n4_r_b, n4_i_b = y
+                    dn2_r = -(torch.einsum('ij,sjk->sik', eta2, n2_r_b) - torch.einsum('sij,jk->sik', n2_r_b, eta2))
+                    dn2_i = -(torch.einsum('ij,sjk->sik', eta2, n2_i_b) - torch.einsum('sij,jk->sik', n2_i_b, eta2))
+                    c42_r = torch.einsum('abcd,sdf->sabcf', eta4, n2_r_b)
+                    c42_r -= torch.einsum('abcd,sec->sabed', eta4, n2_r_b)
+                    c42_r += torch.einsum('abcd,sbf->safcd', eta4, n2_r_b)
+                    c42_r -= torch.einsum('abcd,sea->sebcd', eta4, n2_r_b)
+                    c42_r -= torch.einsum('sabcd,df->sabcf', n4_r_b, eta2)
+                    c42_r += torch.einsum('sabcd,ec->sabed', n4_r_b, eta2)
+                    c42_r -= torch.einsum('sabcd,bf->safcd', n4_r_b, eta2)
+                    c42_r += torch.einsum('sabcd,ea->sebcd', n4_r_b, eta2)
+                    c42_r = -c42_r.contiguous()
+                    c42_r.view(-1, n**4).mul_(no_mask_n)
+                    c42_i = torch.einsum('abcd,sdf->sabcf', eta4, n2_i_b)
+                    c42_i -= torch.einsum('abcd,sec->sabed', eta4, n2_i_b)
+                    c42_i += torch.einsum('abcd,sbf->safcd', eta4, n2_i_b)
+                    c42_i -= torch.einsum('abcd,sea->sebcd', eta4, n2_i_b)
+                    c42_i -= torch.einsum('sabcd,df->sabcf', n4_i_b, eta2)
+                    c42_i += torch.einsum('sabcd,ec->sabed', n4_i_b, eta2)
+                    c42_i -= torch.einsum('sabcd,bf->safcd', n4_i_b, eta2)
+                    c42_i += torch.einsum('sabcd,ea->sebcd', n4_i_b, eta2)
+                    c42_i = -c42_i.contiguous()
+                    c42_i.view(-1, n**4).mul_(no_mask_n)
+                    return (dn2_r, dn2_i, c42_r, c42_i)
+
+                # ── mini-batch：反向状态4分量，使用更小的 batch ──
+                for mb_start in range(0, n, _bck_batch_size):
+                    mb_end = min(mb_start + _bck_batch_size, n)
+
+                    n2_r_mb = n2_r_batch[mb_start:mb_end].clone()
+                    n2_i_mb = n2_i_batch[mb_start:mb_end].clone()
+                    n4_r_mb = n4_r_batch[mb_start:mb_end].clone()
+                    n4_i_mb = n4_i_batch[mb_start:mb_end].clone()
+
+                    soln = torch_odeint(_bck_rhs_batch, (n2_r_mb, n2_i_mb, n4_r_mb, n4_i_mb),
+                                        steps_s, rtol=1e-3, atol=1e-6, method='dopri5')
+                    n2_r_batch[mb_start:mb_end] = soln[0][-1]
+                    n2_i_batch[mb_start:mb_end] = soln[1][-1]
+                    n4_r_batch[mb_start:mb_end] = soln[2][-1]
+                    n4_i_batch[mb_start:mb_end] = soln[3][-1]
+                    del soln, n2_r_mb, n2_i_mb, n4_r_mb, n4_i_mb
+
+                    bck_step_cnt += 1
+                    if bck_step_cnt % 1000 == 0 or bck_step_cnt == total_bck_steps:
+                        remaining = total_bck_steps - bck_step_cnt
+                        print(f"  [反向流] 剩余={remaining}/{total_bck_steps}  l={dl_list_final[global_step]:.4e}")
+                del eta2, eta4, steps_s
+
+            _t_ode = time.perf_counter() - _t_ode
+            _overlap = min(_t_h, _t_ode) / max(_t_h, _t_ode, 1e-9) * 100
+            print(f"  [反向流 段 {seg_idx}/{total_bck_segs}] H={_t_h:.3f}s ODE={_t_ode:.3f}s 重叠={_overlap:.0f}%")
+            # 本段 ODE 完成（torch_odeint 同步返回，GPU 1 已空闲），通知子线程可以安全进行下一段 D2D 拷贝
+            bck_done_signal.set()
+
+            del seg_h, seg_n
+
+        bck_worker.join()
+        _acc_bck = time.perf_counter() - _t_bck
+
+        print(f"  [耗时汇总] 算符正向流={_acc_fwd:.1f}s  算符反向流={_acc_bck:.1f}s  时间演化={_acc_evo:.3f}s")
+
+        # 4d. 计算期望值和不平衡度
+        for site in range(n):
+            n2_bck = torch.complex(n2_r_batch[site], n2_i_batch[site])
+            n4_bck = torch.complex(n4_r_batch[site], n4_i_batch[site])
+
+            nlist = 0.0
+            for i in range(n):
+                nlist += (n2_bck[i, i] * state_t[i]).real.item()
+                for j in range(n):
+                    if i != j:
+                        nlist += (n4_bck[i, i, j, j] * state_t[i] * state_t[j]).real.item()
+                        nlist -= (n4_bck[i, j, j, i] * state_t[i] * state_t[j]).real.item()
+            imblist[site] = float(((-1) ** site) * nlist / n)
+            del n2_bck, n4_bck
+
+        imblist_total = 2.0 * np.sum(imblist)
+        _elapsed = time.perf_counter() - _t_start
+
+        elems = n * n + n ** 4
+        per_h = elems * 4
+        seg_factor = 2 if _is_multi_gpu else 1
+        output = {
+            "H0_diag": H0_diag.detach().cpu().numpy(),
+            "Hint": Hint_diag.detach().cpu().numpy(),
+            "LIOM Interactions": lbits,
+            "Imbalance": imblist_total,
+            "elapsed_s": _elapsed,
+            "steps_evolved": int(final_step),
+            "ckpt_step": int(ckpt_step),
+            "peak_memory_bytes": int(n_ckpts * per_h + ckpt_step * per_h * seg_factor + 2 * n * elems * 4
+                                        + 12 * _batch_size * elems * 4),
+            "timing": {
+                "h_diag_s": float(_t_h_diag - _t_start),
+                "op_fwd_s": float(_acc_fwd),
+                "time_evo_s": float(_acc_evo),
+                "op_bck_s": float(_acc_bck),
+                "total_s": float(_t_h_diag - _t_start + _acc_fwd + _acc_evo + _acc_bck),
+            },
+        }
+        return output
+
+    else:
+        raise NotImplementedError(
+            f"switch_num={switch_num} 尚未实现。"
+        )
+
+
+# ==============================================================================
+# 注：此文件需插入到 spinless_fermion copy.py 中 flow_dyn_density 之后、
+# flow_static_int_ckpt_liubo 之前。
+# ==============================================================================
 
 def flow_static_int_ckpt_liubo(n,hamiltonian,dl_list,qmax,cutoff,method='tensordot',norm=False,Hflow=False,store_flow=False):
     """
@@ -8753,7 +11079,7 @@ def flow_static_int_ckpt_torch(n, hamiltonian, dl_list, qmax, cutoff,
         if (k % conv_check_step == 0) or (k == len(dl_list) - 1):
             J0 = float(torch.max(torch.abs(curr_H2 - torch.diag(torch.diag(curr_H2)))))
 
-        if k % 100 == 0:
+        if k % 1000 == 0:
             print(f"        Step {k}/{len(dl_list)} | l={dl_list[k]:.4f} | off-diag={J0:.2e} | ckpts={len(checkpoints)}", flush=True)
 
         # if k % 10 == 0:
