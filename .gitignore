@@ -43,7 +43,11 @@ pyflow_out/
 # PDF files (documentation, papers)
 *.pdf
 
-
+# Agent configuration and local workflow files
+AGENTS.md
+CLAUDE.md
+docs/agents/
+.scratch/
 
 # OS files
 .DS_Store
@@ -80,3 +84,4 @@ run_compress_modes.sh
 /test_density/
 /test_imb/datas/
 /test_imb/paper/
+/.github/

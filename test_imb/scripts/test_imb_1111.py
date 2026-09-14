@@ -78,7 +78,7 @@ def run_single(config: dict, switch_num: int) -> dict:
     dl_list = config["dl_list"]; qmax = config["qmax"]
     cutoff = config["cutoff"]; t_val = config["t_val"]
     ckpt = config.get("ckpt_step")
-    batch_size = config.get("batch_size", n)
+    batch_size = int(os.environ.get("PYFLOW_BATCH_SIZE",config.get("batch_size", n)))
 
     set_switch_env(switch_num)
 

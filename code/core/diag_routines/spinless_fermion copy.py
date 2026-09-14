@@ -9067,8 +9067,8 @@ def flow_imb(
         lbits = _extract_lbits(Hint_diag, n)
 
         # --- 3. 格点级动力学计算 ---
-        _fast_mode = (n >= 25)  # L>=5 时快速模式：仅演化 2 个 site 估算总时间
-        _sample_sites = [0, n // 2] if _fast_mode else list(range(n))
+        _fast_mode = (n >= 25)  # L>=5 时快速模式：仅演化 1 个 site 估算总时间
+        _sample_sites = [0] if _fast_mode else list(range(n))
         if _fast_mode:
             print(f"  [快速模式] 仅演化 site {_sample_sites}，总时间=平均×{n}，imbalance 固定为 1.0")
         imblist = np.zeros(n, dtype=np.float32)
@@ -9218,8 +9218,8 @@ def flow_imb(
             return seg_h2, seg_h4
 
         # --- 3. 格点级动力学计算 ---
-        _fast_mode = (n >= 25)  # L>=5 时快速模式：仅演化 2 个 site 估算总时间
-        _sample_sites = [0, n // 2] if _fast_mode else list(range(n))
+        _fast_mode = (n >= 25)  # L>=5 时快速模式：仅演化 1 个 site 估算总时间
+        _sample_sites = [0] if _fast_mode else list(range(n))
         if _fast_mode:
             print(f"  [快速模式] 仅演化 site {_sample_sites}，总时间=平均×{n}，imbalance 固定为 1.0")
         imblist = np.zeros(n, dtype=np.float32)
@@ -9769,7 +9769,7 @@ def flow_imb(
                 return seg_state
 
             _fast_mode = (n >= 25)
-            _sample_sites = [0, n // 2] if _fast_mode else list(range(n))
+            _sample_sites = [0] if _fast_mode else list(range(n))
             if _fast_mode:
                 print(f"  [快速模式] 仅演化 site {_sample_sites}，总时间=平均×{n}，imbalance 固定为 1.0")
             imblist = np.zeros(n, dtype=np.float32)

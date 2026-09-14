@@ -46,7 +46,7 @@ def set_switch_env(switch_num: int) -> None:
     os.environ["checkpoint_switch"] = str(switch_num % 10)
     
     # 使用CPU或者GPU
-    os.environ["PYFLOW_USE_TORCH"]  = os.environ.get("PYFLOW_USE_TORCH", "1")
+    os.environ["PYFLOW_USE_TORCH"]  = os.environ.get("PYFLOW_USE_TORCH", "0")
     
     # 压缩模式
     os.environ.setdefault("compress_mode", "1")

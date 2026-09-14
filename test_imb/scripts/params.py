@@ -27,5 +27,5 @@ PARAM_SETS = [
 
     # ──────── L=7 (n=49) ────────
     {"dim": 2, "L": 7, "dis_type": "linear", "dis": 1.0, "J": 1.0, "delta": 0.1, "seed": 42, "lmax": 1000.0, "qmax": 10000, "cutoff": 1e-3},
-    {"dim": 2, "L": 7, "dis_type": "random", "dis": 1.0, "J": 1.0, "delta": 0.1, "seed": 42, "lmax": 1000.0, "qmax": 10000, "cutoff": 1e-3},
+    # {"dim": 2, "L": 7, "dis_type": "random", "dis": 1.0, "J": 1.0, "delta": 0.1, "seed": 42, "lmax": 1000.0, "qmax": 10000, "cutoff": 1e-3},
 ]
